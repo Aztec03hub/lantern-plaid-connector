@@ -330,6 +330,20 @@ internal class R2ConverterTest {
         assertThat(untouched.transfersNeedingReview).isEmpty()
     }
 
+    /** Both legs are updated in one sync but only one of them flipped: the banks disagree, so no swap, and it is reported. */
+    @Test
+    fun aTransferWhoseOtherLegIsUpdatedWithoutFlippingIsNotSwapped() = runBlocking<Unit> {
+        val transfer = existing("ff1", "plaid-dep", TransactionTypeProperty.transfer, internalReference = "plaid-wd")
+
+        val result = converter().convertPollSync(
+            accountMap, listOf(), listOf(plaid(accountA, "wd", -40.0), plaid(accountB, "dep", -41.0)), listOf(), listOf(transfer)
+        )
+
+        assertThat(result.updates).hasSize(2)
+        assertThat(result.updates.map { it.tx.sourceId }).containsOnly("1")
+        assertThat(result.transfersNeedingReview).containsExactly("ff1")
+    }
+
     /** The deposit leg flipping alone (OUT) is reported too, not swapped. */
     @Test
     fun aDepositLegThatFlipsToOutAloneIsReportedNotSwapped() = runBlocking<Unit> {

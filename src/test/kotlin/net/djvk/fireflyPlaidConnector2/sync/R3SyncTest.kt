@@ -166,6 +166,21 @@ internal class R3SyncTest {
         assertThat(store.read()).isEmpty()
     }
 
+    /** The posted version alone (its pending id may be removed in a later sync) already replaces the pending letter. */
+    @Test
+    fun aPostedVersionDropsTheLetterOfItsPendingTransactionEvenWithoutARemovalEvent() = runBlocking<Unit> {
+        emptyFirefly()
+        rejectCreates()
+        val store = DeadLetterStore(dir.toString())
+        store.add(DeadLetter("create", "plaid-pend", null, create("plaid-pend").tx, false, "x"))
+        whenever(plaidSyncService.processPlaidTransactions(any(), any()))
+            .thenReturn(plaidResult(created = listOf(plaid(accountA, "posted", 50.0, pendingId = "pend"))))
+
+        orchestrator(service(store), store).processTransactions(accountMap, sequenceOf(Pair("tok-12345678", listOf(accountA))), mutableMapOf())
+
+        assertThat(store.read().map { it.key }).containsExactly("plaid-posted")
+    }
+
     @Test
     fun aPlaidUpdateOfADeadLetteredCreateIsRetriedWithTheNewAmount() = runBlocking<Unit> {
         emptyFirefly()
