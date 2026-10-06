@@ -19,6 +19,11 @@ group = "net.djvk"
 version = "1.5.1"
 java.sourceCompatibility = JavaVersion.VERSION_17
 
+// Generates META-INF/build-info.properties so the app can report its own version (see WebhookService)
+springBoot {
+    buildInfo()
+}
+
 repositories {
     mavenCentral()
 }

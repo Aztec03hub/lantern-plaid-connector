@@ -13,11 +13,16 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.Arguments
 import org.junit.jupiter.params.provider.MethodSource
+import org.junit.jupiter.api.assertThrows
+import org.mockito.kotlin.any
+import org.mockito.kotlin.argumentCaptor
 import org.mockito.kotlin.eq
+import org.mockito.kotlin.isNull
 import org.mockito.kotlin.mock
 import org.mockito.kotlin.verify
 import org.mockito.kotlin.whenever
 import java.util.stream.Stream
+import kotlin.test.assertEquals
 
 /**
  * Test for the PolledSyncOrchestrator class.
@@ -283,5 +288,85 @@ internal class PolledSyncOrchestratorTest {
             eq(convertResult.deletes)
         )
         verify(cursorManager).writeCursorMap(eq(cursorMap))
+    }
+
+    private fun stubOneCreateIteration(): Triple<Map<String, Int>, Sequence<Pair<String, List<String>>>, MutableMap<String, String>> {
+        val accountMap = mapOf("account1" to 1)
+        val sequence = sequenceOf(Pair("token1", listOf("account1")))
+        val cursorMap = mutableMapOf<String, String>()
+        val plaidTx = PlaidFixtures.getPaymentTransaction(
+            name = "Created", accountId = "account1", amount = 100.0, transactionId = "created1"
+        )
+        val plaidResult = PlaidTransactionResult(listOf(plaidTx), emptyList(), listOf("gone1"))
+        val convertResult = TransactionConverter.ConvertPollSyncResult(
+            creates = listOf(
+                FireflyTransactionDto(
+                    null,
+                    FireflyFixtures.getTransaction(description = "Created", amount = "100.0", sourceId = "1")
+                        .transactions.first()
+                )
+            ),
+            updates = emptyList(),
+            deletes = listOf("77"),
+        )
+        runBlocking {
+            whenever(fireflyTransactionService.fetchExistingFireflyTransactions()).thenReturn(emptyList())
+            whenever(plaidSyncService.processPlaidTransactions(eq(sequence), eq(cursorMap))).thenReturn(plaidResult)
+            whenever(converter.convertPollSync(any(), any(), any(), any(), any())).thenReturn(convertResult)
+        }
+        return Triple(accountMap, sequence, cursorMap)
+    }
+
+    /**
+     * With the result callback enabled, a successful iteration posts non-empty counts and no failure.
+     */
+    @Test
+    fun runIterationPostsResultToWebhookOnSuccess() = runBlocking<Unit> {
+        val webhookService: WebhookService = mock()
+        val (accountMap, sequence, cursorMap) = stubOneCreateIteration()
+        val orchestrator = PolledSyncOrchestrator(
+            30, syncHelper, cursorManager, plaidSyncService, fireflyTransactionService, converter, webhookService
+        )
+
+        orchestrator.runIteration(accountMap, sequence, cursorMap)
+
+        val result = argumentCaptor<PollResult>()
+        verify(webhookService).post(any(), any(), result.capture(), isNull())
+        assertEquals(1, result.firstValue.plaidCreated)
+        assertEquals(1, result.firstValue.plaidDeleted)
+        assertEquals(1, result.firstValue.fireflyCreated)
+        assertEquals(1, result.firstValue.fireflyDeleted)
+    }
+
+    /**
+     * A failed iteration is reported to the callback (no result, with the exception) and then rethrown.
+     */
+    @Test
+    fun runIterationPostsFailureToWebhookAndRethrows() = runBlocking<Unit> {
+        val webhookService: WebhookService = mock()
+        val (accountMap, sequence, cursorMap) = stubOneCreateIteration()
+        whenever(fireflyTransactionService.fetchExistingFireflyTransactions()).thenThrow(IllegalStateException("boom"))
+        val orchestrator = PolledSyncOrchestrator(
+            30, syncHelper, cursorManager, plaidSyncService, fireflyTransactionService, converter, webhookService
+        )
+
+        assertThrows<IllegalStateException> { orchestrator.runIteration(accountMap, sequence, cursorMap) }
+
+        verify(webhookService).post(any(), any(), isNull(), any<IllegalStateException>())
+    }
+
+    /**
+     * With no callback configured the iteration still completes and nothing is posted.
+     */
+    @Test
+    fun runIterationWorksWithoutWebhook() = runBlocking<Unit> {
+        val (accountMap, sequence, cursorMap) = stubOneCreateIteration()
+        val orchestrator = PolledSyncOrchestrator(
+            30, syncHelper, cursorManager, plaidSyncService, fireflyTransactionService, converter
+        )
+
+        orchestrator.runIteration(accountMap, sequence, cursorMap)
+
+        verify(fireflyTransactionService).processFireflyTransactionUpdates(any(), any(), any())
     }
 }
