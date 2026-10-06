@@ -6,6 +6,7 @@ import io.ktor.client.HttpClientConfig
 import io.ktor.client.engine.HttpClientEngine
 import io.ktor.client.plugins.*
 import io.ktor.http.*
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import net.djvk.fireflyPlaidConnector2.api.plaid.apis.PlaidApi
 import net.djvk.fireflyPlaidConnector2.api.plaid.infrastructure.ApiClient
@@ -37,6 +38,9 @@ class PlaidApiWrapper(
     private val plaidSecret: String,
     httpClientEngine: HttpClientEngine? = null,
     httpClientConfig: ((HttpClientConfig<*>) -> Unit)? = null,
+    /** Base wait between retries of a failed call; attempt N waits N times this. */
+    @Value("\${fireflyPlaidConnector2.plaid.retryBackoffMillis:2000}")
+    private val retryBackoffMillis: Long = 2000,
 ) {
     private val plaidApi = PlaidApi(baseUrl, httpClientEngine, httpClientConfig) {
         ApiClient.JSON_DEFAULT.invoke(this)
@@ -72,8 +76,16 @@ class PlaidApiWrapper(
                 return executeRequest(request, logString, remainingRetries)
             }
             throw cre
-        } catch (e: Throwable) {
-            logger.error("Error encountered $logString.", e)
+        } catch (e: CancellationException) {
+            // Never swallow cancellation (app shutdown); retrying here would keep a cancelled job alive
+            throw e
+        } catch (e: Exception) {
+            logger.error("Error encountered $logString; ${remainingRetries - 1} retries remaining.", e)
+            if (remainingRetries - 1 <= 0) {
+                throw RuntimeException("Plaid API call $logString failed after $maxRetries attempts", e)
+            }
+            // Back off so a brief network outage isn't burned through by instant retries
+            delay(retryBackoffMillis * (maxRetries - remainingRetries + 1))
             return executeRequest(request, logString, remainingRetries - 1)
         }
     }

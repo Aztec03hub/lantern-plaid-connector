@@ -7,6 +7,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import net.djvk.fireflyPlaidConnector2.transactions.FireflyAccountId
 import net.djvk.fireflyPlaidConnector2.transactions.TransactionConverter
+import net.djvk.fireflyPlaidConnector2.util.Utilities
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.DisposableBean
 import org.springframework.beans.factory.annotation.Value
@@ -14,6 +15,7 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty
 import org.springframework.stereotype.Component
 import java.time.Instant
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.time.Duration
 import kotlin.time.Duration.Companion.minutes
 
 typealias IntervalMinutes = Int
@@ -73,10 +75,13 @@ class PolledSyncOrchestrator(
         // Fetch existing Firefly transactions
         val existingFireflyTxs = fireflyTransactionService.fetchExistingFireflyTransactions()
 
-        // Process Plaid transactions
+        // Advance a working copy of the cursors. The real map is only updated after Firefly has accepted the
+        //  changes, so a failure part way through (network down, Firefly error) never skips Plaid data: the next
+        //  iteration re-reads from the last committed cursors.
+        val workingCursors = cursorMap.toMutableMap()
         val plaidTransactions = plaidSyncService.processPlaidTransactions(
             accountAccessTokenSequence,
-            cursorMap
+            workingCursors
         )
 
         // Convert Plaid transactions to Firefly format
@@ -101,7 +106,8 @@ class PolledSyncOrchestrator(
             convertResult.deletes
         )
 
-        // Update cursor map after successful processing
+        // Commit the cursors only after successful processing
+        cursorMap.putAll(workingCursors)
         cursorManager.writeCursorMap(cursorMap)
 
         return PollResult(
@@ -136,17 +142,44 @@ class PolledSyncOrchestrator(
         webhookService?.post(iterationStart, Instant.now(), pollResult)
     }
 
+    /**
+     * Runs [block], and if it fails because the network (or a remote 5xx) is unavailable, logs a warning and tries
+     * again after [retryDelay], for as long as it keeps failing that way. Any other failure propagates.
+     * Used for startup, where a host that boots before its network is up should wait, not crash.
+     */
+    suspend fun <T> retryWhileNetworkDown(
+        what: String,
+        retryDelay: Duration = syncFrequencyMinutes.minutes,
+        block: suspend () -> T,
+    ): T {
+        while (true) {
+            try {
+                return block()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (!Utilities.isTransientNetworkError(e)) throw e
+                logger.warn("Network unavailable during $what (${e::class.simpleName}); retrying in $retryDelay")
+                delay(retryDelay)
+            }
+        }
+    }
+
     override fun run() {
         runBlocking {
-            syncHelper.setApiCreds()
-
             mainJob = launch {
-                // Initialize cursors
-                initializeCursors()
+                val (accountMap, accountAccessTokenSequence, cursorMap) = retryWhileNetworkDown("startup") {
+                    syncHelper.setApiCreds()
 
-                // Get account mappings for the polling loop
-                val (accountMap, accountAccessTokenSequence) = syncHelper.getAllPlaidAccessTokenAccountIdSets()
-                val cursorMap = cursorManager.readCursorMap()
+                    // Initialize cursors
+                    initializeCursors()
+
+                    // Get account mappings for the polling loop
+                    val (accountMap, accountAccessTokenSequence) = syncHelper.getAllPlaidAccessTokenAccountIdSets()
+                    Triple(accountMap, accountAccessTokenSequence, cursorManager.readCursorMap())
+                }
+
+                var consecutiveFailures = 0
 
                 /**
                  * Periodic polling loop
@@ -154,7 +187,24 @@ class PolledSyncOrchestrator(
                 do {
                     logger.debug("Polling loop start")
 
-                    runIteration(accountMap, accountAccessTokenSequence, cursorMap)
+                    // Process transactions (and report the outcome to the optional result callback). A failed
+                    //  iteration (network down, Plaid or Firefly error) must not kill the loop: cursors are only
+                    //  committed on success, so the next iteration retries the same data.
+                    try {
+                        runIteration(accountMap, accountAccessTokenSequence, cursorMap)
+                        if (consecutiveFailures > 0) {
+                            logger.info("Poll recovered after $consecutiveFailures failed iteration(s)")
+                        }
+                        consecutiveFailures = 0
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        consecutiveFailures++
+                        logger.error(
+                            "Poll iteration failed ($consecutiveFailures consecutive); " +
+                                    "retrying in $syncFrequencyMinutes minutes", e
+                        )
+                    }
 
                     // Trigger GC to try to reduce heap size
                     logger.trace("Calling System.gc()")
