@@ -954,6 +954,79 @@ internal class TransactionConverterTest {
         assertThat(actual).containsExactlyInAnyOrder(expectedFfTxWithTags, expectedFfTxWithoutTags)
     }
 
+    private fun converterWithImportTag(template: String) = TransactionConverter(
+        useNameForDestination = true,
+        enablePrimaryCategorization = true,
+        primaryCategoryPrefix = "pcat-",
+        enableDetailedCategorization = false,
+        detailedCategoryPrefix = "b",
+        timeZoneString = "America/New_York",
+        transferMatchWindowDays = 10L,
+        txStyle = defaultStyle,
+        importTagTemplate = template,
+    )
+
+    @org.junit.jupiter.api.Test
+    fun renderImportTagFormatsDatePatternsInBraces() {
+        val now = java.time.ZonedDateTime.of(2024, 2, 7, 13, 19, 5, 0, java.time.ZoneId.of("America/New_York"))
+        assertThat(TransactionConverter.renderImportTag("Plaid import {yyyy-MM-dd @ HH:mm}", now))
+            .isEqualTo("Plaid import 2024-02-07 @ 13:19")
+        assertThat(TransactionConverter.renderImportTag("plain-tag", now)).isEqualTo("plain-tag")
+        assertThat(TransactionConverter.renderImportTag("  ", now)).isNull()
+        assertThat(TransactionConverter.renderImportTag("", now)).isNull()
+    }
+
+    @org.junit.jupiter.api.Test
+    fun invalidImportTagPatternFailsAtStartup() {
+        org.junit.jupiter.api.assertThrows<IllegalArgumentException> { converterWithImportTag("bad {ii}") }
+    }
+
+    @ParameterizedTest(name = "poll mode = {0}")
+    @ValueSource(booleans = [true, false])
+    fun convertAddsImportTagToCreatedTransactionsAlongsideCategoryTags(poll: Boolean) {
+        val converter = converterWithImportTag("Plaid import")
+        val plaidTx = PlaidFixtures.getPaymentTransaction(
+            accountId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            name = "Coffee",
+            transactionId = "plaidTagged",
+            amount = 5.0,
+            personalFinanceCategory = PersonalFinanceCategoryEnum.TRAVEL_FLIGHTS.toPersonalFinanceCategory(),
+        )
+
+        val actual = convertCreates(converter, poll, listOf(plaidTx), PlaidFixtures.getStandardAccountMapping())
+
+        assertThat(actual.single().tx.tags).containsExactly("pcat-travel", "Plaid import")
+    }
+
+    @org.junit.jupiter.api.Test
+    fun importTagIsNotAddedToPlaidUpdatesOfExistingTransactions() {
+        val converter = converterWithImportTag("Plaid import")
+        val existing = TransactionRead(
+            "thing", "ffId1",
+            FireflyFixtures.getTransaction(
+                type = TransactionTypeProperty.withdrawal,
+                amount = "5.0",
+                sourceId = "1",
+                externalId = "plaid-plaidUpdated",
+            ), ObjectLink()
+        )
+        val updated = PlaidFixtures.getPaymentTransaction(
+            accountId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            name = "Coffee updated",
+            transactionId = "plaidUpdated",
+            amount = 5.0,
+        )
+
+        val result = runBlocking {
+            converter.convertPollSync(
+                PlaidFixtures.getStandardAccountMapping(), listOf(), listOf(updated), listOf(), listOf(existing)
+            )
+        }
+
+        assertThat(result.updates).hasSize(1)
+        assertThat(result.updates.single().tx.tags).doesNotContain("Plaid import")
+    }
+
     @ParameterizedTest(name = "poll mode = {0}")
     @ValueSource(booleans = [true, false])
     fun convertWithDisableAccountAssignmentLeavesCounterpartyUnset(poll: Boolean) {
