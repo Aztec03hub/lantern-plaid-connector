@@ -364,7 +364,7 @@ internal class R3SyncTest {
     fun aRangedReadOfMoreThanTheTransactionCeilingFailsWhateverThePageSize() = runBlocking<Unit> {
         val pagination = mock<net.djvk.fireflyPlaidConnector2.api.firefly.models.MetaPagination> {
             on { currentPage } doReturn 1
-            on { totalPages } doReturn 2
+            on { totalPages } doReturn 1
             on { total } doReturn 300_000
         }
         val meta = mock<Meta> { on { this.pagination } doReturn pagination }
