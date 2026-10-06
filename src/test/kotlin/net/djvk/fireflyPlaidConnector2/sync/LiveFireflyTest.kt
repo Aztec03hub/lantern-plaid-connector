@@ -103,7 +103,10 @@ internal class LiveFireflyTest {
         assertThat(split.sourceId).isEqualTo(accountB)
         assertThat(split.destinationId).isEqualTo(accountA)
         assertThat(split.tags).contains("user-tag")
-        assertThat(service.fetchMissingByPlaidId(listOf(xId), listOf())).describedAs("old external id is gone").isEmpty()
+        // R2 H1: the converted transaction's old id is no longer its external id but is kept as the transfer's
+        //  internal reference, so a lookup by it finds this same transfer
+        assertThat(split.internalReference).isEqualTo("plaid-$xId")
+        assertThat(service.fetchMissingByPlaidId(listOf(xId), listOf()).map { it.id }).containsExactly(converted.id)
 
         // H2 + H3: the retried Plaid create for Y is recognised from what Firefly really returns
         val retry = converter.convertPollSync(accountMap, listOf(yLeg), listOf(), listOf(), listOf(converted))
