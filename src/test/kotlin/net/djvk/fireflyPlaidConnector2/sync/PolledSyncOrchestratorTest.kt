@@ -75,6 +75,22 @@ internal class PolledSyncOrchestratorTest {
         verify(cursorManager).writeCursorMap(eq(cursorMap))
     }
 
+    /**
+     * With importHistoryOnFirstSync enabled, new Items must NOT be fast-forwarded past their history.
+     */
+    @Test
+    fun testInitializeCursorsSkippedWhenImportingHistory() = runBlocking<Unit> {
+        val orchestrator = PolledSyncOrchestrator(
+            30, syncHelper, cursorManager, plaidSyncService, fireflyTransactionService, converter,
+            importHistoryOnFirstSync = true,
+        )
+
+        orchestrator.initializeCursors()
+
+        org.mockito.kotlin.verifyNoInteractions(plaidSyncService)
+        org.mockito.kotlin.verifyNoInteractions(cursorManager)
+    }
+
     companion object {
         /**
          * Provides test cases for the processTransactions test.

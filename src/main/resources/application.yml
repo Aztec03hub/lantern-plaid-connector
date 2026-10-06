@@ -67,6 +67,13 @@ fireflyPlaidConnector2:
     # A refresh failure (for example the Item lacks the refresh capability) is logged and does not stop the sync.
     # 0 disables it. Defaults to 0.
     refreshIntervalMinutes: 0
+    # By default, the first run for a newly configured Plaid Item skips the Item's existing history and only syncs
+    #   transactions that change after that point.
+    # Set this to true to instead import the Item's whole available history on its first run (typically up to 24 months
+    #   of transactions). Use it when connecting banks to a fresh Firefly. Be aware that on the first run Firefly
+    #   receives every historical transaction, and an Item whose cursor is already stored is unaffected.
+    # Defaults to false.
+    importHistoryOnFirstSync: false
   batch:
     # The number of days in the past to pull data for.
     maxSyncDays: 5
