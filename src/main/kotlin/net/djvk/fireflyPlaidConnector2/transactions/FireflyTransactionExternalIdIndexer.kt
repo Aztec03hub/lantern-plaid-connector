@@ -22,6 +22,9 @@ class FireflyTransactionExternalIdIndexer(
         fireflyTxsByExternalId = out
     }
 
+    /** [externalId] is the full Firefly external id (with the `plaid-` prefix). */
+    fun findByExternalId(externalId: FireflyExternalId): TransactionRead? = fireflyTxsByExternalId[externalId]
+
     fun findExistingFireflyTx(
         plaidTransactionId: PlaidTransactionId,
     ): TransactionRead? {

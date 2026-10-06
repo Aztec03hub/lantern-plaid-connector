@@ -114,6 +114,8 @@ internal class TransactionConverterTest {
                                     sourceId = "2",
                                     destinationId = "1",
                                 ).transactions.first()
+                                    // An in-place update never re-sends the reconciled flag or order (M2)
+                                    .copy(order = null, reconciled = null)
                             )
                         ),
                         deletes = listOf(),
@@ -160,6 +162,8 @@ internal class TransactionConverterTest {
                                     sourceId = "1",
                                     destinationId = "2",
                                 ).transactions.first()
+                                    // An in-place update never re-sends the reconciled flag or order (M2)
+                                    .copy(order = null, reconciled = null)
                             )
                         ),
                         deletes = listOf(),
@@ -295,12 +299,14 @@ internal class TransactionConverterTest {
                                 "updatedFireflyId",
                                 FireflyFixtures.getTransaction(
                                     type = TransactionTypeProperty.withdrawal,
-                                    description = "Updated transaction name",
+                                    description = "Old transaction name",
                                     amount = "1111.22",
                                     sourceId = "1",
                                     destinationName = "Unknown Transfer Recipient",
                                     externalId = "plaid-plaidUpdateId",
                                 ).transactions.first()
+                                    // M2: the user's description and counterparty, and the reconciled flag, are kept
+                                    .copy(order = null, reconciled = null, destinationName = null)
                             ),
                         ),
                         deletes = listOf(),

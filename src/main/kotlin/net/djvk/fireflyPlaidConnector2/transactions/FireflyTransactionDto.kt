@@ -37,7 +37,9 @@ data class FireflyTransactionDto(
 
     fun toTransactionUpdate(): TransactionUpdate {
         return TransactionUpdate(
-            transactions = listOf(tx.toTransactionSplitUpdate()),
+            // A transfer is always sent with its type: for an existing deposit/withdrawal that is the in-place
+            //  conversion to a transfer, for an existing transfer it is a no-op.
+            transactions = listOf(tx.toTransactionSplitUpdate(includeType = tx.type == TransactionTypeProperty.transfer)),
             applyRules = true,
             fireWebhooks = true,
             groupTitle = tx.description,

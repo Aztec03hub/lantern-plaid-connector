@@ -199,7 +199,7 @@ internal class InvestmentTransactionsTest {
     }
 
     @Test
-    fun oneFailingItemDoesNotStopTheOthers() = runBlocking<Unit> {
+    fun oneFailingItemDoesNotStopTheOthersButIsReported() = runBlocking<Unit> {
         whenever(syncHelper.getInvestmentAccessTokenAccountIdSets()).thenReturn(
             sequenceOf(Pair("tokBad", listOf("a")), Pair("tokGood", listOf("b")))
         )
@@ -209,11 +209,40 @@ internal class InvestmentTransactionsTest {
         whenever(plaidSyncService.fetchInvestmentTransactions(eq("tokGood"), any(), any(), any()))
             .thenReturn(listOf(invTx("g1", account = "b", amount = 9.0)))
 
-        orchestrator().syncInvestments(mapOf("a" to 1, "b" to 2))
+        // L3: the failure is reported after every Item has had its turn
+        val e = runCatching { orchestrator().syncInvestments(mapOf("a" to 1, "b" to 2)) }.exceptionOrNull()
+        assertThat(e).isInstanceOf(IllegalStateException::class.java).hasMessageContaining("1 Item(s)")
 
         val inserted = argumentCaptor<List<FireflyTransactionDto>>()
         verify(syncHelper).optimisticInsertBatchIntoFirefly(inserted.capture())
         assertThat(inserted.firstValue.map { it.tx.externalId }).containsExactly("plaid-g1")
+    }
+
+    @Test
+    fun fireflyWindowIsNotReadWhenPlaidReturnsNothing() = runBlocking<Unit> {
+        whenever(syncHelper.getInvestmentAccessTokenAccountIdSets())
+            .thenReturn(sequenceOf(Pair("tokBroker", listOf("brokerage"))))
+        whenever(plaidSyncService.fetchInvestmentTransactions(any(), any(), any(), any())).thenReturn(emptyList())
+
+        orchestrator().syncInvestments(mapOf("brokerage" to 3))
+
+        // L3: no Plaid data, no Firefly window read
+        verify(fireflyTransactionService, never()).fetchExistingFireflyTransactions()
+    }
+
+    @Test
+    fun anUnreachableFireflyFailsTheCallWithAnIterationFailureH4() = runBlocking<Unit> {
+        whenever(syncHelper.getInvestmentAccessTokenAccountIdSets())
+            .thenReturn(sequenceOf(Pair("tokBroker", listOf("brokerage"))))
+        whenever(plaidSyncService.fetchInvestmentTransactions(any(), any(), any(), any()))
+            .thenReturn(listOf(invTx("new", amount = 6.0)))
+        whenever(fireflyTransactionService.fetchExistingFireflyTransactions())
+            .doSuspendableAnswer { throw java.net.ConnectException("refused") }
+
+        val e = runCatching { orchestrator().syncInvestments(mapOf("brokerage" to 3)) }.exceptionOrNull()
+
+        // Not the raw ConnectException of the old code: that escaped the poll loop and ended the process (#130)
+        assertThat(e).isInstanceOf(IllegalStateException::class.java)
     }
 
     @Test

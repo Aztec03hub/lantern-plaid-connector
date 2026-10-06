@@ -1,11 +1,9 @@
 package net.djvk.fireflyPlaidConnector2.sync
 
-import kotlinx.coroutines.CancellationException
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.SearchApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.TransactionsApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionRead
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionTypeFilter
-import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionTypeProperty
 import net.djvk.fireflyPlaidConnector2.transactions.FireflyTransactionDto
 import net.djvk.fireflyPlaidConnector2.transactions.FireflyTransactionExternalIdIndexer
 import org.slf4j.LoggerFactory
@@ -80,40 +78,35 @@ class FireflyTransactionService(
         return existingFireflyTxs
     }
 
+    /** First day of the pull window; Firefly transactions dated before it are not returned by [fetchExistingFireflyTransactions]. */
+    fun windowStart(): LocalDate = LocalDate.now(zoneId).minusDays(existingFireflyPullWindowDays.toLong())
+
     /**
-     * Plaid can update or remove a transaction long after we imported it, and a pending transaction can take days to
-     * post, so the Firefly transactions it refers to may be older than the pull window. Without them the connector
-     * logs "Failed to find existing Firefly transaction" and the change is never applied.
+     * Plaid can update or remove a transaction long after we imported it, a pending transaction can take days to
+     * post, and an iteration that failed part way is retried with the same Plaid creates, so the Firefly transactions
+     * a poll refers to may be older than the pull window.
      *
      * This looks up, via Firefly's search (`external_id_is:`), the ones for [plaidTransactionIds] that aren't already
-     * in [alreadyFetched]. Capped at [maxLookups] per call to bound the extra API traffic. Lookup failures are
-     * logged and skipped, never fatal.
+     * in [alreadyFetched]. Every id is looked up (a history import needs them all) and a failed lookup propagates:
+     * swallowing it would let the caller commit its Plaid cursor over a change that was never applied or a create
+     * that would be inserted twice.
+     * ponytail: one search request per id, sequential; batch or parallelise if a 24-month history import is too slow.
      */
     suspend fun fetchMissingByPlaidId(
         plaidTransactionIds: Collection<String>,
         alreadyFetched: List<TransactionRead>,
-        maxLookups: Int = 100,
     ): List<TransactionRead> {
         val searchApi = fireflySearchApi ?: return listOf()
         val known = FireflyTransactionExternalIdIndexer(alreadyFetched)
         val missing = plaidTransactionIds.distinct().filter { known.findExistingFireflyTx(it) == null }
         if (missing.isEmpty()) return listOf()
-        if (missing.size > maxLookups) {
-            logger.warn("{} Plaid transactions are outside the Firefly pull window; looking up only the first {}", missing.size, maxLookups)
-        }
 
         val found = mutableListOf<TransactionRead>()
-        for (plaidId in missing.take(maxLookups)) {
+        for (plaidId in missing) {
             val externalId = FireflyTransactionExternalIdIndexer.getExternalId(plaidId)
-            try {
-                val match = searchApi.searchTransactions("external_id_is:\"$externalId\"", 1).body().data
-                    .firstOrNull { read -> read.attributes.transactions.any { it.externalId == externalId } }
-                if (match != null) found.add(match)
-            } catch (ce: CancellationException) {
-                throw ce
-            } catch (e: Exception) {
-                logger.warn("Firefly search for external id {} failed: {}", externalId, e::class.simpleName)
-            }
+            val match = searchApi.searchTransactions("external_id_is:\"$externalId\"", 1).body().data
+                .firstOrNull { read -> read.attributes.transactions.any { it.externalId == externalId } }
+            if (match != null) found.add(match)
         }
         logger.debug("Found {} of {} out-of-window Firefly transactions by external id", found.size, missing.size)
         return found
@@ -130,61 +123,11 @@ class FireflyTransactionService(
         // Insert new transactions
         syncHelper.optimisticInsertBatchIntoFirefly(creates)
         
-        // Process updates
-        /**
-         * All updates here will either be updates of existing Firefly transactions that have been
-         *  paired with incoming Plaid creates to become transfers, or updates coming in directly from Plaid.
-         *
-         * Split them here so we can handle them separately.
-         */
-        val (transferUpdates, nonTransferUpdates) = updates.partition { it.tx.type == TransactionTypeProperty.transfer }
-        processFireflyTransferUpdates(transferUpdates)
-        processFireflyNonTransferUpdates(nonTransferUpdates)
+        // Process updates. This includes converting an existing deposit/withdrawal into a transfer, which is an in-place
+        //  update with type=transfer (Firefly 6.7.7 accepts that), so every Firefly write here is safe to repeat.
+        syncHelper.updateBatchInFirefly(updates)
 
         // Process deletes
         syncHelper.deleteBatchInFirefly(deletes)
-    }
-
-    /**
-     * Firefly's transaction update endpoint does not allow changing transaction types
-     *  (i.e. deposit to transfer), so in cases where we're trying to update existing
-     *  Firefly non-transfer transactions (combined with an incoming Plaid create) to become
-     *  transfer transactions, we have to resolve the updates as deletes and creates.
-     * I'm not crazy about this because any other reference to the existing record will be
-     *  broken, but such is life (and this behavior has been around for a while at this point).
-     */
-    private suspend fun processFireflyTransferUpdates(updates: List<FireflyTransactionDto>) {
-        for (update in updates) {
-            update.id ?: throw IllegalArgumentException("Unexpected transfer update tx missing id: $update")
-
-            /**
-             * Delete first, if that fails, don't do the create.
-             */
-            try {
-                syncHelper.deleteBatchInFirefly(listOf(update.id))
-            } catch (e: Exception) {
-                logger.error(
-                    "Failed to execute delete as first part of updating transaction ${update.id}; " +
-                            "aborting create part of update operation", e
-                )
-                continue
-            }
-
-            /**
-             * This should not be a duplicate, so allow an exception to propagate if it is
-             */
-            syncHelper.pessimisticInsertBatchIntoFirefly(listOf(update))
-        }
-    }
-
-    /**
-     * Updates direct from Plaid will always be non-transfers (see comment a few lines down
-     *  in [TransactionConverter.convertPollSync]) because we're currently not trying to handle
-     *  the complexity of Plaid updates being applied to Firefly transfers (which themselves
-     *  originated as two distinct Plaid transactions).
-     * Because Plaid direct updates are not transfers, we can update them directly in Firefly.
-     */
-    private suspend fun processFireflyNonTransferUpdates(updates: List<FireflyTransactionDto>) {
-        syncHelper.updateBatchInFirefly(updates)
     }
 }

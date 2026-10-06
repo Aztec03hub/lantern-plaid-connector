@@ -123,12 +123,23 @@ internal class SyncCorrectnessTest {
     }
 
     @Test
-    fun searchFailuresAreSkippedNotFatal() = runBlocking<Unit> {
+    fun searchFailuresPropagateSoTheIterationIsRetried() = runBlocking<Unit> {
         whenever(searchApi.searchTransactions(any(), any())).doSuspendableAnswer { throw java.io.IOException("down") }
 
-        val found = service.fetchMissingByPlaidId(listOf("old1"), listOf())
+        // M1: swallowing this let the caller commit its cursor over an update or delete that was never applied
+        val e = runCatching { service.fetchMissingByPlaidId(listOf("old1"), listOf()) }.exceptionOrNull()
 
-        assertThat(found).isEmpty()
+        assertThat(e).isInstanceOf(java.io.IOException::class.java)
+    }
+
+    @Test
+    fun moreThanOneHundredMissingIdsAreAllLookedUp() = runBlocking<Unit> {
+        val empty = searchResult()
+        whenever(searchApi.searchTransactions(any(), any())).thenReturn(empty)
+
+        service.fetchMissingByPlaidId((1..250).map { "id$it" }, listOf())
+
+        verify(searchApi, times(250)).searchTransactions(any(), any())
     }
 
     @Test
@@ -183,7 +194,8 @@ internal class SyncCorrectnessTest {
         whenever(plaidSyncService.processPlaidTransactions(any(), any()))
             .thenReturn(PlaidTransactionResult(listOf(), listOf(), listOf("oldId")))
         whenever(fireflyTransactionService.fetchExistingFireflyTransactions()).thenReturn(listOf())
-        whenever(fireflyTransactionService.fetchMissingByPlaidId(any(), any(), any())).thenReturn(listOf(old))
+        whenever(fireflyTransactionService.fetchMissingByPlaidId(any(), any())).thenReturn(listOf(old))
+        whenever(fireflyTransactionService.windowStart()).thenReturn(java.time.LocalDate.now().minusDays(5))
         whenever(converter.convertPollSync(any(), any(), any(), any(), any()))
             .thenReturn(net.djvk.fireflyPlaidConnector2.transactions.TransactionConverter.ConvertPollSyncResult(listOf(), listOf(), listOf("ffOld")))
 

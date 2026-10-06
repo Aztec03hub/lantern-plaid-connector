@@ -178,7 +178,14 @@ class SyncHelper(
             logger.debug("Delete batch of ${fireflyTxIds.size} txs in Firefly")
         }
         for (fireflyTxId in fireflyTxIds) {
-            fireflyTxApi.deleteTransaction(fireflyTxId)
+            try {
+                fireflyTxApi.deleteTransaction(fireflyTxId)
+            } catch (cre: ClientRequestException) {
+                // Already gone, for example deleted by an earlier attempt of an iteration that then failed and is
+                //  being retried. The goal state is reached, and failing here would block the retry for good.
+                if (cre.response.status != HttpStatusCode.NotFound) throw cre
+                logger.info("Firefly transaction $fireflyTxId was already deleted")
+            }
         }
     }
 }

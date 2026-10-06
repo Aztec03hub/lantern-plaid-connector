@@ -100,8 +100,8 @@ class PolledSyncOrchestrator(
      * ones are rejected by Firefly's duplicate detection, which the insert tolerates. Later corrections or
      * cancellations of an already-imported investment transaction are not propagated.
      *
-     * One Item failing (for example because it wasn't linked with the investments product) is logged and does not
-     * stop the other Items or the regular bank sync.
+     * One Item failing (for example because it wasn't linked with the investments product) does not stop the other
+     * Items; once all have been tried, an exception reports the failed ones.
      */
     suspend fun syncInvestments(
         accountMap: Map<PlaidAccountId, FireflyAccountId>,
@@ -111,18 +111,23 @@ class PolledSyncOrchestrator(
         val investmentItems = syncHelper.getInvestmentAccessTokenAccountIdSets().toList()
         if (investmentItems.isEmpty()) return
 
-        val knownExternalIds = fireflyTransactionService.fetchExistingFireflyTransactions()
-            .flatMap { it.attributes.transactions }
-            .mapNotNull { it.externalId }
-            .toSet()
+        // The Firefly window is read at most once per call, and only if Plaid returned something to compare with
+        var knownExternalIds: Set<String>? = null
+        val failedItems = mutableListOf<String>()
 
         for ((accessToken, accountIds) in investmentItems) {
             try {
                 val plaidTxs = plaidSyncService.fetchInvestmentTransactions(
                     accessToken, accountIds, today.minusDays(investmentLookbackDays), today
                 )
+                if (plaidTxs.isEmpty()) continue
+                val known = knownExternalIds ?: fireflyTransactionService.fetchExistingFireflyTransactions()
+                    .flatMap { it.attributes.transactions }
+                    .mapNotNull { it.externalId }
+                    .toSet()
+                    .also { knownExternalIds = it }
                 val creates = plaidTxs
-                    .filter { FireflyTransactionExternalIdIndexer.getExternalId(it.investmentTransactionId) !in knownExternalIds }
+                    .filter { FireflyTransactionExternalIdIndexer.getExternalId(it.investmentTransactionId) !in known }
                     .mapNotNull { tx ->
                         val fireflyAccountId = accountMap[tx.accountId]
                         if (fireflyAccountId == null) {
@@ -143,7 +148,13 @@ class PolledSyncOrchestrator(
                 logger.error(
                     "Investment sync failed for ${Utilities.redactAccessToken(accessToken)}: ${e::class.simpleName}"
                 )
+                failedItems.add(Utilities.redactAccessToken(accessToken))
             }
+        }
+        // Every Item gets its turn, but a failure is not silent: it fails the iteration, so it is reported through the
+        //  result callback and logged by the poll loop (an outage longer than the lookback loses transactions).
+        if (failedItems.isNotEmpty()) {
+            throw IllegalStateException("Investment sync failed for ${failedItems.size} Item(s): $failedItems")
         }
     }
 
@@ -166,6 +177,12 @@ class PolledSyncOrchestrator(
         // Initialize cursors for access tokens that don't have one yet
         plaidSyncService.initializeCursors(accountAccessTokenSequence, cursorMap)
         cursorManager.writeCursorMap(cursorMap)
+    }
+
+    /** Writes the cursors to disk first and only then advances the in-memory map, so a failed write leaves both stale together. */
+    private suspend fun commitCursors(cursorMap: MutableMap<PlaidAccessToken, PlaidSyncCursor>, workingCursors: Map<PlaidAccessToken, PlaidSyncCursor>) {
+        cursorManager.writeCursorMap(cursorMap + workingCursors)
+        cursorMap.putAll(workingCursors)
     }
 
     /**
@@ -192,17 +209,23 @@ class PolledSyncOrchestrator(
             plaidTransactions.deleted.isEmpty()
         ) {
             logger.debug("No Plaid changes; skipping Firefly")
-            cursorMap.putAll(workingCursors)
-            cursorManager.writeCursorMap(cursorMap)
+            commitCursors(cursorMap, workingCursors)
             return PollResult()
         }
 
         // Fetch existing Firefly transactions in the pull window, plus any older ones that Plaid's updates, removals
         //  and pending-to-posted links refer to (which the window would otherwise miss)
         val windowFireflyTxs = fireflyTransactionService.fetchExistingFireflyTransactions()
+        //  Creates dated before the window are looked up too: an iteration that failed part way is retried with the
+        //  same creates, and without this the only protection against inserting them twice is Firefly's content hash,
+        //  which changes with the import tag and with Plaid edits.
+        val windowStart = fireflyTransactionService.windowStart()
         val referencedPlaidIds = plaidTransactions.updated.map { it.transactionId } +
                 plaidTransactions.deleted +
-                plaidTransactions.created.mapNotNull { it.pendingTransactionId }
+                plaidTransactions.created.mapNotNull { it.pendingTransactionId } +
+                plaidTransactions.created
+                    .filter { minOf(it.date, it.authorizedDate ?: it.date) < windowStart }
+                    .map { it.transactionId }
         val existingFireflyTxs = windowFireflyTxs +
                 fireflyTransactionService.fetchMissingByPlaidId(referencedPlaidIds, windowFireflyTxs)
 
@@ -229,8 +252,7 @@ class PolledSyncOrchestrator(
         )
 
         // Commit the cursors only after successful processing
-        cursorMap.putAll(workingCursors)
-        cursorManager.writeCursorMap(cursorMap)
+        commitCursors(cursorMap, workingCursors)
 
         return PollResult(
             existingFireflyTransactionsRead = existingFireflyTxs.size,
@@ -255,6 +277,9 @@ class PolledSyncOrchestrator(
         val iterationStart = Instant.now()
         val pollResult = try {
             processTransactions(accountMap, accountAccessTokenSequence, cursorMap)
+                // Accounts marked investment: true. Inside this try so a failure is reported to the callback and,
+                //  like any other, caught by the poll loop (see [pollOnce]) instead of ending the process.
+                .also { syncInvestments(accountMap) }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -287,6 +312,39 @@ class PolledSyncOrchestrator(
         }
     }
 
+    private var consecutiveFailures = 0
+
+    /**
+     * One iteration of the polling loop. A failed iteration (network down, Plaid or Firefly error) must not kill the
+     * loop: cursors are only committed on success, so the next iteration retries the same data. Never throws, except
+     * for cancellation.
+     */
+    suspend fun pollOnce(
+        accountMap: Map<PlaidAccountId, FireflyAccountId>,
+        accountAccessTokenSequence: Sequence<Pair<PlaidAccessToken, List<PlaidAccountId>>>,
+        cursorMap: MutableMap<PlaidAccessToken, PlaidSyncCursor>,
+    ) {
+        logger.debug("Polling loop start")
+        try {
+            // Optionally nudge Plaid to check for new data; it arrives on a later poll
+            refreshItemsDue(accountAccessTokenSequence)
+
+            runIteration(accountMap, accountAccessTokenSequence, cursorMap)
+            if (consecutiveFailures > 0) {
+                logger.info("Poll recovered after $consecutiveFailures failed iteration(s)")
+            }
+            consecutiveFailures = 0
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            consecutiveFailures++
+            logger.error(
+                "Poll iteration failed ($consecutiveFailures consecutive); " +
+                        "retrying in $syncFrequencyMinutes minutes", e
+            )
+        }
+    }
+
     override fun run() {
         runBlocking {
             mainJob = launch {
@@ -301,38 +359,11 @@ class PolledSyncOrchestrator(
                     Triple(accountMap, accountAccessTokenSequence, cursorManager.readCursorMap())
                 }
 
-                var consecutiveFailures = 0
-
                 /**
                  * Periodic polling loop
                  */
                 do {
-                    logger.debug("Polling loop start")
-
-                    // Process transactions (and report the outcome to the optional result callback). A failed
-                    //  iteration (network down, Plaid or Firefly error) must not kill the loop: cursors are only
-                    //  committed on success, so the next iteration retries the same data.
-                    try {
-                        // Optionally nudge Plaid to check for new data; it arrives on a later poll
-                        refreshItemsDue(accountAccessTokenSequence)
-
-                        runIteration(accountMap, accountAccessTokenSequence, cursorMap)
-                        if (consecutiveFailures > 0) {
-                            logger.info("Poll recovered after $consecutiveFailures failed iteration(s)")
-                        }
-                        consecutiveFailures = 0
-                    } catch (e: CancellationException) {
-                        throw e
-                    } catch (e: Exception) {
-                        consecutiveFailures++
-                        logger.error(
-                            "Poll iteration failed ($consecutiveFailures consecutive); " +
-                                    "retrying in $syncFrequencyMinutes minutes", e
-                        )
-                    }
-
-                    // Accounts marked investment: true
-                    syncInvestments(accountMap)
+                    pollOnce(accountMap, accountAccessTokenSequence, cursorMap)
 
                     // Trigger GC to try to reduce heap size
                     logger.trace("Calling System.gc()")

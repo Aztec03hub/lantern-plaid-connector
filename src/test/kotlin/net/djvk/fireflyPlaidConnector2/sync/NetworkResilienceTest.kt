@@ -161,7 +161,8 @@ internal class NetworkResilienceTest {
         }
         whenever(converter.convertPollSync(any(), any(), any(), any(), any()))
             .thenReturn(TransactionConverter.ConvertPollSyncResult(emptyList(), emptyList(), emptyList()))
-        whenever(fireflyTransactionService.fetchMissingByPlaidId(any(), any(), any())).thenReturn(emptyList())
+        whenever(fireflyTransactionService.fetchMissingByPlaidId(any(), any())).thenReturn(emptyList())
+        whenever(fireflyTransactionService.windowStart()).thenReturn(java.time.LocalDate.now().minusDays(5))
         whenever(fireflyTransactionService.processFireflyTransactionUpdates(any(), any(), any()))
             .doSuspendableAnswer { throw ConnectTimeoutException("Firefly unreachable") }
 

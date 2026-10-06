@@ -267,7 +267,8 @@ internal class PolledSyncOrchestratorTest {
         whenever(cursorManager.readCursorMap()).thenReturn(cursorMap)
         whenever(syncHelper.getAllPlaidAccessTokenAccountIdSets()).thenReturn(Pair(accountMap, accountAccessTokenSequence))
         whenever(fireflyTransactionService.fetchExistingFireflyTransactions()).thenReturn(existingFireflyTxs)
-        whenever(fireflyTransactionService.fetchMissingByPlaidId(any(), any(), any())).thenReturn(emptyList())
+        whenever(fireflyTransactionService.fetchMissingByPlaidId(any(), any())).thenReturn(emptyList())
+        whenever(fireflyTransactionService.windowStart()).thenReturn(java.time.LocalDate.now().minusDays(5))
         whenever(plaidSyncService.processPlaidTransactions(eq(accountAccessTokenSequence), eq(cursorMap))).thenReturn(plaidTransactionResult)
         whenever(converter.convertPollSync(
             eq(accountMap),
@@ -339,7 +340,8 @@ internal class PolledSyncOrchestratorTest {
         )
         runBlocking {
             whenever(fireflyTransactionService.fetchExistingFireflyTransactions()).thenReturn(emptyList())
-            whenever(fireflyTransactionService.fetchMissingByPlaidId(any(), any(), any())).thenReturn(emptyList())
+            whenever(fireflyTransactionService.fetchMissingByPlaidId(any(), any())).thenReturn(emptyList())
+            whenever(fireflyTransactionService.windowStart()).thenReturn(java.time.LocalDate.now().minusDays(5))
             whenever(plaidSyncService.processPlaidTransactions(eq(sequence), eq(cursorMap))).thenReturn(plaidResult)
             whenever(converter.convertPollSync(any(), any(), any(), any(), any())).thenReturn(convertResult)
         }

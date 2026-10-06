@@ -319,8 +319,10 @@ data class TransactionSplit(
     @field:JsonProperty("has_attachments")
     val hasAttachments: kotlin.Boolean? = null
 ) {
-    fun toTransactionSplitUpdate(): TransactionSplitUpdate {
+    /** @param includeType send the transaction type too; only wanted when converting to a transfer */
+    fun toTransactionSplitUpdate(includeType: Boolean = false): TransactionSplitUpdate {
         return TransactionSplitUpdate(
+            type = if (includeType) type else null,
             date = date,
             amount = amount,
             description = description,

@@ -54,12 +54,10 @@ class FireflyTransactionServiceTest {
             // Verify
             verify(syncHelper).optimisticInsertBatchIntoFirefly(eq(creates))
 
-            // Verify transfer update is handled with delete and create
-            verify(syncHelper).deleteBatchInFirefly(eq(listOf("transfer-update-id")))
-            verify(syncHelper).pessimisticInsertBatchIntoFirefly(eq(listOf(transferUpdate)))
-
-            // Verify non-transfer update is handled with direct update
-            verify(syncHelper).updateBatchInFirefly(eq(listOf(nonTransferUpdate)))
+            // H1: a transfer conversion is an in-place update like any other, never a delete plus create
+            verify(syncHelper).updateBatchInFirefly(eq(updates))
+            verify(syncHelper, never()).pessimisticInsertBatchIntoFirefly(any())
+            verify(syncHelper, never()).deleteBatchInFirefly(eq(listOf("transfer-update-id")))
 
             // Verify deletes
             verify(syncHelper).deleteBatchInFirefly(eq(deletes))
@@ -67,26 +65,19 @@ class FireflyTransactionServiceTest {
     }
 
     @Test
-    fun testProcessFireflyTransactionUpdatesHandlesDeleteFailure() {
+    fun aFailedTransferConversionPropagatesAndNothingIsDeleted() {
         runBlocking {
-            // Setup a transfer update
-            val transferTransaction = FireflyFixtures.getTransaction(type = TransactionTypeProperty.transfer)
-            val transferTxSplit = transferTransaction.transactions.first()
+            val transferTxSplit = FireflyFixtures.getTransaction(type = TransactionTypeProperty.transfer).transactions.first()
             val transferUpdate = FireflyTransactionDto("transfer-update-id", transferTxSplit)
+            whenever(syncHelper.updateBatchInFirefly(any())).thenThrow(RuntimeException("Update failed"))
 
-            // Mock delete to throw exception
-            whenever(syncHelper.deleteBatchInFirefly(eq(listOf("transfer-update-id")))).thenThrow(RuntimeException("Delete failed"))
+            // H1(a): this used to be caught and logged, and the caller then committed its Plaid cursor
+            val e = runCatching {
+                fireflyTransactionService.processFireflyTransactionUpdates(emptyList(), listOf(transferUpdate), listOf("9"))
+            }.exceptionOrNull()
 
-            // Execute
-            fireflyTransactionService.processFireflyTransactionUpdates(
-                emptyList(),
-                listOf(transferUpdate),
-                emptyList()
-            )
-
-            // Verify
-            verify(syncHelper).deleteBatchInFirefly(eq(listOf("transfer-update-id")))
-            // Verify that pessimisticInsertBatchIntoFirefly is not called due to delete failure
+            assertEquals("Update failed", e?.message)
+            verify(syncHelper, never()).deleteBatchInFirefly(any())
             verify(syncHelper, never()).pessimisticInsertBatchIntoFirefly(any())
         }
     }

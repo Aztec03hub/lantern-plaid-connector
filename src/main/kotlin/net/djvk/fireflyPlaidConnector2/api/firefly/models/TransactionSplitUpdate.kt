@@ -84,6 +84,13 @@ import com.fasterxml.jackson.annotation.JsonProperty
 @JsonInclude(JsonInclude.Include.NON_NULL)
 data class TransactionSplitUpdate(
 
+    /*
+     * Hand-added. Firefly 6.7.7 accepts a type change on update (verified live: deposit to transfer through
+     * PUT /transactions/{id}). Only set when converting a withdrawal/deposit into a transfer.
+     */
+    @field:JsonProperty("type")
+    val type: TransactionTypeProperty? = null,
+
     /* Date of the transaction */
     @field:JsonProperty("date")
     val date: java.time.OffsetDateTime? = null,

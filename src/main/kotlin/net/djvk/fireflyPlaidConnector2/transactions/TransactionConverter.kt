@@ -366,12 +366,16 @@ class TransactionConverter(
 
                     val fireflyComponent = create.fireflyTransaction
                     if (fireflyComponent != null) {
-                        convertDoubleFirefly(
+                        val converted = convertDoubleFirefly(
                             requirePlaidTransaction(create),
                             fireflyComponent,
                             accountMap,
                             importTag,
                         )
+                        // Converted in place, so keep the user's tags and reconciliation on the existing transaction
+                        val target = existingFireflyTxs.firstOrNull { it.id == converted.id }
+                        if (target == null) converted
+                        else FireflyTransactionDto(converted.id, preserveUserFields(converted.tx, target, keepCounterparty = false))
                     } else {
                         convertDoublePlaid(
                             requirePlaidTransaction(create.deposit),
@@ -384,6 +388,14 @@ class TransactionConverter(
             }
 
             if (convertedSingle.id == null) {
+                // A create whose external id is already in Firefly (whatever its type) was inserted by an earlier,
+                //  partly failed iteration, possibly as one leg of a transfer. Skip it so a retry never records the
+                //  same money twice.
+                val externalId = convertedSingle.tx.externalId
+                if (externalId != null && indexer.findByExternalId(externalId) != null) {
+                    logger.info("Skipping create of {}: Firefly already has a transaction with that external id", externalId)
+                    continue
+                }
                 creates.add(convertedSingle)
             } else {
                 updates.add(convertedSingle)
@@ -477,15 +489,30 @@ class TransactionConverter(
      * - Plaid-derived tags (category and pending tags) are refreshed, but tags the user added in Firefly are kept.
      *   Sending just the Plaid tags would remove the user's.
      * - The existing currency is carried over, which Firefly requires on updates.
+     * - Reconciled flag, description and counterparty name are not sent (see the comments in the body), unless
+     *   [keepCounterparty] is false: a conversion to a transfer needs both accounts spelled out.
      * Fields the connector never sets (category, budget, notes, ...) are null here and are omitted from the update
      *  JSON (see TransactionSplitUpdate), so the user's values for them are untouched.
      */
-    private fun preserveUserFields(update: TransactionSplit, target: TransactionRead): TransactionSplit {
+    private fun preserveUserFields(
+        update: TransactionSplit,
+        target: TransactionRead,
+        keepCounterparty: Boolean = true,
+    ): TransactionSplit {
         val existingSplit = target.attributes.transactions.firstOrNull() ?: return update
         return update.copy(
             tags = mergeTags(existingSplit.tags, update.tags),
             currencyId = existingSplit.currencyId ?: update.currencyId,
             currencyCode = existingSplit.currencyCode ?: update.currencyCode,
+            // The connector sets reconciled=false on create; sending it again would un-reconcile what the user
+            //  reconciled. null omits it from the update JSON.
+            reconciled = null,
+            order = null,
+            // Description and counterparty are the user's to edit once imported (Plaid's are only a first guess), so
+            //  an update keeps the existing ones. The account on our side stays Plaid-owned.
+            description = if (keepCounterparty) existingSplit.description else update.description,
+            sourceName = if (keepCounterparty) null else update.sourceName,
+            destinationName = if (keepCounterparty) null else update.destinationName,
         )
     }
 
