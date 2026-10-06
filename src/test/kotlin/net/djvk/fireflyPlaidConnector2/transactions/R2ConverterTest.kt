@@ -125,6 +125,22 @@ internal class R2ConverterTest {
         assertThat(result.creates).isEmpty()
     }
 
+    /**
+     * A transfer recorded by an older build has only one leg's id. Re-pairing the same two legs makes a transfer whose
+     * external id is the OTHER leg, found only through the internal reference of the new one.
+     */
+    @Test
+    fun aRetriedPairIsSkippedWhenAnOlderTransferHasOnlyTheOtherLegsId() = runBlocking<Unit> {
+        val older = existing("ff1", "plaid-wd", TransactionTypeProperty.transfer)
+
+        val result = converter().convertPollSync(
+            accountMap, listOf(plaid(accountA, "wd", 50.0), plaid(accountB, "dep", -50.0)), listOf(), listOf(), listOf(older)
+        )
+
+        assertThat(result.creates).isEmpty()
+        assertThat(result.updates).isEmpty()
+    }
+
     @Test
     fun aPlaidUpdateOfTheLegStoredAsInternalReferenceFindsTheTransfer() = runBlocking<Unit> {
         val transfer = existing("ff1", "plaid-dep", TransactionTypeProperty.transfer, internalReference = "plaid-wd")
@@ -229,6 +245,19 @@ internal class R2ConverterTest {
         assertThat(tx.sourceName).isNull()
         assertThat(tx.destinationName).isNull()
         assertThat(tx.description).isEqualTo("User words")
+    }
+
+    /** R3 survivor, the deposit side: Plaid's name for the sender must not overwrite what the user set. */
+    @Test
+    fun anOrdinaryUpdateOfADepositDoesNotResendTheCounterpartyName() = runBlocking<Unit> {
+        val result = converter().convertPollSync(
+            accountMap, listOf(), listOf(plaid(accountA, "x", -25.0, name = "ACME PAYROLL")), listOf(),
+            listOf(existing("ff1", "plaid-x", TransactionTypeProperty.deposit, sourceId = null, destinationId = "1"))
+        )
+
+        val tx = result.updates.single().tx
+        assertThat(tx.sourceName).isNull()
+        assertThat(tx.destinationName).isNull()
     }
 
     /** A leg whose sign flips swaps the transfer's direction instead of being sent as the original one. */
