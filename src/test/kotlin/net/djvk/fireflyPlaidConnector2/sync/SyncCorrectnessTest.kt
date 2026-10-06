@@ -294,6 +294,31 @@ internal class SyncCorrectnessTest {
         assertThat(call).isEqualTo(3)
     }
 
+    /** R1 L1: the restart must really use the cursor the sync began at, not just call Plaid again. */
+    @Test
+    fun theRestartedPaginationSendsTheOriginalCursorToPlaid() = runBlocking<Unit> {
+        val plaid = net.djvk.fireflyPlaidConnector2.lib.PlaidMock()
+        val sentCursors = mutableListOf<String?>()
+        val tx1 = PlaidFixtures.getPaymentTransaction(accountId = "acct", transactionId = "tx1")
+        var call = 0
+        whenever(plaid.api.transactionsSync(any())).doSuspendableAnswer {
+            sentCursors.add((it.getArgument<net.djvk.fireflyPlaidConnector2.api.plaid.models.TransactionsSyncRequest>(0)).cursor)
+            when (++call) {
+                1 -> createPlaidResponse(syncResponse(listOf(tx1), "c1", hasMore = true))
+                2 -> throw mutationException()
+                3 -> createPlaidResponse(syncResponse(listOf(tx1), "c9", hasMore = false))
+                else -> error("unexpected call $call")
+            }
+        }
+        val cursors = mutableMapOf("tok" to "start")
+
+        PlaidSyncService(plaid.wrapper, 100, false)
+            .processPlaidTransactions(sequenceOf(Pair("tok", listOf("acct"))), cursors)
+
+        // page 1 from "start", page 2 from "c1" (fails), the restart again from "start", not from "c1"
+        assertThat(sentCursors).containsExactly("start", "c1", "start")
+    }
+
     @Test
     fun paginationRestartsAreBoundedSoAPermanentlyChangingItemCannotLoopForever() = runBlocking<Unit> {
         var call = 0
