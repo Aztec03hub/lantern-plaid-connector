@@ -166,6 +166,35 @@ internal class RetryIdempotencyTest {
 
     // endregion
 
+    // region H4
+
+    /** The #130 fix was undone because investment sync ran outside the guarded iteration. */
+    @Test
+    fun investmentSyncRunsInsideTheIterationAndItsFailureIsReportedAndSurvivedByTheLoop() = runBlocking<Unit> {
+        val webhook: WebhookService = mock()
+        val sequence = sequenceOf(Pair("tok", listOf(accountA)))
+        val cursorMap = mutableMapOf<String, String>()
+        whenever(plaidSyncService.processPlaidTransactions(any(), any()))
+            .thenReturn(PlaidTransactionResult(listOf(), listOf(), listOf()))
+        whenever(syncHelper.getInvestmentAccessTokenAccountIdSets())
+            .thenReturn(sequenceOf(Pair("brokerTok", listOf("brokerage"))))
+        whenever(plaidSyncService.fetchInvestmentTransactions(any(), any(), any(), any()))
+            .doSuspendableAnswer { throw java.net.ConnectException("down") }
+        val orchestrator = PolledSyncOrchestrator(
+            30, syncHelper, cursorManager, plaidSyncService, fireflyTransactionService, mockConverter, webhook,
+            investmentConverter = mock(),
+        )
+
+        val e = runCatching { orchestrator.runIteration(mapOf(accountA to 1), sequence, cursorMap) }.exceptionOrNull()
+        assertThat(e).isInstanceOf(IllegalStateException::class.java)
+        verify(webhook).post(any(), any(), org.mockito.kotlin.isNull(), any())
+
+        // and the poll loop's iteration swallows it instead of ending the process
+        orchestrator.pollOnce(mapOf(accountA to 1), sequence, cursorMap)
+    }
+
+    // endregion
+
     // region M4 / L2
 
     @Test
