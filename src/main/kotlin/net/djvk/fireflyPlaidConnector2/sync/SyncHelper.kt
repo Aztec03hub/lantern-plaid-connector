@@ -58,7 +58,10 @@ class SyncHelper(
             Pair<Map<PlaidAccountId, FireflyAccountId>, Sequence<Pair<PlaidAccessToken, List<PlaidAccountId>>>> {
         val accountMap = plaidAccountsConfig.accounts.associate { Pair(it.plaidAccountId, it.fireflyAccountId) }
         logger.trace("Read config mapping data for ${accountMap.size} Firefly accounts")
-        val accountsByAccessToken = plaidAccountsConfig.accounts.groupBy { it.plaidItemAccessToken }
+        // Investment accounts are synced through a different Plaid endpoint, see getInvestmentAccessTokenAccountIdSets
+        val accountsByAccessToken = plaidAccountsConfig.accounts
+            .filter { !it.investment }
+            .groupBy { it.plaidItemAccessToken }
         logger.trace("Read config mapping data for ${accountsByAccessToken.size} Plaid access tokens")
 
         return Pair(accountMap, sequence {
@@ -67,6 +70,21 @@ class SyncHelper(
                 yield(Pair(accessToken, accountIds))
             }
         })
+    }
+
+    /**
+     * The configured accounts marked `investment: true`, grouped by Plaid Item. These are read with
+     * /investments/transactions/get rather than /transactions/sync.
+     */
+    fun getInvestmentAccessTokenAccountIdSets(): Sequence<Pair<PlaidAccessToken, List<PlaidAccountId>>> {
+        val investmentsByAccessToken = plaidAccountsConfig.accounts
+            .filter { it.investment }
+            .groupBy { it.plaidItemAccessToken }
+        return sequence {
+            for ((accessToken, accountConfigs) in investmentsByAccessToken) {
+                yield(Pair(accessToken, accountConfigs.map { it.plaidAccountId }))
+            }
+        }
     }
 
     suspend fun optimisticInsertBatchIntoFirefly(fireflyTxs: List<FireflyTransactionDto>) {

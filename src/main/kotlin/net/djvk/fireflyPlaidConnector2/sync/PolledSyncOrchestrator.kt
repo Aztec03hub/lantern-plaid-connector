@@ -6,6 +6,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import net.djvk.fireflyPlaidConnector2.transactions.FireflyAccountId
+import net.djvk.fireflyPlaidConnector2.transactions.FireflyTransactionExternalIdIndexer
+import net.djvk.fireflyPlaidConnector2.transactions.InvestmentTransactionConverter
 import net.djvk.fireflyPlaidConnector2.transactions.TransactionConverter
 import net.djvk.fireflyPlaidConnector2.util.Utilities
 import org.slf4j.LoggerFactory
@@ -56,6 +58,12 @@ class PolledSyncOrchestrator(
      */
     @Value("\${fireflyPlaidConnector2.polled.importHistoryOnFirstSync:false}")
     private val importHistoryOnFirstSync: Boolean = false,
+
+    private val investmentConverter: InvestmentTransactionConverter? = null,
+
+    /** How many days back each poll re-reads investment transactions (Plaid has no change feed for them). */
+    @Value("\${fireflyPlaidConnector2.polled.investmentLookbackDays:14}")
+    private val investmentLookbackDays: Long = 14,
 ) : Runner, DisposableBean {
     private val logger = LoggerFactory.getLogger(this::class.java)
 
@@ -80,6 +88,62 @@ class PolledSyncOrchestrator(
             if (last != null && java.time.Duration.between(last, now).toMinutes() < refreshIntervalMinutes) continue
             lastRefreshAt[accessToken] = now
             plaidSyncService.refreshTransactions(accessToken)
+        }
+    }
+
+    /**
+     * Syncs accounts configured with `investment: true` (upstream issue #68): reads their recent investment
+     * transactions from Plaid and inserts the ones Firefly doesn't have yet.
+     *
+     * Plaid has no cursor or change events for investment transactions, so each poll re-reads the last
+     * [investmentLookbackDays] days. Transactions already in Firefly's pull window are skipped by external id; older
+     * ones are rejected by Firefly's duplicate detection, which the insert tolerates. Later corrections or
+     * cancellations of an already-imported investment transaction are not propagated.
+     *
+     * One Item failing (for example because it wasn't linked with the investments product) is logged and does not
+     * stop the other Items or the regular bank sync.
+     */
+    suspend fun syncInvestments(
+        accountMap: Map<PlaidAccountId, FireflyAccountId>,
+        today: java.time.LocalDate = java.time.LocalDate.now(),
+    ) {
+        val converter = investmentConverter ?: return
+        val investmentItems = syncHelper.getInvestmentAccessTokenAccountIdSets().toList()
+        if (investmentItems.isEmpty()) return
+
+        val knownExternalIds = fireflyTransactionService.fetchExistingFireflyTransactions()
+            .flatMap { it.attributes.transactions }
+            .mapNotNull { it.externalId }
+            .toSet()
+
+        for ((accessToken, accountIds) in investmentItems) {
+            try {
+                val plaidTxs = plaidSyncService.fetchInvestmentTransactions(
+                    accessToken, accountIds, today.minusDays(investmentLookbackDays), today
+                )
+                val creates = plaidTxs
+                    .filter { FireflyTransactionExternalIdIndexer.getExternalId(it.investmentTransactionId) !in knownExternalIds }
+                    .mapNotNull { tx ->
+                        val fireflyAccountId = accountMap[tx.accountId]
+                        if (fireflyAccountId == null) {
+                            logger.warn("Investment transaction for an unconfigured Plaid account; skipping")
+                            null
+                        } else {
+                            converter.convert(tx, fireflyAccountId)
+                        }
+                    }
+                logger.debug(
+                    "Investments for ${Utilities.redactAccessToken(accessToken)}: ${plaidTxs.size} read, " +
+                            "${creates.size} new"
+                )
+                syncHelper.optimisticInsertBatchIntoFirefly(creates)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                logger.error(
+                    "Investment sync failed for ${Utilities.redactAccessToken(accessToken)}: ${e::class.simpleName}"
+                )
+            }
         }
     }
 
@@ -266,6 +330,9 @@ class PolledSyncOrchestrator(
                                     "retrying in $syncFrequencyMinutes minutes", e
                         )
                     }
+
+                    // Accounts marked investment: true
+                    syncInvestments(accountMap)
 
                     // Trigger GC to try to reduce heap size
                     logger.trace("Calling System.gc()")
