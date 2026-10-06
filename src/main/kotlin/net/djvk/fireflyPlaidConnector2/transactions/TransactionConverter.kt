@@ -51,13 +51,52 @@ class TransactionConverter(
     private val detailedCategoryPrefix: String,
 
     private val txStyle: TransactionStyleConfig,
+
+    /**
+     * Optional tag added to every transaction CREATED during a sync run, like the Firefly data importer's
+     * "Data Import on ..." tag. Text inside {braces} is a java.time.format.DateTimeFormatter pattern evaluated in
+     * [timeZoneString] at the start of the run, e.g. "Plaid import {yyyy-MM-dd @ HH:mm}". Blank disables it.
+     * Updates to existing transactions are not re-tagged.
+     */
+    @Value("\${fireflyPlaidConnector2.importTag:}")
+    private val importTagTemplate: String = "",
 ) {
     private val logger = LoggerFactory.getLogger(this::class.java)
     private val timeZone = TimeZone.getTimeZone(timeZoneString)
     private val zoneId = timeZone.toZoneId()
+
+    init {
+        // Fail fast on a bad pattern instead of on the first sync
+        currentImportTag()
+    }
+
+    /**
+     * The import tag for a run starting now, or null if none is configured.
+     */
+    fun currentImportTag(): String? = renderImportTag(importTagTemplate, ZonedDateTime.now(zoneId))
     private val transferMatcher = TransferMatcher(timeZoneString, transferMatchWindowDays)
 
     companion object {
+        private val importTagPlaceholder = Regex("\\{([^{}]*)\\}")
+
+        /**
+         * Replaces each {pattern} in [template] with [now] formatted using that DateTimeFormatter pattern.
+         * @return the rendered tag, or null if [template] is blank
+         * @throws IllegalArgumentException if a pattern is not a valid DateTimeFormatter pattern
+         */
+        fun renderImportTag(template: String, now: ZonedDateTime): String? {
+            if (template.isBlank()) return null
+            return importTagPlaceholder.replace(template.trim()) { match ->
+                try {
+                    java.time.format.DateTimeFormatter.ofPattern(match.groupValues[1]).format(now)
+                } catch (e: IllegalArgumentException) {
+                    throw IllegalArgumentException(
+                        "fireflyPlaidConnector2.importTag has an invalid date pattern '${match.groupValues[1]}': ${e.message}"
+                    )
+                }
+            }
+        }
+
         fun convertScreamingSnakeCaseToKebabCase(input: String): String {
             return input
                 .replace("_", "-")
@@ -198,17 +237,19 @@ class TransactionConverter(
         accountMap: Map<PlaidAccountId, FireflyAccountId>,
     ): List<FireflyTransactionDto> {
         logger.debug("Batch sync converting Plaid transactions to Firefly transactions")
+        val importTag = currentImportTag()
         return transferMatcher.match(PlaidFireflyTransaction.normalizeByTransactionId(txs, listOf(), accountMap)).map {
             when (it) {
                 is PlaidFireflyTransaction.Transfer -> {
                     convertDoublePlaid(
                         requirePlaidTransaction(it.withdrawal),
                         requirePlaidTransaction(it.deposit),
-                        accountMap
+                        accountMap,
+                        importTag,
                     )
                 }
                 else -> {
-                    convertSingle(requirePlaidTransaction(it), accountMap)
+                    convertSingle(requirePlaidTransaction(it), accountMap, importTag)
                 }
             }
         }
@@ -240,6 +281,7 @@ class TransactionConverter(
         val creates = mutableListOf<FireflyTransactionDto>()
         val updates = mutableListOf<FireflyTransactionDto>()
         val deletes = mutableListOf<FireflyTransactionId>()
+        val importTag = currentImportTag()
 
         /**
          * Don't pass in [plaidUpdatedTxs] here because we're not going to try to update transfers for now
@@ -259,7 +301,8 @@ class TransactionConverter(
          */
         for (create in wrappedCreates) {
             val convertedSingle = when (create) {
-                is PlaidFireflyTransaction.PlaidTransaction -> convertSingle(create.plaidTransaction, accountMap)
+                is PlaidFireflyTransaction.PlaidTransaction ->
+                    convertSingle(create.plaidTransaction, accountMap, importTag)
 
                 // In both of these cases a Firefly transaction already exists. We don't need to do anything to it.
                 // If we have an associated Plaid transaction, log a message. Otherwise, silently ignore it.
@@ -287,12 +330,14 @@ class TransactionConverter(
                             requirePlaidTransaction(create),
                             fireflyComponent,
                             accountMap,
+                            importTag,
                         )
                     } else {
                         convertDoublePlaid(
                             requirePlaidTransaction(create.deposit),
                             requirePlaidTransaction(create.withdrawal),
                             accountMap,
+                            importTag,
                         )
                     }
                 }
@@ -357,9 +402,13 @@ class TransactionConverter(
 
     }
 
+    /**
+     * @param importTag tag to add for this run; null for Plaid updates, which must not be re-tagged
+     */
     protected suspend fun convertSingle(
         tx: PlaidTransaction,
         accountMap: Map<PlaidAccountId, FireflyAccountId>,
+        importTag: String? = null,
     ): FireflyTransactionDto {
         logger.trace("Starting ${::convertSingle.name}")
         val fireflyAccountId = accountMap[tx.accountId]?.toString()
@@ -389,6 +438,7 @@ class TransactionConverter(
             sourceName = sourceName,
             destinationId = destinationId,
             destinationName = destinationName,
+            importTag = importTag,
         )
     }
 
@@ -396,6 +446,7 @@ class TransactionConverter(
         a: PlaidTransaction,
         b: PlaidTransaction,
         accountMap: Map<PlaidAccountId, FireflyAccountId>,
+        importTag: String? = null,
     ): FireflyTransactionDto {
         val (sourceTx, destinationTx) = if (a.amount < 0.0) Pair(b, a) else Pair(a, b)
         return convert(
@@ -406,6 +457,7 @@ class TransactionConverter(
                 ?: throw RuntimeException("Failed to find Firefly account mapping for Plaid account ${sourceTx.accountId}"),
             destinationId = accountMap[destinationTx.accountId]?.toString()
                 ?: throw RuntimeException("Failed to find Firefly account mapping for Plaid account ${destinationTx.accountId}"),
+            importTag = importTag,
         )
     }
 
@@ -413,6 +465,7 @@ class TransactionConverter(
         plaidTx: PlaidTransaction,
         fireflyTx: FireflyTransactionDto,
         accountMap: Map<PlaidAccountId, FireflyAccountId>,
+        importTag: String? = null,
     ): FireflyTransactionDto {
         val plaidTxFireflyAccountId = accountMap[plaidTx.accountId]
             ?: throw RuntimeException("Failed to find Firefly account mapping for Plaid account ${plaidTx.accountId}")
@@ -465,6 +518,7 @@ class TransactionConverter(
             destinationId = destinationId,
             destinationName = destinationName,
             fireflyTx = fireflyTx,
+            importTag = importTag,
         )
     }
 
@@ -479,6 +533,7 @@ class TransactionConverter(
         destinationId: String? = null,
         destinationName: String? = null,
         fireflyTx: FireflyTransactionDto? = null,
+        importTag: String? = null,
     ): FireflyTransactionDto {
         val postedTime = getTxPostedTimestamp(tx)
         val authorizedTime = getTxAuthorizedTimestamp(tx)
@@ -509,7 +564,7 @@ class TransactionConverter(
             sourceName = sourceName,
             destinationId = destinationId,
             destinationName = destinationName,
-            tags = getFireflyCategoryTags(tx),
+            tags = getFireflyCategoryTags(tx) + listOfNotNull(importTag),
             latitude = tx.location.lat,
             longitude = tx.location.lon,
             externalUrl = externalUrl,
