@@ -41,11 +41,39 @@ class PolledSyncOrchestrator(
 
     /** Null unless `fireflyPlaidConnector2.polled.resultCallbackUrl` is configured. */
     private val webhookService: WebhookService? = null,
+
+    /**
+     * If greater than zero, ask Plaid to refresh each Item (/transactions/refresh) at most this often, before the
+     * poll that follows. 0 (the default) disables it. See [refreshItemsDue].
+     */
+    @Value("\${fireflyPlaidConnector2.polled.refreshIntervalMinutes:0}")
+    private val refreshIntervalMinutes: Long = 0,
 ) : Runner, DisposableBean {
     private val logger = LoggerFactory.getLogger(this::class.java)
 
     private val terminated = AtomicBoolean(false)
     private lateinit var mainJob: Job
+
+    /** When each Item (by access token) was last asked to refresh; in memory only, so every restart refreshes once. */
+    private val lastRefreshAt = mutableMapOf<PlaidAccessToken, Instant>()
+
+    /**
+     * Requests a Plaid refresh for every Item that hasn't been asked within [refreshIntervalMinutes]. The attempt
+     * time is recorded even if Plaid rejects the request, so a failing or unsupported Item is retried only on the
+     * interval rather than every poll (Plaid bills successful refreshes).
+     */
+    suspend fun refreshItemsDue(
+        accessTokens: Sequence<Pair<PlaidAccessToken, List<PlaidAccountId>>>,
+        now: Instant = Instant.now(),
+    ) {
+        if (refreshIntervalMinutes <= 0) return
+        for ((accessToken, _) in accessTokens) {
+            val last = lastRefreshAt[accessToken]
+            if (last != null && java.time.Duration.between(last, now).toMinutes() < refreshIntervalMinutes) continue
+            lastRefreshAt[accessToken] = now
+            plaidSyncService.refreshTransactions(accessToken)
+        }
+    }
 
     /**
      * Initializes cursors for access tokens that don't have one yet.
@@ -207,6 +235,9 @@ class PolledSyncOrchestrator(
                     //  iteration (network down, Plaid or Firefly error) must not kill the loop: cursors are only
                     //  committed on success, so the next iteration retries the same data.
                     try {
+                        // Optionally nudge Plaid to check for new data; it arrives on a later poll
+                        refreshItemsDue(accountAccessTokenSequence)
+
                         runIteration(accountMap, accountAccessTokenSequence, cursorMap)
                         if (consecutiveFailures > 0) {
                             logger.info("Poll recovered after $consecutiveFailures failed iteration(s)")

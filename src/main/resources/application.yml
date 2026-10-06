@@ -60,6 +60,13 @@ fireflyPlaidConnector2:
     # resultCallbackUrl: https://monitor.example.com/connector-result
     # Optional. If set, sent as "Authorization: Bearer <token>" on the callback. Prefer https when using this.
     # resultCallbackBearerToken: change-me
+    # If greater than 0, ask Plaid to check each Item's institution for new transactions (/transactions/refresh) at
+    #   most this often, before the next poll. Plaid normally refreshes on its own schedule, which for some institutions
+    #   is infrequent, so new transactions can take a day to appear without this.
+    # Plaid bills each successful refresh call per Item, so choose a sensible interval (for example 60 or 240).
+    # A refresh failure (for example the Item lacks the refresh capability) is logged and does not stop the sync.
+    # 0 disables it. Defaults to 0.
+    refreshIntervalMinutes: 0
   batch:
     # The number of days in the past to pull data for.
     maxSyncDays: 5
