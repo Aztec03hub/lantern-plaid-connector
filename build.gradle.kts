@@ -24,6 +24,11 @@ springBoot {
     buildInfo()
 }
 
+// Newer than the versions Spring Boot's BOM manages; these carry fixes for published advisories (found with an
+//  OSV scan of the runtime classpath). Remove an override once Boot's own BOM catches up.
+extra["jackson-bom.version"] = "2.22.3"
+extra["log4j2.version"] = "2.26.1"
+
 repositories {
     mavenCentral()
 }
