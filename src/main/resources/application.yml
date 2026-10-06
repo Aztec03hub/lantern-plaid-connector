@@ -25,6 +25,12 @@ fireflyPlaidConnector2:
   #   starts. For example "Plaid import {yyyy-MM-dd @ HH:mm}" becomes "Plaid import 2024-02-07 @ 13:19".
   # Updates to existing transactions are not re-tagged. Blank or omitted disables the tag.
   # importTag: "Plaid import {yyyy-MM-dd @ HH:mm}"
+  # Optional. If set, transactions that Plaid reports as pending get this tag in Firefly; it is removed when the
+  #   transaction posts. Blank or omitted disables it.
+  # When a pending transaction posts, the connector updates the existing Firefly transaction in place (keeping your
+  #   categories, budgets, notes and your own tags) instead of deleting and re-creating it. Pending transactions are
+  #   never matched as transfers.
+  # pendingTag: "pending"
   # Firefly uses a timestamp for when transactions occurred, but Plaid does not always provide a timestamp
   #   for transactions; often it only provides a date. In those cases, we need a time zone to apply so that
   #   the timestamp that shows up in Firefly properly spans the specified date in the user's timezone.

@@ -21,6 +21,7 @@
 package net.djvk.fireflyPlaidConnector2.api.firefly.models
 
 
+import com.fasterxml.jackson.annotation.JsonInclude
 import com.fasterxml.jackson.annotation.JsonProperty
 
 /**
@@ -75,6 +76,12 @@ import com.fasterxml.jackson.annotation.JsonProperty
  * @param invoiceDate
  */
 
+/*
+ * Hand-edited (not regenerated): null fields are omitted from the JSON. Firefly treats a present-but-null field
+ * (e.g. category_name, budget_id, notes) as "clear it", so sending nulls for fields the connector does not own would
+ * wipe the user's own categorization every time Plaid updates a transaction.
+ */
+@JsonInclude(JsonInclude.Include.NON_NULL)
 data class TransactionSplitUpdate(
 
     /* Date of the transaction */
