@@ -348,7 +348,23 @@ class TransactionConverter(
             }
 
             val convertedUpdate = convertSingle(plaidUpdate, accountMap)
-            updates.add(FireflyTransactionDto(target.id, preserveUserFields(convertedUpdate.tx, target)))
+            val existingSplit = target.attributes.transactions.singleOrNull()
+            val update = if (existingSplit?.type == TransactionTypeProperty.transfer) {
+                // This Plaid transaction is one leg of a transfer we created. Firefly can't turn a transfer back
+                //  into a withdrawal/deposit, and the counterparty on a transfer is a real account, so keep both
+                //  account ids exactly as they are and only refresh what Plaid owns (amount, date, description,
+                //  tags).
+                convertedUpdate.tx.copy(
+                    sourceId = existingSplit.sourceId,
+                    sourceName = null,
+                    destinationId = existingSplit.destinationId,
+                    destinationName = null,
+                    description = existingSplit.description,
+                )
+            } else {
+                convertedUpdate.tx
+            }
+            updates.add(FireflyTransactionDto(target.id, preserveUserFields(update, target)))
         }
         /**
          * Handle Plaid deletes
