@@ -8,8 +8,8 @@ val ktorVersion: String by project
 val jacksonVersion: String by project
 
 plugins {
-    id("org.openapi.generator") version "7.7.0"
-    id("org.springframework.boot") version "3.3.2"
+    id("org.openapi.generator") version "7.14.0"
+    id("org.springframework.boot") version "3.5.16"
     id("io.spring.dependency-management") version "1.1.6"
     alias(libs.plugins.kotlin.jvm)
     alias(libs.plugins.kotlin.spring)
@@ -28,13 +28,13 @@ dependencies {
     implementation(libs.ktor.cio)
     implementation(libs.ktor.logging)
     implementation("org.springframework.boot:spring-boot-starter")
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.1")
-    implementation("org.semver4j:semver4j:5.3.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
+    implementation("org.semver4j:semver4j:5.8.0")
     testImplementation(libs.kotlin.test)
     testImplementation(libs.ktor.mock)
     testImplementation("org.springframework.boot:spring-boot-starter-test")
-    testImplementation("org.mockito.kotlin:mockito-kotlin:5.4.0")
-    testImplementation("org.assertj:assertj-core:3.26.3")
+    testImplementation("org.mockito.kotlin:mockito-kotlin:6.4.0")
+    testImplementation("org.assertj:assertj-core:3.27.7")
 }
 
 var generatePlaidClient = tasks.register<org.openapitools.generator.gradle.plugin.tasks.GenerateTask>("generatePlaidClient") {
@@ -69,9 +69,9 @@ kotlin {
 }
 
 tasks.withType<KotlinCompile> {
-    kotlinOptions {
-        freeCompilerArgs = listOf("-Xjsr305=strict")
-        jvmTarget = "17"
+    compilerOptions {
+        freeCompilerArgs.set(listOf("-Xjsr305=strict"))
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
     }
     dependsOn(generatePlaidClient)
 }
