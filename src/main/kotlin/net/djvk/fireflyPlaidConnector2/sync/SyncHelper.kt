@@ -71,6 +71,8 @@ class SyncHelper(
             logger.debug("Optimistic insert of ${fireflyTxs.size} txs into Firefly")
         }
         var index = 0
+        var timedOut = 0
+        var firstTimeout: ConnectTimeoutException? = null
         for (fireflyTx in fireflyTxs) {
             try {
                 insertIntoFirefly(fireflyTx)
@@ -91,8 +93,18 @@ class SyncHelper(
                     throw cre
                 }
             } catch (e: ConnectTimeoutException) {
-                logger.error("Timeout inserting firefly tx; skipping for now: $fireflyTx", e)
+                // Keep going so one timeout doesn't block the rest, but remember it: silently skipping would lose
+                //  the transaction for good once the caller commits its Plaid cursor.
+                logger.error("Timeout inserting firefly tx ${fireflyTx.tx.externalId}; will fail this batch", e)
+                firstTimeout = firstTimeout ?: e
+                timedOut++
             }
+        }
+        if (firstTimeout != null) {
+            throw java.io.IOException(
+                "$timedOut of ${fireflyTxs.size} Firefly inserts timed out; the caller must retry this batch",
+                firstTimeout
+            )
         }
     }
 
