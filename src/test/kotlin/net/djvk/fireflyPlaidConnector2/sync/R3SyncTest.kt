@@ -321,6 +321,84 @@ internal class R3SyncTest {
 
     // endregion
 
+    // region M1-R3 (transfer letters), N1-R3, N2-R3
+
+    @Test
+    fun aPlaidUpdateOfADeadLetteredTransferRefreshesItsAmountAndKeepsItsAccounts() = runBlocking<Unit> {
+        emptyFirefly()
+        rejectCreates()
+        val store = DeadLetterStore(dir.toString())
+        val transfer = create("plaid-dep").tx.copy(
+            type = TransactionTypeProperty.transfer, sourceId = "1", destinationId = "2", internalReference = "plaid-wd",
+        )
+        store.add(DeadLetter("create", "plaid-dep", null, transfer, false, "x"))
+        whenever(plaidSyncService.processPlaidTransactions(any(), any()))
+            .thenReturn(plaidResult(updated = listOf(plaid(accountB, "dep", -75.0))))
+
+        orchestrator(service(store), store).processTransactions(accountMap, sequenceOf(Pair("tok-12345678", listOf(accountA))), mutableMapOf())
+
+        val revised = store.read().single().split!!
+        assertThat(revised.type).isEqualTo(TransactionTypeProperty.transfer)
+        assertThat(revised.amount).isEqualTo("75.0")
+        assertThat(revised.sourceId).isEqualTo("1")
+        assertThat(revised.destinationId).isEqualTo("2")
+        assertThat(revised.internalReference).isEqualTo("plaid-wd")
+    }
+
+    @Test
+    fun aRangedReadOfMoreThanTheTransactionCeilingFailsWhateverThePageSize() = runBlocking<Unit> {
+        val pagination = mock<net.djvk.fireflyPlaidConnector2.api.firefly.models.MetaPagination> {
+            on { currentPage } doReturn 1
+            on { totalPages } doReturn 2
+            on { total } doReturn 300_000
+        }
+        val meta = mock<Meta> { on { this.pagination } doReturn pagination }
+        val array = mock<TransactionArray> {
+            on { data } doReturn listOf()
+            on { this.meta } doReturn meta
+        }
+        val response = createFireflyResponse(array)
+        whenever(txApi.listTransaction(any(), any(), any(), any())).thenReturn(response)
+
+        val e = runCatching {
+            service(null).fetchFireflyTransactionsBetween(java.time.LocalDate.of(2025, 1, 1), java.time.LocalDate.of(2025, 1, 31), Int.MAX_VALUE)
+        }.exceptionOrNull()
+
+        assertThat(e).hasMessageContaining("exceeds the failsafe")
+    }
+
+    private fun mutationError() = statusError(
+        HttpStatusCode.BadRequest, """{"error_type":"TRANSACTIONS_ERROR","error_code":"TRANSACTIONS_SYNC_MUTATION_DURING_PAGINATION"}"""
+    )
+
+    @Test
+    fun anItemWhoseMutationRestartsAreExhaustedFailsAloneWhenItemsMayFail() = runBlocking<Unit> {
+        val plaid = net.djvk.fireflyPlaidConnector2.lib.PlaidMock()
+        whenever(plaid.api.transactionsSync(any())).doSuspendableAnswer { throw mutationError() }
+        val cursors = mutableMapOf("tok-12345678" to "start")
+
+        val result = PlaidSyncService(plaid.wrapper, 100, true)
+            .processPlaidTransactions(sequenceOf(Pair("tok-12345678", listOf("acct"))), cursors)
+
+        assertThat(result.failedItems.single().errorCode).isEqualTo(MUTATION_DURING_PAGINATION)
+        assertThat(cursors["tok-12345678"]).isEqualTo("start")
+    }
+
+    @Test
+    fun exhaustedMutationRestartsStillFailTheIterationWhenItemsMayNotFail() = runBlocking<Unit> {
+        val plaid = net.djvk.fireflyPlaidConnector2.lib.PlaidMock()
+        whenever(plaid.api.transactionsSync(any())).doSuspendableAnswer { throw mutationError() }
+
+        val e = runCatching {
+            PlaidSyncService(plaid.wrapper, 100, false)
+                .processPlaidTransactions(sequenceOf(Pair("tok-12345678", listOf("acct"))), mutableMapOf())
+        }.exceptionOrNull()
+
+        assertThat(e).isInstanceOf(SyncMutationDuringPaginationException::class.java)
+    }
+
+    // endregion
+
     // region L5-R3
 
     @Test
@@ -330,6 +408,30 @@ internal class R3SyncTest {
         }.exceptionOrNull()
 
         assertThat(e).isInstanceOf(IllegalStateException::class.java).hasMessageContaining("pendingTag must be set")
+    }
+
+    @Test
+    fun syncModeDefaultsToPolledWhenUnset() {
+        val polled = PolledSyncOrchestrator::class.java
+            .getAnnotation(org.springframework.boot.autoconfigure.condition.ConditionalOnProperty::class.java)
+        val batch = BatchSyncRunner::class.java
+            .getAnnotation(org.springframework.boot.autoconfigure.condition.ConditionalOnProperty::class.java)
+        assertThat(polled.matchIfMissing).describedAs("polled starts when syncMode is missing").isTrue()
+        assertThat(batch.matchIfMissing).describedAs("batch never starts by default").isFalse()
+
+        val yml = org.yaml.snakeyaml.Yaml().load<Map<String, Any>>(
+            javaClass.getResourceAsStream("/application.yml")!!.reader().readText()
+        )
+        @Suppress("UNCHECKED_CAST")
+        assertThat((yml["fireflyPlaidConnector2"] as Map<String, Any>)["syncMode"]).isEqualTo("polled")
+    }
+
+    @Test
+    fun anUnreadableFileOrATransferNeedingReviewMakesThePollPartial() {
+        assertThat(PollResult(deadLetterFilesUnreadable = 1).partial).isTrue()
+        assertThat(PollResult(transfersNeedingReview = 1).partial).isTrue()
+        assertThat(PollResult(deadLettersAbandoned = 1, deadLetters = 1).partial).isTrue()
+        assertThat(PollResult().partial).isFalse()
     }
 
     // endregion
