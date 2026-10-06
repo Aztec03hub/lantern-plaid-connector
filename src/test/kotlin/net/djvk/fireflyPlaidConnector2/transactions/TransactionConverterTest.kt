@@ -956,6 +956,52 @@ internal class TransactionConverterTest {
 
     @ParameterizedTest(name = "poll mode = {0}")
     @ValueSource(booleans = [true, false])
+    fun convertWithDisableAccountAssignmentLeavesCounterpartyUnset(poll: Boolean) {
+        val converter = TransactionConverter(
+            useNameForDestination = true,
+            enablePrimaryCategorization = false,
+            primaryCategoryPrefix = "a",
+            enableDetailedCategorization = false,
+            detailedCategoryPrefix = "b",
+            timeZoneString = "America/New_York",
+            transferMatchWindowDays = 10L,
+            txStyle = defaultStyle,
+            disableAccountAssignment = true,
+        )
+
+        val withdrawal = PlaidFixtures.getPaymentTransaction(
+            accountId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            name = "Coffee Shop",
+            transactionId = "plaidOut",
+            amount = 12.34,
+        )
+        val deposit = PlaidFixtures.getPaymentTransaction(
+            accountId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            name = "Employer",
+            transactionId = "plaidIn",
+            amount = -2000.0,
+        )
+
+        val actual = convertCreates(
+            converter = converter,
+            poll = poll,
+            inputPlaidTxs = listOf(withdrawal, deposit),
+            accountMap = PlaidFixtures.getStandardAccountMapping()
+        )
+
+        assertThat(actual).hasSize(2)
+        val actualWithdrawal = actual.single { it.tx.type == TransactionTypeProperty.withdrawal }.tx
+        assertThat(actualWithdrawal.sourceId).isEqualTo("1")
+        assertThat(actualWithdrawal.destinationName).isNull()
+        assertThat(actualWithdrawal.destinationId).isNull()
+        val actualDeposit = actual.single { it.tx.type == TransactionTypeProperty.deposit }.tx
+        assertThat(actualDeposit.destinationId).isEqualTo("1")
+        assertThat(actualDeposit.sourceName).isNull()
+        assertThat(actualDeposit.sourceId).isNull()
+    }
+
+    @ParameterizedTest(name = "poll mode = {0}")
+    @ValueSource(booleans = [true, false])
     fun convertProvidesValidExternalUrl(poll: Boolean) {
         val converter = TransactionConverter(
             useNameForDestination = false,

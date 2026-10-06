@@ -51,6 +51,15 @@ class TransactionConverter(
     private val detailedCategoryPrefix: String,
 
     private val txStyle: TransactionStyleConfig,
+
+    /**
+     * When true, single (non-transfer) transactions are created without a counterparty name, so Firefly leaves the
+     * other side as its default "(no name)" account instead of creating one account per merchant. Useful when
+     * Firefly rules or webhooks assign the counterparty afterwards. Transfers are unaffected because both of their
+     * accounts are real, configured accounts.
+     */
+    @Value("\${fireflyPlaidConnector2.disableAccountAssignment:false}")
+    private val disableAccountAssignment: Boolean = false,
 ) {
     private val logger = LoggerFactory.getLogger(this::class.java)
     private val timeZone = TimeZone.getTimeZone(timeZoneString)
@@ -374,13 +383,13 @@ class TransactionConverter(
             destinationName = null
 
             sourceId = null
-            sourceName = getSourceOrDestinationName(tx, true)
+            sourceName = if (disableAccountAssignment) null else getSourceOrDestinationName(tx, true)
         } else {
             sourceId = fireflyAccountId
             sourceName = null
 
             destinationId = null
-            destinationName = getSourceOrDestinationName(tx, false)
+            destinationName = if (disableAccountAssignment) null else getSourceOrDestinationName(tx, false)
         }
         return convert(
             tx = tx,
