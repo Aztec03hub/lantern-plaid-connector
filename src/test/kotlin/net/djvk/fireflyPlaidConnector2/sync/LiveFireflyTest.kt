@@ -99,13 +99,14 @@ internal class LiveFireflyTest {
         val split = converted.attributes.transactions.single()
         assertThat(converted.id).isEqualTo(existing.id)
         assertThat(split.type).isEqualTo(TransactionTypeProperty.transfer)
-        assertThat(split.externalId).isEqualTo("plaid-$yId")
         assertThat(split.sourceId).isEqualTo(accountB)
         assertThat(split.destinationId).isEqualTo(accountA)
         assertThat(split.tags).contains("user-tag")
-        // R2 H1: the converted transaction's old id is no longer its external id but is kept as the transfer's
-        //  internal reference, so a lookup by it finds this same transfer
-        assertThat(split.internalReference).isEqualTo("plaid-$xId")
+        // R2 H1 + R3 L1: both Plaid ids are kept, so a lookup by either finds this same transfer. The destination
+        //  leg's id (the old deposit, on account A) is the external id and the source leg's (Y, on B) the internal
+        //  reference, which is what lets the removal of one leg leave the other on the right account.
+        assertThat(split.externalId).isEqualTo("plaid-$xId")
+        assertThat(split.internalReference).isEqualTo("plaid-$yId")
         assertThat(service.fetchMissingByPlaidId(listOf(xId), listOf()).map { it.id }).containsExactly(converted.id)
 
         // H2 + H3: the retried Plaid create for Y is recognised from what Firefly really returns
