@@ -155,7 +155,7 @@ class FireflyTransactionServiceTest {
             // Verify
             assertEquals(transactions, result)
             verify(fireflyTxApi).listTransaction(
-                eq(0),
+                eq(1),
                 any(),
                 any(),
                 any()

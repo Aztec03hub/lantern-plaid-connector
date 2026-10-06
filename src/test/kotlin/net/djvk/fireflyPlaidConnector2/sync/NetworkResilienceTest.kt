@@ -156,10 +156,12 @@ internal class NetworkResilienceTest {
         whenever(plaidSyncService.processPlaidTransactions(any(), any())).doSuspendableAnswer {
             @Suppress("UNCHECKED_CAST")
             (it.arguments[1] as MutableMap<String, String>)["token1"] = "cursor-new"
-            PlaidTransactionResult(emptyList(), emptyList(), emptyList())
+            // One deletion, so there is work for Firefly (an empty poll skips Firefly entirely)
+            PlaidTransactionResult(emptyList(), emptyList(), listOf("gone"))
         }
         whenever(converter.convertPollSync(any(), any(), any(), any(), any()))
             .thenReturn(TransactionConverter.ConvertPollSyncResult(emptyList(), emptyList(), emptyList()))
+        whenever(fireflyTransactionService.fetchMissingByPlaidId(any(), any(), any())).thenReturn(emptyList())
         whenever(fireflyTransactionService.processFireflyTransactionUpdates(any(), any(), any()))
             .doSuspendableAnswer { throw ConnectTimeoutException("Firefly unreachable") }
 

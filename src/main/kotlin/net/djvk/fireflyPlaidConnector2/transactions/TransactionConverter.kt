@@ -502,7 +502,9 @@ class TransactionConverter(
              * Always positive per https://github.com/firefly-iii/firefly-iii/issues/2476
              * "Direction" of transactions handled in [getFireflyTransactionDtoType]
              */
-            abs(tx.amount).toString(),
+            // toPlainString: Double.toString switches to scientific notation ("1.0E7") from ten million up, which
+            //  Firefly rejects
+            java.math.BigDecimal.valueOf(abs(tx.amount)).toPlainString(),
             fireflyTx?.tx?.description ?: getTxDescription(tx),
             processDate = postedTime,
             sourceId = sourceId,

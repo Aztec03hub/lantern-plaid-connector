@@ -1,14 +1,18 @@
 package net.djvk.fireflyPlaidConnector2.sync
 
+import kotlinx.coroutines.CancellationException
+import net.djvk.fireflyPlaidConnector2.api.firefly.apis.SearchApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.TransactionsApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionRead
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionTypeFilter
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionTypeProperty
 import net.djvk.fireflyPlaidConnector2.transactions.FireflyTransactionDto
+import net.djvk.fireflyPlaidConnector2.transactions.FireflyTransactionExternalIdIndexer
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.stereotype.Component
 import java.time.LocalDate
+import java.time.ZoneId
 
 /**
  * Service for handling Firefly transaction operations.
@@ -19,25 +23,36 @@ class FireflyTransactionService(
     private val syncHelper: SyncHelper,
     
     @Value("\${fireflyPlaidConnector2.polled.existingFireflyPullWindowDays}")
-    private val existingFireflyPullWindowDays: Int
+    private val existingFireflyPullWindowDays: Int,
+
+    /** "Today" is evaluated in the user's configured time zone, not the container's (which is usually UTC). */
+    @Value("\${fireflyPlaidConnector2.timeZone:UTC}")
+    timeZoneString: String = "UTC",
+
+    /** Used to look up Firefly transactions that are older than the pull window; see [fetchMissingByPlaidId]. */
+    private val fireflySearchApi: SearchApi? = null,
 ) {
     private val logger = LoggerFactory.getLogger(this::class.java)
     private val fireflyPageCountMax = 20
+    private val zoneId = ZoneId.of(timeZoneString)
 
     /**
      * Fetches all Firefly transactions within the configured window.
      */
     suspend fun fetchExistingFireflyTransactions(): List<TransactionRead> {
         val existingFireflyTxs = mutableListOf<TransactionRead>()
-        val transferWindowStart = LocalDate.now().minusDays(existingFireflyPullWindowDays.toLong())
+        val today = LocalDate.now(zoneId)
+        val transferWindowStart = today.minusDays(existingFireflyPullWindowDays.toLong())
 
-        var fireflyTxPage = 0
+        // Firefly pages are 1-based; starting at 0 fetched page 1 twice
+        var fireflyTxPage = 1
+        var lastPageHadMore: Boolean
         do {
             logger.debug("Fetching page $fireflyTxPage of Firefly transactions with window starting at $transferWindowStart")
             val response = fireflyTxApi.listTransaction(
                 fireflyTxPage++,
                 transferWindowStart,
-                LocalDate.now(),
+                today,
                 TransactionTypeFilter.all,
             ).body()
             val pagination = response.meta.pagination
@@ -52,17 +67,56 @@ class FireflyTransactionService(
             val filteredTxs = response.data
             logger.debug("Fetched ${filteredTxs.size} existing Firefly single-split, non transfer transactions with window starting at $transferWindowStart")
             existingFireflyTxs.addAll(filteredTxs)
-        } while (pagination != null &&
-            pagination.currentPage < pagination.totalPages &&
-            // This condition is a failsafe to avoid an infinite loop
-            fireflyTxPage < fireflyPageCountMax
-        )
-        
-        if (fireflyTxPage >= fireflyPageCountMax) {
+            lastPageHadMore = pagination != null && pagination.currentPage < pagination.totalPages
+            // The page cap is a failsafe against an infinite loop
+        } while (lastPageHadMore && fireflyTxPage <= fireflyPageCountMax)
+
+        // Only an error if there really were more pages we refused to read (not merely when the last allowed page
+        //  was also the last page)
+        if (lastPageHadMore) {
             throw RuntimeException("Exceeded Firefly failsafe max page count $fireflyPageCountMax")
         }
-        
+
         return existingFireflyTxs
+    }
+
+    /**
+     * Plaid can update or remove a transaction long after we imported it, and a pending transaction can take days to
+     * post, so the Firefly transactions it refers to may be older than the pull window. Without them the connector
+     * logs "Failed to find existing Firefly transaction" and the change is never applied.
+     *
+     * This looks up, via Firefly's search (`external_id_is:`), the ones for [plaidTransactionIds] that aren't already
+     * in [alreadyFetched]. Capped at [maxLookups] per call to bound the extra API traffic. Lookup failures are
+     * logged and skipped, never fatal.
+     */
+    suspend fun fetchMissingByPlaidId(
+        plaidTransactionIds: Collection<String>,
+        alreadyFetched: List<TransactionRead>,
+        maxLookups: Int = 100,
+    ): List<TransactionRead> {
+        val searchApi = fireflySearchApi ?: return listOf()
+        val known = FireflyTransactionExternalIdIndexer(alreadyFetched)
+        val missing = plaidTransactionIds.distinct().filter { known.findExistingFireflyTx(it) == null }
+        if (missing.isEmpty()) return listOf()
+        if (missing.size > maxLookups) {
+            logger.warn("{} Plaid transactions are outside the Firefly pull window; looking up only the first {}", missing.size, maxLookups)
+        }
+
+        val found = mutableListOf<TransactionRead>()
+        for (plaidId in missing.take(maxLookups)) {
+            val externalId = FireflyTransactionExternalIdIndexer.getExternalId(plaidId)
+            try {
+                val match = searchApi.searchTransactions("external_id_is:\"$externalId\"", 1).body().data
+                    .firstOrNull { read -> read.attributes.transactions.any { it.externalId == externalId } }
+                if (match != null) found.add(match)
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (e: Exception) {
+                logger.warn("Firefly search for external id {} failed: {}", externalId, e::class.simpleName)
+            }
+        }
+        logger.debug("Found {} of {} out-of-window Firefly transactions by external id", found.size, missing.size)
+        return found
     }
 
     /**
