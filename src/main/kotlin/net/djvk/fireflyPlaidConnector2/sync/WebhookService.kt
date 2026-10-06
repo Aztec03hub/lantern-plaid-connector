@@ -88,7 +88,9 @@ class WebhookService(
     private val callbackUri: URI = validateCallbackUrl(resultCallbackUrl.trim())
 
     /** Safe to log: scheme, host and path only, so a secret in a query string or userinfo is never printed. */
-    private val loggableTarget = "${callbackUri.scheme}://${callbackUri.host}${callbackUri.path ?: ""}"
+    private val loggableTarget =
+        "${callbackUri.scheme}://${callbackUri.host}${if (callbackUri.port != -1) ":${callbackUri.port}" else ""}" +
+                (callbackUri.path ?: "")
 
     private val connectorVersion = buildProperties?.version ?: "unknown"
     private val bearerToken = resultCallbackBearerToken?.takeIf { it.isNotBlank() }

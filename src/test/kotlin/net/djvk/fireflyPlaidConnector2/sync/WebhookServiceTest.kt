@@ -143,6 +143,18 @@ internal class WebhookServiceTest {
     }
 
     @Test
+    fun loggedTargetKeepsThePortButNeverUserInfoOrQuery() {
+        val service = WebhookService(
+            "https://user:pw@monitor.example.com:8443/hook?key=SECRET", null, engine(Captured())
+        )
+
+        val target = WebhookService::class.java.getDeclaredField("loggableTarget")
+            .also { it.isAccessible = true }.get(service) as String
+
+        assertEquals("https://monitor.example.com:8443/hook", target)
+    }
+
+    @Test
     fun rejectsMalformedUrls() {
         assertThrows<IllegalArgumentException> { WebhookService("not a url", null, engine(Captured())) }
         assertThrows<IllegalArgumentException> { WebhookService("ftp://example.com/x", null, engine(Captured())) }
