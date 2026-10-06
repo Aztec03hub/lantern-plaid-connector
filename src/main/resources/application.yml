@@ -154,4 +154,6 @@ logging:
   level:
     root: INFO
     net:
-      djvk: DEBUG
+      # INFO by default. DEBUG and TRACE add per-batch and per-transaction detail that you generally don't want in
+      #   persistent logs for a financial integration; raise this temporarily when troubleshooting.
+      djvk: INFO

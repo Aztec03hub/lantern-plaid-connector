@@ -86,7 +86,8 @@ class SyncHelper(
                     if (error.message.lowercase().contains("duplicate of transaction")) {
                         logger.info("Skipped transaction ${fireflyTx.tx.externalId} that Firefly identified as a duplicate")
                     } else {
-                        logger.error("Firefly transaction insert $error for tx: $fireflyTx")
+                        // Log the external id only: the full transaction holds descriptions and amounts
+                        logger.error("Firefly transaction insert $error for tx ${fireflyTx.tx.externalId}")
                         throw cre
                     }
                 } else {
@@ -120,11 +121,13 @@ class SyncHelper(
             try {
                 insertIntoFirefly(fireflyTx)
             } catch (cre: ClientRequestException) {
-                val error = cre.response.body<FireflyApiError>()
                 if (cre.response.status == HttpStatusCode.UnprocessableEntity) {
-                    logger.error("Firefly transaction insert $error for tx: $fireflyTx")
-                    throw cre
+                    val error = cre.response.body<FireflyApiError>()
+                    logger.error("Firefly transaction insert $error for tx ${fireflyTx.tx.externalId}")
                 }
+                // Every client error propagates. This used to swallow anything that wasn't a 422, which for a
+                //  transfer update (delete, then this insert) meant the transaction was deleted and never re-created.
+                throw cre
             }
         }
     }
@@ -141,7 +144,9 @@ class SyncHelper(
         for (fireflyTx in fireflyTxs) {
             fireflyTxApi.updateTransaction(
                 fireflyTx.id
-                    ?: throw IllegalArgumentException("Can't update Firefly transaction without id: $fireflyTx"),
+                    ?: throw IllegalArgumentException(
+                        "Can't update Firefly transaction without id (external id ${fireflyTx.tx.externalId})"
+                    ),
                 fireflyTx.toTransactionUpdate(),
             )
         }

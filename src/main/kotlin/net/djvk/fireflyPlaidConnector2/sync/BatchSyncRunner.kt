@@ -12,6 +12,7 @@ import net.djvk.fireflyPlaidConnector2.constants.IntervalSeconds
 import net.djvk.fireflyPlaidConnector2.constants.TimestampSeconds
 import net.djvk.fireflyPlaidConnector2.transactions.FireflyTransactionDto
 import net.djvk.fireflyPlaidConnector2.transactions.TransactionConverter
+import net.djvk.fireflyPlaidConnector2.util.Utilities.redactAccessToken
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty
@@ -59,7 +60,7 @@ class BatchSyncRunner(
             syncHelper.setApiCreds()
             val (accountMap, accountAccessTokenSequence) = syncHelper.getAllPlaidAccessTokenAccountIdSets()
             for ((accessToken, accountIds) in accountAccessTokenSequence) {
-                logger.debug("Fetching Plaid data for access token $accessToken and account ids ${accountIds.joinToString()}")
+                logger.debug("Fetching Plaid data for access token ${redactAccessToken(accessToken)} and account ids ${accountIds.joinToString()}")
                 var offset = 0
                 do {
                     /**
@@ -101,7 +102,11 @@ class BatchSyncRunner(
                         ).body().transactions
                         logger.debug("\tReceived a batch of ${plaidTxs.size} Plaid transactions")
                     } catch (cre: ClientRequestException) {
-                        logger.error("Error requesting Plaid transactions. Request: $request; ")
+                        // The request object holds the access token, so don't log it
+                        logger.error(
+                            "Error requesting Plaid transactions for access token ${redactAccessToken(accessToken)} " +
+                                    "at offset $offset"
+                        )
                         throw cre
                     }
                     allPlaidTxs
@@ -119,7 +124,7 @@ class BatchSyncRunner(
 
                     // Keep going until we get all the transactions
                 } while (plaidTxs.size == plaidBatchSize)
-                logger.debug("Done fetching Plaid data for access token $accessToken and account ids ${accountIds.joinToString()}")
+                logger.debug("Done fetching Plaid data for access token ${redactAccessToken(accessToken)} and account ids ${accountIds.joinToString()}")
             }
 
             // Map Plaid transactions to Firefly transactions
@@ -146,7 +151,7 @@ class BatchSyncRunner(
         for ((accessToken, accountIds) in accountAccessTokenSequence) {
             val plaidTxs = allPlaidTxs[accessToken] ?: continue
             // Request balance data for this item/access token
-            logger.debug("Requesting balances for access token $accessToken and account ids ${accountIds.joinToString()}")
+            logger.debug("Requesting balances for access token ${redactAccessToken(accessToken)} and account ids ${accountIds.joinToString()}")
             // Calculate min last updated, if required
             val minLastUpdated = balanceMinLastUpdatedDatetimeSeconds?.let {
                 logger.debug("Setting min_last_updated_datetime to $balanceMinLastUpdatedDatetimeSeconds seconds ago")
@@ -166,7 +171,7 @@ class BatchSyncRunner(
                 ).body()
             } catch (e: Exception) {
                 logger.error(
-                    "Failed to fetch balances for access token $accessToken and account ids ${accountIds.joinToString()}",
+                    "Failed to fetch balances for access token ${redactAccessToken(accessToken)} and account ids ${accountIds.joinToString()}",
                     e
                 )
                 continue
