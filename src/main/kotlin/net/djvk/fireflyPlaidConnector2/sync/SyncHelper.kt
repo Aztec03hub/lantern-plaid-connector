@@ -107,8 +107,8 @@ class SyncHelper(
                     if (error.message.lowercase().contains("duplicate of transaction")) {
                         logger.info("Skipped transaction ${fireflyTx.tx.externalId} that Firefly identified as a duplicate")
                     } else {
-                        // Log the external id only: the full transaction holds descriptions and amounts
-                        logger.error("Firefly transaction insert $error for tx ${fireflyTx.tx.externalId}")
+                        // Log the external id and Firefly's message only: the full error object and the transaction hold field values
+                        logger.error("Firefly transaction insert rejected (${error.message}) for tx ${fireflyTx.tx.externalId}")
                         throw cre
                     }
                 } else {
@@ -144,7 +144,7 @@ class SyncHelper(
             } catch (cre: ClientRequestException) {
                 if (cre.response.status == HttpStatusCode.UnprocessableEntity) {
                     val error = cre.response.body<FireflyApiError>()
-                    logger.error("Firefly transaction insert $error for tx ${fireflyTx.tx.externalId}")
+                    logger.error("Firefly transaction insert rejected (${error.message}) for tx ${fireflyTx.tx.externalId}")
                 }
                 // Every client error propagates. This used to swallow anything that wasn't a 422, which for a
                 //  transfer update (delete, then this insert) meant the transaction was deleted and never re-created.
