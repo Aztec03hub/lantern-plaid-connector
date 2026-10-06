@@ -217,6 +217,8 @@ internal class TransactionConverterTest {
                                     sourceId = "1",
                                     destinationId = "2",
                                 ).transactions.first()
+                                    // H1-R2: the withdrawal leg's id is kept on the transfer
+                                    .copy(internalReference = "plaid-plaidWithdrawalId")
                             ),
                         ),
                         updates = listOf(),
@@ -282,7 +284,7 @@ internal class TransactionConverterTest {
                         TransactionRead(
                             "thing", "updatedFireflyId",
                             FireflyFixtures.getTransaction(
-                                type = TransactionTypeProperty.deposit,
+                                type = TransactionTypeProperty.withdrawal,
                                 description = "Old transaction name",
                                 amount = "123.45",
                                 sourceId = "1",

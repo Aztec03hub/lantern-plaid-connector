@@ -18,6 +18,11 @@ data class FireflyTransactionDto(
      */
     val id: FireflyTransactionId?,
     val tx: TransactionSplit,
+    /**
+     * True when this update changes the type of the existing Firefly transaction (a sign flip turns a withdrawal into
+     * a deposit and back). The type is only sent on an update when it changes, so an ordinary update can never alter it.
+     */
+    val changesType: Boolean = false,
 ) {
     val transactionId: String
         get() = id ?: throw RuntimeException("Can't use a Firefly transaction without an id for sorting")
@@ -38,8 +43,11 @@ data class FireflyTransactionDto(
     fun toTransactionUpdate(): TransactionUpdate {
         return TransactionUpdate(
             // A transfer is always sent with its type: for an existing deposit/withdrawal that is the in-place
-            //  conversion to a transfer, for an existing transfer it is a no-op.
-            transactions = listOf(tx.toTransactionSplitUpdate(includeType = tx.type == TransactionTypeProperty.transfer)),
+            //  conversion to a transfer, for an existing transfer it is a no-op. A deposit/withdrawal is sent with its
+            //  type only when the update says it changes (see [changesType]).
+            transactions = listOf(
+                tx.toTransactionSplitUpdate(includeType = changesType || tx.type == TransactionTypeProperty.transfer)
+            ),
             applyRules = true,
             fireWebhooks = true,
             groupTitle = tx.description,

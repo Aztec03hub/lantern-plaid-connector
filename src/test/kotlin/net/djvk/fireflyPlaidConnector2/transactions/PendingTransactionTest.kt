@@ -38,6 +38,7 @@ internal class PendingTransactionTest {
         externalId: String,
         type: TransactionTypeProperty = TransactionTypeProperty.withdrawal,
         tags: List<String> = listOf("my-own-tag", "plaid-primary-cat-old"),
+        internalReference: String? = null,
     ) = TransactionRead(
         "transactions", id,
         FireflyFixtures.getTransaction(
@@ -46,6 +47,7 @@ internal class PendingTransactionTest {
             sourceId = "1",
             destinationId = if (type == TransactionTypeProperty.transfer) "2" else null,
             externalId = externalId,
+            internalReference = internalReference,
             tags = tags,
             categoryName = "Groceries (set by user)",
             currencyId = "5",
@@ -112,18 +114,40 @@ internal class PendingTransactionTest {
         assertThat(result.deletes).isEmpty() // nothing to delete: it was never imported
     }
 
+    /** M2-R2: deleting and re-creating would drop the transfer's other leg and its user data. */
     @Test
-    fun fallsBackToDeleteAndCreateWhenPendingFireflyTransactionBecameATransfer() = runBlocking<Unit> {
+    fun aPendingTransactionThatBecameATransferIsUpdatedInPlaceWhenItPosts() = runBlocking<Unit> {
         val existing = existingFirefly("ff1", "plaid-pendingId", type = TransactionTypeProperty.transfer)
 
         val result = converter().convertPollSync(
             accountMap, listOf(posted()), listOf(), listOf("pendingId"), listOf(existing)
         )
 
-        // Firefly can't change a transaction's type on update, so the old behavior still applies
-        assertThat(result.updates).isEmpty()
-        assertThat(result.creates).hasSize(1)
-        assertThat(result.deletes).containsExactly("ff1")
+        assertThat(result.creates).isEmpty()
+        assertThat(result.deletes).isEmpty()
+        val update = result.updates.single()
+        assertThat(update.id).isEqualTo("ff1")
+        assertThat(update.tx.externalId).isEqualTo("plaid-postedId")
+        // both accounts of the transfer are kept, and no type is sent (it stays a transfer)
+        assertThat(update.tx.sourceId).isEqualTo("1")
+        assertThat(update.tx.destinationId).isEqualTo("2")
+        assertThat(update.toTransactionUpdate().transactions!!.single().type).isNull()
+    }
+
+    /** The pending leg's id is the transfer's internal reference (the other leg is its external id). */
+    @Test
+    fun aPendingIdKeptAsATransfersInternalReferenceIsMovedToThePostedId() = runBlocking<Unit> {
+        val existing = existingFirefly("ff1", "plaid-otherLeg", type = TransactionTypeProperty.transfer, internalReference = "plaid-pendingId")
+
+        val result = converter().convertPollSync(
+            accountMap, listOf(posted()), listOf(), listOf("pendingId"), listOf(existing)
+        )
+
+        assertThat(result.creates).isEmpty()
+        assertThat(result.deletes).isEmpty()
+        val update = result.updates.single()
+        assertThat(update.tx.externalId).isEqualTo("plaid-otherLeg")
+        assertThat(update.tx.internalReference).isEqualTo("plaid-postedId")
     }
 
     @Test
