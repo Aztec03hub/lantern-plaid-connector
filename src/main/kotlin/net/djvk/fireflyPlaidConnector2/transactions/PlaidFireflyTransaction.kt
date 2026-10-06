@@ -45,7 +45,7 @@ sealed interface PlaidFireflyTransaction {
                     val convertedFirefly = matchingFirefly.map { FireflyTransaction(it) }
                     val convertedPlaid = matchingPlaid.map { matchingPlaidTx ->
                         val accountId = accountMap[matchingPlaidTx.accountId]
-                            ?: throw throw IllegalArgumentException("Can not match Plaid transactions from accounts not mapped "
+                            ?: throw IllegalArgumentException("Can not match Plaid transactions from accounts not mapped "
                                     + "to a Firefly account id")
                         PlaidTransaction(matchingPlaidTx, accountId)
                     }
@@ -60,7 +60,7 @@ sealed interface PlaidFireflyTransaction {
                 } else if (plaidTx != null) {
                     val accountId = accountMap[plaidTx.accountId]
                     if (accountId == null) {
-                        throw throw IllegalArgumentException("Can not match Plaid transactions from accounts not mapped "
+                        throw IllegalArgumentException("Can not match Plaid transactions from accounts not mapped "
                                 + "to a Firefly account id")
                     }
                     listOf(PlaidTransaction(plaidTx, accountId))
