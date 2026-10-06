@@ -46,7 +46,7 @@ internal class WebhookServiceTest {
     }
 
     @Test
-    fun postsNonEmptyResultsWithBearerToken() = runBlocking {
+    fun postsNonEmptyResultsWithBearerToken() = runBlocking<Unit> {
         val captured = Captured()
         val service = WebhookService("https://monitor.example.com/hook", "secret-token", engine(captured))
 
@@ -70,7 +70,7 @@ internal class WebhookServiceTest {
     }
 
     @Test
-    fun omitsAuthorizationHeaderWhenNoTokenConfigured() = runBlocking {
+    fun omitsAuthorizationHeaderWhenNoTokenConfigured() = runBlocking<Unit> {
         val captured = Captured()
         val service = WebhookService("https://monitor.example.com/hook", "  ", engine(captured))
 
@@ -81,7 +81,7 @@ internal class WebhookServiceTest {
     }
 
     @Test
-    fun reportsFailureWithErrorTypeOnlyAndNoMessage() = runBlocking {
+    fun reportsFailureWithErrorTypeOnlyAndNoMessage() = runBlocking<Unit> {
         val captured = Captured()
         val service = WebhookService("https://monitor.example.com/hook", null, engine(captured))
 
@@ -95,7 +95,7 @@ internal class WebhookServiceTest {
     }
 
     @Test
-    fun serverErrorDoesNotThrow() = runBlocking {
+    fun serverErrorDoesNotThrow() = runBlocking<Unit> {
         val captured = Captured()
         val service = WebhookService(
             "https://monitor.example.com/hook", null, engine(captured, HttpStatusCode.InternalServerError)
@@ -107,7 +107,7 @@ internal class WebhookServiceTest {
     }
 
     @Test
-    fun networkFailureDoesNotThrowAndNextPostStillWorks() = runBlocking {
+    fun networkFailureDoesNotThrowAndNextPostStillWorks() = runBlocking<Unit> {
         var calls = 0
         val failingThenOk = MockEngine {
             calls++

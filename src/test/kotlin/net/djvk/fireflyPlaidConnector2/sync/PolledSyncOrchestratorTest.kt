@@ -321,7 +321,7 @@ internal class PolledSyncOrchestratorTest {
      * With the result callback enabled, a successful iteration posts non-empty counts and no failure.
      */
     @Test
-    fun runIterationPostsResultToWebhookOnSuccess() = runBlocking {
+    fun runIterationPostsResultToWebhookOnSuccess() = runBlocking<Unit> {
         val webhookService: WebhookService = mock()
         val (accountMap, sequence, cursorMap) = stubOneCreateIteration()
         val orchestrator = PolledSyncOrchestrator(
@@ -342,7 +342,7 @@ internal class PolledSyncOrchestratorTest {
      * A failed iteration is reported to the callback (no result, with the exception) and then rethrown.
      */
     @Test
-    fun runIterationPostsFailureToWebhookAndRethrows() = runBlocking {
+    fun runIterationPostsFailureToWebhookAndRethrows() = runBlocking<Unit> {
         val webhookService: WebhookService = mock()
         val (accountMap, sequence, cursorMap) = stubOneCreateIteration()
         whenever(fireflyTransactionService.fetchExistingFireflyTransactions()).thenThrow(IllegalStateException("boom"))
@@ -359,7 +359,7 @@ internal class PolledSyncOrchestratorTest {
      * With no callback configured the iteration still completes and nothing is posted.
      */
     @Test
-    fun runIterationWorksWithoutWebhook() = runBlocking {
+    fun runIterationWorksWithoutWebhook() = runBlocking<Unit> {
         val (accountMap, sequence, cursorMap) = stubOneCreateIteration()
         val orchestrator = PolledSyncOrchestrator(
             30, syncHelper, cursorManager, plaidSyncService, fireflyTransactionService, converter
