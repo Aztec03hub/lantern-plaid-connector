@@ -50,6 +50,11 @@ class PlaidApiWrapper(
     private val logger = LoggerFactory.getLogger(this::class.java)
 
     init {
+        // The Plaid client id and secret travel in headers of every request, and access tokens in the body, so a
+        //  plain-http URL (typo or bad config) would send them in the clear. Loopback is allowed for local mocks.
+        require(isSecureOrLoopback(baseUrl)) {
+            "fireflyPlaidConnector2.plaid.url must use https (plain http is only allowed for localhost)"
+        }
         plaidApi.setApiKey(plaidClientId, clientIdHeader)
         plaidApi.setApiKey(plaidSecret, secretHeader)
     }
@@ -87,6 +92,24 @@ class PlaidApiWrapper(
             // Back off so a brief network outage isn't burned through by instant retries
             delay(retryBackoffMillis * (maxRetries - remainingRetries + 1))
             return executeRequest(request, logString, remainingRetries - 1)
+        }
+    }
+
+    companion object {
+        /**
+         * True if [url] is https, or http to a loopback host (for local mock servers).
+         */
+        fun isSecureOrLoopback(url: String): Boolean {
+            val uri = try {
+                java.net.URI(url.trim())
+            } catch (e: Exception) {
+                return false
+            }
+            return when (uri.scheme?.lowercase()) {
+                "https" -> true
+                "http" -> uri.host in setOf("localhost", "127.0.0.1", "[::1]", "::1")
+                else -> false
+            }
         }
     }
 }

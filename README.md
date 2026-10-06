@@ -292,15 +292,29 @@ docker run \
 -t firefly-plaid-connector-2
 ```
 
+# Protecting your credentials
+The connector holds your Plaid client id and secret, a Firefly personal access token, and one Plaid access token per linked
+institution. Anyone who can read these can read your bank data, so:
+* Keep the configuration file readable only by the user that runs the connector (`chmod 600`), and don't commit it.
+  Spring Boot also accepts every setting as an environment variable (for example `FIREFLYPLAIDCONNECTOR2_PLAID_SECRET`), which
+  lets you keep secrets out of the file, for instance by loading them from a Docker secret or a root-owned env file.
+* The cursor file (`plaid_sync_cursors.txt`) contains your access tokens too. The connector creates it with owner-only permissions
+  (0600) and replaces it atomically; keep the directory you mount for it private as well.
+* The connector never logs full access tokens, the Plaid secret, the Firefly token, or transaction descriptions/amounts at the
+  default log level. It also refuses to talk to a non-https `fireflyPlaidConnector2.plaid.url` (loopback excepted).
+* Use an https URL for your Firefly instance if it is not on the same host/network segment as the connector.
+
 # Credential Updates
    On occasion, you will get an `ITEM_LOGIN_REQUIRED` error in the connector logs. This typically happens when the credentials
-   for one of the institutional accounts you've linked Plaid to have changed. You can find the access token for the account in question on the log line above the exception log.
+   for one of the institutional accounts you've linked Plaid to have changed. The log line above the exception identifies the account by a masked
+   access token such as `access-****90ab` (the last four characters), so find the entry in your configuration file whose `plaidItemAccessToken` ends with
+   those characters. Full access tokens are intentionally never written to the logs.
    There are two methods for resolving the error, described below.
 ## Update Mode
 This is the recommended method of resolving this issue, although it's a bit more complex than create mode.
 1. Check out https://github.com/dvankley/quickstart
 2. Start the frontend and the java backend per the instructions in the README and verify that the frontend loads correctly at `https://localhost:3000`.
-3. Find the access token value for the account with the `ITEM_LOGIN_REQUIRED` error (it should be in the connector logs just above the exception).
+3. Find the access token value for the account with the `ITEM_LOGIN_REQUIRED` error: take the last four characters from the connector log line just above the exception and look up the matching `plaidItemAccessToken` in your configuration file.
 4. Navigate to `https://localhost:3000?input_access_token=$yourAccessTokenHere` in your browser.
 5. Complete the Link flow in the UI.
 
