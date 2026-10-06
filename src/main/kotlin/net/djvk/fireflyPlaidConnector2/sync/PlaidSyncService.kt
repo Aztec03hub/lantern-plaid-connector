@@ -266,7 +266,14 @@ class PlaidSyncService(
                         hasMore = response.hasMore
                     } while (hasMore)
                 } catch (e: SyncMutationDuringPaginationException) {
-                    if (++restarts > maxMutationRestarts) throw e
+                    if (++restarts > maxMutationRestarts) {
+                        if (!allowItemToFail) throw e
+                        // Like any other Item failure: this Item waits one poll, the others carry on
+                        logger.error("Plaid data for ${describeItem(accessToken)} kept changing during pagination; giving up for this poll")
+                        restoreStartCursor()
+                        failedItems.add(ItemFailure(describeInstitution(accessToken), redactAccessToken(accessToken), MUTATION_DURING_PAGINATION))
+                        continue@accessTokenLoop
+                    }
                     logger.warn(
                         "Plaid data for ${redactAccessToken(accessToken)} changed during pagination; " +
                                 "restarting from the cursor this sync began at (restart $restarts of $maxMutationRestarts)"

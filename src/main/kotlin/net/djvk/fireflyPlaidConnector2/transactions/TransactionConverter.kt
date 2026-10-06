@@ -275,6 +275,11 @@ class TransactionConverter(
         val creates: List<FireflyTransactionDto>,
         val updates: List<FireflyTransactionDto>,
         val deletes: List<FireflyTransactionId>,
+        /**
+         * Firefly transfers whose two Plaid legs disagree after a Plaid change, which this conversion therefore left
+         * alone. A person has to check them; the poll reports the count (callback status "partial").
+         */
+        val transfersNeedingReview: Set<FireflyTransactionId> = setOf(),
     )
 
     /**
@@ -305,6 +310,7 @@ class TransactionConverter(
          *  Plaid "removed" event for the pending id doesn't also delete them.
          */
         val promotedFireflyIds = mutableSetOf<FireflyTransactionId>()
+        val needsReview = linkedSetOf<FireflyTransactionId>()
 
         /**
          * Don't pass in [plaidUpdatedTxs] here because we're not going to try to update transfers for now
@@ -335,7 +341,7 @@ class TransactionConverter(
                     // A posted transaction that replaces a pending one we already imported updates that Firefly
                     //  transaction in place (keeping its id, categories, budgets, notes and user tags) rather than
                     //  deleting and re-creating it.
-                    val promotion = convertPendingPromotion(create.plaidTransaction, indexer, accountMap)
+                    val promotion = convertPendingPromotion(create.plaidTransaction, indexer, accountMap, needsReview)
                     if (promotion != null) {
                         promotedFireflyIds.add(promotion.transactionId)
                         updates.add(promotion)
@@ -422,10 +428,13 @@ class TransactionConverter(
             val existingSplit = target.attributes.transactions.singleOrNull()
             updates.add(
                 when {
-                    existingSplit?.type == TransactionTypeProperty.transfer -> FireflyTransactionDto(
-                        target.id,
-                        preserveUserFields(transferLegUpdate(convertedUpdate.tx, plaidUpdate, existingSplit, accountMap), target),
-                    )
+                    existingSplit?.type == TransactionTypeProperty.transfer -> {
+                        val swap = shouldSwapTransfer(plaidUpdate, existingSplit, accountMap, plaidUpdatedTxs, target.id, needsReview)
+                        FireflyTransactionDto(
+                            target.id,
+                            preserveUserFields(transferLegUpdate(convertedUpdate.tx, plaidUpdate, existingSplit, swap), target),
+                        )
+                    }
 
                     // The sign flipped (a reversal, or a bank correcting a charge into a credit): the type, and the
                     //  accounts on both sides, change with it. Without the type Firefly keeps the old one and records
@@ -450,6 +459,8 @@ class TransactionConverter(
         /**
          * Handle Plaid deletes
          */
+        val deletedExternalIds = plaidDeletedTxs.map { FireflyTransactionExternalIdIndexer.getExternalId(it) }.toSet()
+        val handledRemovals = mutableSetOf<FireflyTransactionId>()
         for (plaidDeleteId in plaidDeletedTxs) {
             val target = indexer.findExistingFireflyTx(plaidDeleteId)
             if (target == null) {
@@ -460,16 +471,34 @@ class TransactionConverter(
                 logger.debug("Not deleting Firefly transaction {}: it was updated in place from pending to posted", target.id)
                 continue
             }
+            // Both legs of one transfer removed in the same sync: one delete, not two
+            if (!handledRemovals.add(target.id)) continue
             val split = target.attributes.transactions.singleOrNull()
-            if (split?.type == TransactionTypeProperty.transfer &&
-                split.externalId != FireflyTransactionExternalIdIndexer.getExternalId(plaidDeleteId)
+            val reference = split?.internalReference?.takeIf { it.startsWith(FireflyTransactionExternalIdIndexer.EXTERNAL_ID_PREFIX) }
+            if (split?.type == TransactionTypeProperty.transfer && split.externalId != null && reference != null &&
+                !(split.externalId in deletedExternalIds && reference in deletedExternalIds)
             ) {
-                // Only the other leg's id is on this transfer. That leg's removal says nothing about the one that
-                //  made it a transfer, and deleting the transfer would drop money Plaid still reports.
-                logger.warn(
-                    "Plaid removed one leg of Firefly transfer {}; keeping the transfer, check it by hand", target.id
-                )
-                continue
+                // Plaid removed ONE leg of a transfer made from two Plaid transactions. The other leg's money is still
+                //  real, so the transfer is not deleted (that would drop it) and not kept either (a re-added leg would
+                //  then be counted again beside it): it becomes a plain withdrawal or deposit for the surviving leg.
+                val prior = updates.lastOrNull { it.id == target.id }
+                // Accounts and ids come from the stored transfer; what Plaid said about the surviving leg earlier in this
+                //  same sync (a new amount or date) is kept
+                val base = plainUpdateOf(split).copy(internalReference = split.internalReference).let {
+                    if (prior == null) it else it.copy(
+                        amount = prior.tx.amount, date = prior.tx.date, processDate = prior.tx.processDate, tags = prior.tx.tags,
+                    )
+                }
+                val survivor = survivingLeg(base, FireflyTransactionExternalIdIndexer.getExternalId(plaidDeleteId))
+                if (survivor != null) {
+                    logger.info(
+                        "Plaid removed one leg of Firefly transfer {}; it becomes a {} for the other leg",
+                        target.id, survivor.type,
+                    )
+                    updates.removeAll { it.id == target.id }
+                    updates.add(FireflyTransactionDto(target.id, survivor, changesType = true))
+                    continue
+                }
             }
 
             deletes.add(target.id)
@@ -479,6 +508,7 @@ class TransactionConverter(
             creates = creates,
             updates = updates,
             deletes = deletes,
+            transfersNeedingReview = needsReview,
         )
     }
 
@@ -496,6 +526,7 @@ class TransactionConverter(
         posted: PlaidTransaction,
         indexer: FireflyTransactionExternalIdIndexer,
         accountMap: Map<PlaidAccountId, FireflyAccountId>,
+        needsReview: MutableSet<FireflyTransactionId>,
     ): FireflyTransactionDto? {
         val pendingId = posted.pendingTransactionId ?: return null
         val target = indexer.findExistingFireflyTx(pendingId) ?: return null
@@ -506,7 +537,8 @@ class TransactionConverter(
             //  external id or as the other leg's id) moves to the posted id so later events still find it.
             val pendingExternalId = FireflyTransactionExternalIdIndexer.getExternalId(pendingId)
             val postedExternalId = FireflyTransactionExternalIdIndexer.getExternalId(posted.transactionId)
-            val leg = transferLegUpdate(convertSingle(posted, accountMap).tx, posted, existingSplit, accountMap)
+            val swap = shouldSwapTransfer(posted, existingSplit, accountMap, listOf(), target.id, needsReview)
+            val leg = transferLegUpdate(convertSingle(posted, accountMap).tx, posted, existingSplit, swap)
             return FireflyTransactionDto(
                 target.id,
                 preserveUserFields(
@@ -529,38 +561,145 @@ class TransactionConverter(
         return FireflyTransactionDto(target.id, preserveUserFields(converted.tx, target, keepCounterparty = false))
     }
 
+    /** True when Plaid says [plaidTx]'s account now sends what [existingSplit] has it receiving, or the other way round. */
+    private suspend fun isLegReversed(
+        plaidTx: PlaidTransaction,
+        existingSplit: TransactionSplit,
+        accountMap: Map<PlaidAccountId, FireflyAccountId>,
+    ): Boolean {
+        val legAccount = accountMap[plaidTx.accountId]?.toString() ?: return false
+        return when (getTransactionDirection(plaidTx)) {
+            Direction.IN -> existingSplit.sourceId == legAccount
+            Direction.OUT -> existingSplit.destinationId == legAccount
+        }
+    }
+
+    /**
+     * Whether a Plaid update of one leg ([plaidTx]) should swap the source and destination of its Firefly transfer.
+     *
+     * A transfer made from two Plaid legs flips only when BOTH legs say so. When one leg flips and the other does not
+     * (in this sync, [batchUpdates]), the two banks disagree about the direction, so the pair is no longer a transfer
+     * we can describe: nothing is swapped (a swap per leg would flip-flop on every later update), the transfer is
+     * logged at ERROR and added to [needsReview]. A transfer with only one known Plaid leg has only that leg's word.
+     */
+    private suspend fun shouldSwapTransfer(
+        plaidTx: PlaidTransaction,
+        existingSplit: TransactionSplit,
+        accountMap: Map<PlaidAccountId, FireflyAccountId>,
+        batchUpdates: Collection<PlaidTransaction>,
+        fireflyId: FireflyTransactionId,
+        needsReview: MutableSet<FireflyTransactionId>,
+    ): Boolean {
+        if (!isLegReversed(plaidTx, existingSplit, accountMap)) return false
+        val reference = existingSplit.internalReference?.takeIf { it.startsWith(FireflyTransactionExternalIdIndexer.EXTERNAL_ID_PREFIX) }
+            ?: return true
+        val ownId = FireflyTransactionExternalIdIndexer.getExternalId(plaidTx.transactionId)
+        val partnerId = if (ownId == existingSplit.externalId) reference else existingSplit.externalId
+        val partner = batchUpdates.firstOrNull { FireflyTransactionExternalIdIndexer.getExternalId(it.transactionId) == partnerId }
+        if (partner != null && isLegReversed(partner, existingSplit, accountMap)) return true
+        logger.error(
+            "Plaid reversed one leg of Firefly transfer {} but not the other; leaving the transfer as it is, check it by hand",
+            fireflyId,
+        )
+        needsReview.add(fireflyId)
+        return false
+    }
+
     /**
      * The update for a Firefly transfer when Plaid reports a change to one of its legs ([plaidTx], [converted] is its
      * single-transaction conversion). Firefly can't turn a transfer back into a withdrawal/deposit, and both sides of
      * a transfer are real accounts, so the account ids stay as they are and only what Plaid owns is refreshed (amount,
      * date, tags). The external id stays too: this leg's id may be the one stored as the other leg's.
      *
-     * The one exception is a leg whose direction flipped (its account now receives what it used to send, or the
-     * other way round): the transfer's source and destination swap, or both accounts' balances would be off by twice
-     * the amount.
+     * The one exception is a transfer whose direction flipped ([swap], see [shouldSwapTransfer]): the source and
+     * destination swap, or both accounts' balances would be off by twice the amount. A transfer made from two Plaid
+     * legs keeps the destination leg's id as `external_id` and the source leg's as `internal_reference` (the removal
+     * of one leg relies on it), so the two ids swap with the accounts.
      */
-    private suspend fun transferLegUpdate(
+    private fun transferLegUpdate(
         converted: TransactionSplit,
         plaidTx: PlaidTransaction,
         existingSplit: TransactionSplit,
-        accountMap: Map<PlaidAccountId, FireflyAccountId>,
+        swap: Boolean,
     ): TransactionSplit {
-        val legAccount = accountMap[plaidTx.accountId]?.toString()
-        val direction = getTransactionDirection(plaidTx)
-        val reversed = legAccount != null && (
-                (direction == Direction.IN && existingSplit.sourceId == legAccount) ||
-                        (direction == Direction.OUT && existingSplit.destinationId == legAccount)
-                )
-        if (reversed) {
+        if (swap) {
             logger.info("Plaid transaction {} reversed the direction of its transfer; swapping source and destination", plaidTx.transactionId)
         }
+        val reference = existingSplit.internalReference?.takeIf { it.startsWith(FireflyTransactionExternalIdIndexer.EXTERNAL_ID_PREFIX) }
+        val swapIds = swap && reference != null
         return converted.copy(
-            sourceId = if (reversed) existingSplit.destinationId else existingSplit.sourceId,
+            sourceId = if (swap) existingSplit.destinationId else existingSplit.sourceId,
             sourceName = null,
-            destinationId = if (reversed) existingSplit.sourceId else existingSplit.destinationId,
+            destinationId = if (swap) existingSplit.sourceId else existingSplit.destinationId,
             destinationName = null,
             description = existingSplit.description,
-            externalId = existingSplit.externalId,
+            externalId = if (swapIds) reference else existingSplit.externalId,
+            internalReference = if (swapIds) existingSplit.externalId else null,
+        )
+    }
+
+    /** What an update of [existing] sends when nothing but the fields below is to be changed (no read-only fields). */
+    private fun plainUpdateOf(existing: TransactionSplit): TransactionSplit = TransactionSplit(
+        type = existing.type,
+        date = existing.date,
+        amount = existing.amount,
+        description = existing.description,
+        sourceId = existing.sourceId,
+        destinationId = existing.destinationId,
+        currencyId = existing.currencyId,
+        currencyCode = existing.currencyCode,
+        tags = existing.tags,
+        externalId = existing.externalId,
+    )
+
+    /**
+     * [transfer] is a transfer made from two Plaid legs (its `external_id` is the destination leg's id, its
+     * `internal_reference` the source leg's). Plaid removed the leg [removedExternalId]; this is the same money as a
+     * plain withdrawal (the source leg survives) or deposit (the destination leg survives) on that leg's account, with
+     * a generic counterparty. Null if [transfer] isn't such a transfer or [removedExternalId] is neither of its legs.
+     */
+    fun survivingLeg(transfer: TransactionSplit, removedExternalId: String): TransactionSplit? {
+        val reference = transfer.internalReference?.takeIf { it.startsWith(FireflyTransactionExternalIdIndexer.EXTERNAL_ID_PREFIX) }
+        val destinationLeg = transfer.externalId
+        if (transfer.type != TransactionTypeProperty.transfer || reference == null || destinationLeg == null) return null
+        return when (removedExternalId) {
+            destinationLeg -> transfer.copy(
+                type = TransactionTypeProperty.withdrawal,
+                destinationId = null,
+                destinationName = "Unknown Transfer Recipient",
+                externalId = reference,
+                internalReference = null,
+            )
+
+            reference -> transfer.copy(
+                type = TransactionTypeProperty.deposit,
+                sourceId = null,
+                sourceName = "Unknown Transfer Source",
+                internalReference = null,
+            )
+
+            else -> null
+        }
+    }
+
+    /**
+     * Applies a Plaid change ([plaidTx], a "modified" event) to the write that has not reached Firefly yet
+     * ([unsent], a create kept in the dead letter file), so the create that finally goes through carries Plaid's
+     * latest word instead of what it was when Firefly first rejected it.
+     */
+    suspend fun reviseUnsentCreate(
+        unsent: TransactionSplit,
+        plaidTx: PlaidTransaction,
+        accountMap: Map<PlaidAccountId, FireflyAccountId>,
+    ): TransactionSplit {
+        val converted = convertSingle(plaidTx, accountMap, currentImportTag()).tx
+        if (unsent.type != TransactionTypeProperty.transfer) return converted
+        // A transfer keeps its accounts and ids; only what Plaid owns is refreshed
+        return unsent.copy(
+            date = converted.date,
+            amount = converted.amount,
+            processDate = converted.processDate,
+            tags = mergeTags(unsent.tags, converted.tags),
         )
     }
 
@@ -741,7 +880,8 @@ class TransactionConverter(
             )
         }
 
-        return convert(
+        val oldPlaidId = fireflyTx.tx.externalId?.takeIf { it.startsWith(FireflyTransactionExternalIdIndexer.EXTERNAL_ID_PREFIX) }
+        val converted = convert(
             tx = plaidTx,
             isPair = true,
             sourceId = sourceId,
@@ -753,8 +893,17 @@ class TransactionConverter(
             // The converted transaction's own Plaid id moves to the new external id; keep it as the other leg's id.
             //  A manually entered transaction has no Plaid id, and then its internal reference is left alone (null
             //  is omitted from the update).
-            internalReference = fireflyTx.tx.externalId?.takeIf { it.startsWith(FireflyTransactionExternalIdIndexer.EXTERNAL_ID_PREFIX) },
+            internalReference = oldPlaidId,
         )
+        // Like convertDoublePlaid, the destination leg's id is the external id and the source leg's the internal
+        //  reference. Here the Plaid transaction is the destination leg when the existing Firefly one was a withdrawal
+        //  and the source leg when it was a deposit, so for a deposit the two ids trade places.
+        if (oldPlaidId != null && fireflyTx.tx.type == TransactionTypeProperty.deposit) {
+            return converted.copy(
+                tx = converted.tx.copy(externalId = oldPlaidId, internalReference = converted.tx.externalId),
+            )
+        }
+        return converted
     }
 
     /**

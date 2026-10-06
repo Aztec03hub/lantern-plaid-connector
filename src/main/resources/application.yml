@@ -1,10 +1,12 @@
 fireflyPlaidConnector2:
-  # "batch" or "polled"
+  # "batch" or "polled". Defaults to "polled" when unset (batch mode has none of the protections of polled mode:
+  #   no failed-Item report, no dead letters, no result callback), so a missing setting can't fall back to it.
+  #   Polled mode refuses to start unless pendingTag below is set.
   #   - "batch" runs once, attempting to sync all data up to maxSyncDays, and then exits
   #   - "polled" runs forever, syncing all new data every "syncFrequencyMinutes", storing
   #     its current state in persistence/plaid_sync_cursors.txt. On first run, it will only pull
   #     transactions that occurred after the run started.
-  syncMode: batch
+  syncMode: polled
   # PlaidTransaction.merchantName will always be used, if available, as the name of a transaction's
   #   destination (or source, for some transfers) account in Firefly.
   # If this is set to true and PlaidTransaction.merchantName is null, then PlaidTransaction.name will

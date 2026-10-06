@@ -1,15 +1,19 @@
 package net.djvk.fireflyPlaidConnector2.sync
 
+import com.fasterxml.jackson.databind.DeserializationFeature
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionSplit
+import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.stereotype.Component
+import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.nio.file.attribute.PosixFilePermissions
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.io.path.Path
 
 /**
@@ -30,6 +34,10 @@ data class DeadLetter(
     val split: TransactionSplit? = null,
     val changesType: Boolean = false,
     val message: String = "",
+    /** How many retries Firefly has rejected since this letter was written; see [DeadLetterStore.maxAttempts]. */
+    val attempts: Int = 0,
+    /** True once [attempts] reached the cap: no longer retried, still reported, and left for a person to resolve. */
+    val abandoned: Boolean = false,
 )
 
 /**
@@ -42,12 +50,39 @@ class DeadLetterStore(
     @Value("\${fireflyPlaidConnector2.polled.cursorFileDirectoryPath}")
     cursorFileDirectoryPath: String,
 ) {
+    private val logger = LoggerFactory.getLogger(this::class.java)
     private val mapper = jacksonObjectMapper().findAndRegisterModules()
+        .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
     val path = Path("$cursorFileDirectoryPath/plaid_dead_letters.json")
 
+    private val unreadable = AtomicInteger(0)
+
+    /**
+     * How many times the file was found unreadable (and moved aside) since this was last asked; resets to 0. The poll
+     * reports it in the result callback, so a lost dead letter file is never silent.
+     */
+    fun takeUnreadableCount(): Int = unreadable.getAndSet(0)
+
+    /**
+     * The letters in the file. A file that can't be parsed (for example after an upgrade changed the generated
+     * `TransactionSplit`) is moved aside to `plaid_dead_letters.unreadable-<epoch>.json` (owner-only, kept for a
+     * person to read) and logged at ERROR; the poll goes on with no letters instead of stopping every bank.
+     */
     suspend fun read(): List<DeadLetter> = withContext(Dispatchers.IO) {
         val file = path.toFile()
-        if (!file.exists()) listOf() else mapper.readValue(file)
+        if (!file.exists()) return@withContext listOf()
+        try {
+            mapper.readValue<List<DeadLetter>>(file)
+        } catch (e: IOException) {
+            val aside = path.resolveSibling("plaid_dead_letters.unreadable-${System.currentTimeMillis()}.json")
+            Files.move(path, aside, StandardCopyOption.REPLACE_EXISTING)
+            unreadable.incrementAndGet()
+            logger.error(
+                "The dead letter file could not be read (${e::class.simpleName}); moved it to $aside. " +
+                        "The writes in it are NOT being retried: read the moved file and re-enter them by hand."
+            )
+            listOf()
+        }
     }
 
     /** Adds [letter], replacing any earlier one with the same operation and key. */
@@ -55,11 +90,21 @@ class DeadLetterStore(
         write(read().filterNot { it.operation == letter.operation && it.key == letter.key } + letter)
     }
 
-    /** Drops the letters for [operation] and [key] (the write finally went through). */
+    /**
+     * Drops the letters for [operation] and [key] (the write finally went through). A delete also drops every other
+     * letter for the same Firefly transaction: an update of something that no longer exists can never succeed.
+     */
     suspend fun remove(operation: String, key: String) {
         val all = read()
-        val remaining = all.filterNot { it.operation == operation && it.key == key }
+        val remaining = all.filterNot {
+            (it.operation == operation && it.key == key) || (operation == "delete" && it.fireflyId == key)
+        }
         if (remaining.size != all.size) write(remaining)
+    }
+
+    companion object {
+        /** A letter Firefly keeps rejecting is retried this many times, then abandoned (reported, not retried). */
+        const val maxAttempts = 10
     }
 
     private suspend fun write(letters: List<DeadLetter>) = withContext(Dispatchers.IO) {

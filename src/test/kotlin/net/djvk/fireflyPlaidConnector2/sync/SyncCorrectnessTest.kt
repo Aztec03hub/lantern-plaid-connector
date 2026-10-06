@@ -158,7 +158,10 @@ internal class SyncCorrectnessTest {
     private val syncHelper: SyncHelper = mock()
     private val cursorManager: CursorManager = mock()
     private val plaidSyncService: PlaidSyncService = mock()
-    private val fireflyTransactionService: FireflyTransactionService = mock()
+    private val fireflyTransactionService: FireflyTransactionService = mock {
+        // 0 creates were dead-lettered (a bare mock returns null for the boxed Int)
+        onBlocking { processFireflyTransactionUpdates(org.mockito.kotlin.any(), org.mockito.kotlin.any(), org.mockito.kotlin.any()) } doReturn 0
+    }
     private val converter: net.djvk.fireflyPlaidConnector2.transactions.TransactionConverter = mock()
 
     private fun orchestrator() = PolledSyncOrchestrator(

@@ -1,5 +1,6 @@
 package net.djvk.fireflyPlaidConnector2.sync
 
+import org.mockito.kotlin.doReturn
 import kotlinx.coroutines.runBlocking
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionRead
 import net.djvk.fireflyPlaidConnector2.api.plaid.models.Transaction as PlaidTransaction
@@ -36,7 +37,10 @@ internal class PolledSyncOrchestratorTest {
     private val syncHelper: SyncHelper = mock()
     private val cursorManager: CursorManager = mock()
     private val plaidSyncService: PlaidSyncService = mock()
-    private val fireflyTransactionService: FireflyTransactionService = mock()
+    private val fireflyTransactionService: FireflyTransactionService = mock {
+        // 0 creates were dead-lettered (a bare mock returns null for the boxed Int)
+        onBlocking { processFireflyTransactionUpdates(org.mockito.kotlin.any(), org.mockito.kotlin.any(), org.mockito.kotlin.any()) } doReturn 0
+    }
     private val converter: TransactionConverter = mock()
 
     /**

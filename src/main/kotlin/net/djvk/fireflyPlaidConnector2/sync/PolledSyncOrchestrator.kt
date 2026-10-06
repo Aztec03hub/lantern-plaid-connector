@@ -29,7 +29,7 @@ typealias PlaidSyncCursor = String
  * Handles the "polled" sync mode, which periodically polls for new transactions and processes them.
  * This class coordinates the different components involved in the sync process.
  */
-@ConditionalOnProperty(name = ["fireflyPlaidConnector2.syncMode"], havingValue = "polled")
+@ConditionalOnProperty(name = ["fireflyPlaidConnector2.syncMode"], havingValue = "polled", matchIfMissing = true)
 @Component
 class PolledSyncOrchestrator(
     @Value("\${fireflyPlaidConnector2.polled.syncFrequencyMinutes}")
@@ -70,8 +70,29 @@ class PolledSyncOrchestrator(
 
     /** Counts the writes Firefly permanently rejected, for the result callback; null (tests) means none are kept. */
     private val deadLetterStore: DeadLetterStore? = null,
+
+    /**
+     * Polled mode needs `pendingTag`: without it a pending Firefly transaction stays a transfer candidate, and a
+     * pending transaction the bank then cancels can stay a transfer. An unset value used to degrade silently, so
+     * startup fails instead. (The default here is only for hand-built instances in tests; Spring passes the property.)
+     */
+    @Value("\${fireflyPlaidConnector2.pendingTag:}")
+    pendingTag: String = "pending",
 ) : Runner, DisposableBean {
     private val logger = LoggerFactory.getLogger(this::class.java)
+
+    init {
+        check(pendingTag.isNotBlank()) {
+            "fireflyPlaidConnector2.pendingTag must be set in polled mode (for example \"pending\"): without it a " +
+                    "cancelled pending transaction can be left behind as a transfer. Set it and restart."
+        }
+        if (webhookService == null) {
+            logger.warn(
+                "fireflyPlaidConnector2.polled.resultCallbackUrl is not set: a poll that needs attention " +
+                        "(status \"partial\") will only show in the log"
+            )
+        }
+    }
 
     private val terminated = AtomicBoolean(false)
     private lateinit var mainJob: Job
@@ -250,8 +271,7 @@ class PolledSyncOrchestrator(
             commitCursors(cursorMap, workingCursors)
             return PollResult(
                 failedItems = recordItemOutcomes(accessTokens, plaidTransactions.failedItems),
-                deadLetters = deadLetterStore?.read()?.size ?: 0,
-            )
+            ).withDeadLetters()
         }
 
         // Fetch existing Firefly transactions in the pull window, plus any older ones that Plaid's updates, removals
@@ -293,11 +313,16 @@ class PolledSyncOrchestrator(
         )
 
         // Process transaction updates in Firefly
-        fireflyTransactionService.processFireflyTransactionUpdates(
+        val deadLetteredCreates = fireflyTransactionService.processFireflyTransactionUpdates(
             convertResult.creates,
             convertResult.updates,
             convertResult.deletes
         )
+
+        // A create waiting in the dead letter file is invisible to the conversion above (it only looks in Firefly), so
+        //  Plaid's later word on that transaction is applied to the letter itself. After the writes, so a failed
+        //  iteration replays cleanly; before the cursors commit, because Plaid will not send these events again.
+        reviseDeadLetteredCreates(accountMap, plaidTransactions)
 
         // Commit the cursors only after successful processing
         commitCursors(cursorMap, workingCursors)
@@ -307,12 +332,73 @@ class PolledSyncOrchestrator(
             plaidCreated = plaidTransactions.created.size,
             plaidUpdated = plaidTransactions.updated.size,
             plaidDeleted = plaidTransactions.deleted.size,
-            fireflyCreated = convertResult.creates.size,
+            fireflyCreated = convertResult.creates.size - deadLetteredCreates,
             fireflyUpdated = convertResult.updates.size,
             fireflyDeleted = convertResult.deletes.size,
             failedItems = recordItemOutcomes(accessTokens, plaidTransactions.failedItems),
-            deadLetters = deadLetterStore?.read()?.size ?: 0,
+            transfersNeedingReview = convertResult.transfersNeedingReview.size,
+        ).withDeadLetters()
+    }
+
+    /** Fills in what the dead letter file holds right now (retried, abandoned, unreadable). */
+    private suspend fun PollResult.withDeadLetters(): PollResult {
+        val store = deadLetterStore ?: return this
+        val letters = store.read()
+        return copy(
+            deadLetters = letters.size,
+            deadLettersAbandoned = letters.count { it.abandoned },
+            deadLetterFilesUnreadable = store.takeUnreadableCount(),
         )
+    }
+
+    /**
+     * Applies this poll's Plaid events to the creates that Firefly rejected and that wait in the dead letter file:
+     * - a posted transaction that replaces a pending one drops the pending one's letter (the posted create takes over);
+     * - a modified transaction replaces the letter's content with its new version (the retry carries the new amount);
+     * - a removed transaction drops its letter (nothing was ever created); one leg of a transfer that was removed
+     *   leaves the other leg's money as a plain create instead.
+     * Any letter that changes is retried from scratch (attempts reset).
+     */
+    private suspend fun reviseDeadLetteredCreates(
+        accountMap: Map<PlaidAccountId, FireflyAccountId>,
+        plaid: PlaidTransactionResult,
+    ) {
+        val store = deadLetterStore ?: return
+        if (plaid.created.isEmpty() && plaid.updated.isEmpty() && plaid.deleted.isEmpty()) return
+        val creates = store.read().filter { it.operation == "create" && it.split != null }
+        if (creates.isEmpty()) return
+        fun letterFor(plaidId: String) = creates.firstOrNull {
+            val id = FireflyTransactionExternalIdIndexer.getExternalId(plaidId)
+            it.key == id || it.split?.internalReference == id
+        }
+
+        for (posted in plaid.created) {
+            val pendingId = posted.pendingTransactionId ?: continue
+            val letter = letterFor(pendingId) ?: continue
+            logger.info("Dropping the dead-lettered create of pending transaction ${letter.key}: its posted version replaces it")
+            store.remove("create", letter.key)
+        }
+        for (modified in plaid.updated) {
+            val letter = letterFor(modified.transactionId) ?: continue
+            logger.info("Applying Plaid's update of ${modified.transactionId} to its dead-lettered create ${letter.key}")
+            store.add(letter.copy(split = converter.reviseUnsentCreate(letter.split!!, modified, accountMap), attempts = 0, abandoned = false))
+        }
+        for (removedId in plaid.deleted) {
+            val letter = store.read().firstOrNull {
+                it.operation == "create" && it.split != null &&
+                        (it.key == FireflyTransactionExternalIdIndexer.getExternalId(removedId) ||
+                                it.split.internalReference == FireflyTransactionExternalIdIndexer.getExternalId(removedId))
+            } ?: continue
+            val survivor = converter.survivingLeg(letter.split!!, FireflyTransactionExternalIdIndexer.getExternalId(removedId))
+            if (survivor == null) {
+                logger.info("Dropping the dead-lettered create ${letter.key}: Plaid removed ${removedId}")
+                store.remove("create", letter.key)
+            } else {
+                logger.info("Plaid removed one leg of the dead-lettered transfer ${letter.key}; keeping the other leg's money")
+                store.remove("create", letter.key)
+                store.add(letter.copy(key = survivor.externalId ?: letter.key, split = survivor, attempts = 0, abandoned = false))
+            }
+        }
     }
 
     /**
@@ -460,5 +546,5 @@ class InvestmentSyncException(val failedItemNames: List<String>) :
     val failedItems: Int get() = failedItemNames.size
 }
 
-/** A history import has thousands of transactions; this caps reading the Firefly range they fall in (50 per page). */
-private const val maxHistoryPages = 1000
+/** No page cap for the history range read: it is bounded by the transaction ceiling in [FireflyTransactionService] instead. */
+private const val maxHistoryPages = Int.MAX_VALUE

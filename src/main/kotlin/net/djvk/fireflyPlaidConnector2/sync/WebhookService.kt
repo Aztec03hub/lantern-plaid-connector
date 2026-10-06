@@ -32,6 +32,7 @@ data class PollResult(
     val plaidCreated: Int = 0,
     val plaidUpdated: Int = 0,
     val plaidDeleted: Int = 0,
+    /** Creates sent to Firefly that went through; creates that were dead-lettered instead are counted in [deadLetters]. */
     val fireflyCreated: Int = 0,
     val fireflyUpdated: Int = 0,
     val fireflyDeleted: Int = 0,
@@ -41,10 +42,17 @@ data class PollResult(
     val deadLetters: Int = 0,
     /** Investment Items that failed this poll. */
     val investmentFailures: Int = 0,
+    /** Of [deadLetters], the ones Firefly rejected so often that they are no longer retried; a person must resolve them. */
+    val deadLettersAbandoned: Int = 0,
+    /** Times the dead letter file could not be read this poll and was moved aside (its writes are NOT being retried). */
+    val deadLetterFilesUnreadable: Int = 0,
+    /** Firefly transfers whose legs disagree after a Plaid change, left untouched for a person to check. */
+    val transfersNeedingReview: Int = 0,
 ) {
     /** True when the poll ran but something needs attention: a bank is failing, a write is dead-lettered. */
     @get:com.fasterxml.jackson.annotation.JsonIgnore
-    val partial: Boolean get() = failedItems.isNotEmpty() || deadLetters > 0 || investmentFailures > 0
+    val partial: Boolean get() = failedItems.isNotEmpty() || deadLetters > 0 || investmentFailures > 0 ||
+            deadLetterFilesUnreadable > 0 || transfersNeedingReview > 0
 }
 
 /**

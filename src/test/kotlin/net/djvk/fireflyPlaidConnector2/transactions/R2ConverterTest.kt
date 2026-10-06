@@ -157,14 +157,26 @@ internal class R2ConverterTest {
         assertThat(update.tx.destinationId).isEqualTo("2")
     }
 
-    /** The removal of one leg says nothing about the other; dropping the transfer would lose money Plaid still reports. */
+    /**
+     * R3 (L1-R3): the removal of one leg says nothing about the other, so the transfer is not deleted; it becomes a
+     * plain deposit for the surviving destination leg (the removed source leg's money is the one Plaid took back).
+     */
     @Test
-    fun theRemovalOfOneLegDoesNotDeleteATransferThatIsRecordedUnderTheOtherLegsId() = runBlocking<Unit> {
+    fun theRemovalOfTheSourceLegTurnsTheTransferIntoADepositForTheOtherLeg() = runBlocking<Unit> {
         val transfer = existing("ff1", "plaid-dep", TransactionTypeProperty.transfer, internalReference = "plaid-wd")
 
         val result = converter().convertPollSync(accountMap, listOf(), listOf(), listOf("wd"), listOf(transfer))
 
         assertThat(result.deletes).isEmpty()
+        val update = result.updates.single()
+        assertThat(update.id).isEqualTo("ff1")
+        assertThat(update.changesType).isTrue()
+        assertThat(update.tx.type).isEqualTo(TransactionTypeProperty.deposit)
+        assertThat(update.tx.destinationId).isEqualTo("2")
+        assertThat(update.tx.sourceId).isNull()
+        assertThat(update.tx.sourceName).isEqualTo("Unknown Transfer Source")
+        assertThat(update.tx.externalId).isEqualTo("plaid-dep")
+        assertThat(typeSent(update)).isEqualTo("deposit")
     }
 
     @Test
@@ -260,19 +272,88 @@ internal class R2ConverterTest {
         assertThat(tx.destinationName).isNull()
     }
 
-    /** A leg whose sign flips swaps the transfer's direction instead of being sent as the original one. */
+    /** Both legs flip in one sync: the transfer's direction swaps once, and the two ids swap with the accounts. */
     @Test
-    fun aTransferLegWhoseSignFlipsSwapsTheTransfersDirection() = runBlocking<Unit> {
-        // account 1 (A) sent 50 to account 2 (B); Plaid now says A's leg is money IN, so it is B that sent it
+    fun aTransferWhoseTwoLegsBothFlipSwapsTheTransfersDirection() = runBlocking<Unit> {
+        // account 1 (A) sent 50 to account 2 (B); Plaid now says A's leg is money IN and B's is money OUT
         val transfer = existing("ff1", "plaid-dep", TransactionTypeProperty.transfer, internalReference = "plaid-wd")
 
         val result = converter().convertPollSync(
-            accountMap, listOf(), listOf(plaid(accountA, "wd", -50.0)), listOf(), listOf(transfer)
+            accountMap, listOf(), listOf(plaid(accountA, "wd", -50.0), plaid(accountB, "dep", 50.0)), listOf(), listOf(transfer)
         )
 
-        val tx = result.updates.single().tx
-        assertThat(tx.sourceId).isEqualTo("2")
-        assertThat(tx.destinationId).isEqualTo("1")
+        assertThat(result.transfersNeedingReview).isEmpty()
+        assertThat(result.updates).hasSize(2)
+        for (update in result.updates) {
+            assertThat(update.tx.sourceId).isEqualTo("2")
+            assertThat(update.tx.destinationId).isEqualTo("1")
+            // external id = the leg on the destination account, which is now A's leg
+            assertThat(update.tx.externalId).isEqualTo("plaid-wd")
+            assertThat(update.tx.internalReference).isEqualTo("plaid-dep")
+        }
+    }
+
+    /** The OUT half of the reversal test (R3 mutation C4): a deposit leg of a transfer that flips to OUT. */
+    @Test
+    fun aTransferWhoseDepositLegFlipsToOutAndWhoseOtherLegAgreesSwaps() = runBlocking<Unit> {
+        val transfer = existing("ff1", "plaid-dep", TransactionTypeProperty.transfer, internalReference = "plaid-wd")
+
+        // only the update of the deposit leg is processed first in list order
+        val result = converter().convertPollSync(
+            accountMap, listOf(), listOf(plaid(accountB, "dep", 50.0), plaid(accountA, "wd", -50.0)), listOf(), listOf(transfer)
+        )
+
+        assertThat(result.updates.first().tx.sourceId).isEqualTo("2")
+        assertThat(result.updates.first().tx.destinationId).isEqualTo("1")
+    }
+
+    /**
+     * R3 (L2-R3, probe p3): one leg flips and the other does not. The banks disagree, so nothing is swapped, the
+     * transfer is reported, and a later ordinary update of the untouched leg no longer flip-flops it.
+     */
+    @Test
+    fun aTransferWhoseLegsDisagreeOnDirectionIsLeftAloneAndReported() = runBlocking<Unit> {
+        val transfer = existing("ff1", "plaid-dep", TransactionTypeProperty.transfer, internalReference = "plaid-wd")
+
+        val flipped = converter().convertPollSync(
+            accountMap, listOf(), listOf(plaid(accountA, "wd", -50.0)), listOf(), listOf(transfer)
+        )
+        assertThat(flipped.updates.single().tx.sourceId).isEqualTo("1")
+        assertThat(flipped.updates.single().tx.destinationId).isEqualTo("2")
+        assertThat(flipped.transfersNeedingReview).containsExactly("ff1")
+
+        val untouched = converter().convertPollSync(
+            accountMap, listOf(), listOf(plaid(accountB, "dep", -50.0)), listOf(), listOf(transfer)
+        )
+        assertThat(untouched.updates.single().tx.sourceId).isEqualTo("1")
+        assertThat(untouched.updates.single().tx.destinationId).isEqualTo("2")
+        assertThat(untouched.transfersNeedingReview).isEmpty()
+    }
+
+    /** The deposit leg flipping alone (OUT) is reported too, not swapped. */
+    @Test
+    fun aDepositLegThatFlipsToOutAloneIsReportedNotSwapped() = runBlocking<Unit> {
+        val transfer = existing("ff1", "plaid-dep", TransactionTypeProperty.transfer, internalReference = "plaid-wd")
+
+        val result = converter().convertPollSync(
+            accountMap, listOf(), listOf(plaid(accountB, "dep", 50.0)), listOf(), listOf(transfer)
+        )
+
+        assertThat(result.updates.single().tx.sourceId).isEqualTo("1")
+        assertThat(result.transfersNeedingReview).containsExactly("ff1")
+    }
+
+    /** A transfer with one known Plaid leg (no reference) has only that leg's word on direction. */
+    @Test
+    fun aLegacyTransferWithOneKnownLegSwapsOnThatLegsWord() = runBlocking<Unit> {
+        val transfer = existing("ff1", "plaid-dep", TransactionTypeProperty.transfer)
+
+        val result = converter().convertPollSync(
+            accountMap, listOf(), listOf(plaid(accountA, "dep", -50.0)), listOf(), listOf(transfer)
+        )
+
+        assertThat(result.updates.single().tx.sourceId).isEqualTo("2")
+        assertThat(result.transfersNeedingReview).isEmpty()
     }
 
     @Test

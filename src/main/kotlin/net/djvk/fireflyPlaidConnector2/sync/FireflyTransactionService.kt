@@ -37,6 +37,7 @@ class FireflyTransactionService(
 ) {
     private val logger = LoggerFactory.getLogger(this::class.java)
     private val fireflyPageCountMax = 20
+    private val maxRangeTransactions = 200_000
     private val zoneId = ZoneId.of(timeZoneString)
 
     /**
@@ -67,6 +68,10 @@ class FireflyTransactionService(
                 TransactionTypeFilter.all,
             ).body()
             val pagination = response.meta.pagination
+            // Fail on the size of the range, not on a page count, which depends on the Firefly user's page size preference
+            if (pagination != null && (pagination.total ?: 0) > maxRangeTransactions) {
+                throw RuntimeException("Firefly range read of ${pagination?.total} transactions exceeds the failsafe $maxRangeTransactions")
+            }
 
             /**
              * Don't do any more filtering here, we will need all transactions for potentially matching
@@ -135,17 +140,21 @@ class FireflyTransactionService(
      * Each write goes through [guarded]: a write Firefly permanently rejects for one transaction is kept in the dead
      * letter file and the rest carry on, so one bad transaction can't stall every bank. Anything else (network, 5xx,
      * authentication, rate limit) still fails the iteration, which is then retried as a whole.
+     *
+     * @return how many of [creates] were dead-lettered instead of created, so the caller doesn't count them as created
      */
     suspend fun processFireflyTransactionUpdates(
         creates: List<FireflyTransactionDto>,
         updates: List<FireflyTransactionDto>,
         deletes: List<String>
-    ) {
+    ): Int {
+        var deadLetteredCreates = 0
         // Insert new transactions
         for (create in creates) {
-            guarded(DeadLetter("create", create.tx.externalId ?: "", null, create.tx, false)) {
+            val kept = guarded(DeadLetter("create", create.tx.externalId ?: "", null, create.tx, false)) {
                 syncHelper.optimisticInsertBatchIntoFirefly(listOf(create))
             }
+            if (kept) deadLetteredCreates++
         }
 
         // Process updates. This includes converting an existing deposit/withdrawal into a transfer, which is an in-place
@@ -160,23 +169,26 @@ class FireflyTransactionService(
         for (id in deletes) {
             guarded(DeadLetter("delete", id, id)) { syncHelper.deleteBatchInFirefly(listOf(id)) }
         }
+        return deadLetteredCreates
     }
 
     /**
      * Retries the writes Firefly rejected in earlier polls. The ones that go through are removed from the dead letter
-     * file; the ones that are still rejected stay (with Firefly's latest message). A create whose external id is
-     * already in Firefly is dropped rather than inserted again.
+     * file; the ones that are still rejected stay (with Firefly's latest message) until [DeadLetterStore.maxAttempts]
+     * retries have failed, after which they are abandoned: no longer retried, but still in the file and still reported.
+     * A create whose external id is already in Firefly is dropped rather than inserted again.
      */
     suspend fun retryDeadLetters() {
         val store = deadLetters ?: return
         for (letter in store.read()) {
+            if (letter.abandoned) continue
             if (letter.operation == "create" && letter.key.startsWith(FireflyTransactionExternalIdIndexer.EXTERNAL_ID_PREFIX) &&
                 fetchMissingByPlaidId(listOf(letter.key.removePrefix(FireflyTransactionExternalIdIndexer.EXTERNAL_ID_PREFIX)), listOf()).isNotEmpty()
             ) {
                 store.remove(letter.operation, letter.key)
                 continue
             }
-            guarded(letter) {
+            guarded(letter, retry = true) {
                 val split = letter.split
                 when (letter.operation) {
                     "create" -> syncHelper.optimisticInsertBatchIntoFirefly(listOf(FireflyTransactionDto(null, split!!)))
@@ -187,23 +199,48 @@ class FireflyTransactionService(
         }
     }
 
-    /** Runs [write] for [letter]'s transaction; see [processFireflyTransactionUpdates] for what is and isn't dead-lettered. */
-    private suspend fun guarded(letter: DeadLetter, write: suspend () -> Unit) {
+    /**
+     * Runs [write] for [letter]'s transaction; see [processFireflyTransactionUpdates] for what is and isn't dead-lettered.
+     *
+     * A 404 on an update or delete means the Firefly transaction is gone (the user deleted it, or a later removal
+     * did): that write can never succeed, so the letter is dropped with a WARN instead of being retried forever.
+     *
+     * @return true if the write was kept as a dead letter
+     */
+    private suspend fun guarded(letter: DeadLetter, retry: Boolean = false, write: suspend () -> Unit): Boolean {
         val store = deadLetters
         try {
             write()
             store?.remove(letter.operation, letter.key)
+            return false
         } catch (cre: ClientRequestException) {
             val status = cre.response.status.value
             // 401/403 mean the Firefly credentials are wrong for every transaction; 408/429 are transient
             if (store == null || status !in 400..499 || status in setOf(401, 403, 408, 429)) throw cre
+            if (status == 404 && letter.operation != "create") {
+                logger.warn(
+                    "Firefly transaction ${letter.fireflyId} no longer exists; dropping the ${letter.operation} of ${letter.key}"
+                )
+                store.remove(letter.operation, letter.key)
+                return false
+            }
             val message = runCatching { cre.response.bodyAsText() }.getOrDefault("")
                 .let { Regex("\"message\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"").find(it)?.groupValues?.get(1) } ?: "HTTP $status"
-            logger.error(
-                "Firefly permanently rejected ${letter.operation} of ${letter.key} (HTTP $status: $message); " +
-                        "kept in the dead letter file and retried every poll"
-            )
-            store.add(letter.copy(message = "HTTP $status: $message"))
+            val attempts = if (retry) letter.attempts + 1 else 0
+            val abandoned = attempts >= DeadLetterStore.maxAttempts
+            if (abandoned) {
+                logger.error(
+                    "Firefly rejected ${letter.operation} of ${letter.key} $attempts times (HTTP $status: $message); " +
+                            "ABANDONED: it stays in the dead letter file and is no longer retried. Fix or remove it by hand."
+                )
+            } else {
+                logger.error(
+                    "Firefly permanently rejected ${letter.operation} of ${letter.key} (HTTP $status: $message); " +
+                            "kept in the dead letter file and retried every poll"
+                )
+            }
+            store.add(letter.copy(message = "HTTP $status: $message", attempts = attempts, abandoned = abandoned))
+            return true
         }
     }
 }

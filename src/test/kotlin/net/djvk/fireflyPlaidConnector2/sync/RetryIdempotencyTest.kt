@@ -1,5 +1,6 @@
 package net.djvk.fireflyPlaidConnector2.sync
 
+import org.mockito.kotlin.doReturn
 import com.fasterxml.jackson.databind.ObjectMapper
 import kotlinx.coroutines.runBlocking
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.ObjectLink
@@ -136,7 +137,10 @@ internal class RetryIdempotencyTest {
     private val syncHelper: SyncHelper = mock()
     private val cursorManager: CursorManager = mock()
     private val plaidSyncService: PlaidSyncService = mock()
-    private val fireflyTransactionService: FireflyTransactionService = mock()
+    private val fireflyTransactionService: FireflyTransactionService = mock {
+        // 0 creates were dead-lettered (a bare mock returns null for the boxed Int)
+        onBlocking { processFireflyTransactionUpdates(org.mockito.kotlin.any(), org.mockito.kotlin.any(), org.mockito.kotlin.any()) } doReturn 0
+    }
     private val mockConverter: TransactionConverter = mock()
 
     private fun orchestrator() = PolledSyncOrchestrator(
