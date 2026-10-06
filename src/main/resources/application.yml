@@ -36,6 +36,12 @@ fireflyPlaidConnector2:
     # Configuration element specifying whether the remainder of the poll sync session should continue if one item
     # has failed to fetch from Plaid for any reason.
     allowItemToFail: false
+    # Optional. If set to an http(s) URL, the connector POSTs a JSON summary there after every poll iteration
+    #   (status success/error, timings, connector version, and counts of Plaid/Firefly creates, updates and deletes;
+    #   no transaction content). Delivery failures are logged and never affect syncing.
+    # resultCallbackUrl: https://monitor.example.com/connector-result
+    # Optional. If set, sent as "Authorization: Bearer <token>" on the callback. Prefer https when using this.
+    # resultCallbackBearerToken: change-me
   batch:
     # The number of days in the past to pull data for.
     maxSyncDays: 5

@@ -1,5 +1,6 @@
 package net.djvk.fireflyPlaidConnector2.sync
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -11,6 +12,7 @@ import org.springframework.beans.factory.DisposableBean
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty
 import org.springframework.stereotype.Component
+import java.time.Instant
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.time.Duration.Companion.minutes
 
@@ -34,6 +36,9 @@ class PolledSyncOrchestrator(
     private val plaidSyncService: PlaidSyncService,
     private val fireflyTransactionService: FireflyTransactionService,
     private val converter: TransactionConverter,
+
+    /** Null unless `fireflyPlaidConnector2.polled.resultCallbackUrl` is configured. */
+    private val webhookService: WebhookService? = null,
 ) : Runner, DisposableBean {
     private val logger = LoggerFactory.getLogger(this::class.java)
 
@@ -57,12 +62,14 @@ class PolledSyncOrchestrator(
 
     /**
      * Processes transactions by fetching from Plaid, converting, and updating Firefly.
+     *
+     * @return counts of what this iteration did, for the optional result callback
      */
     suspend fun processTransactions(
         accountMap: Map<PlaidAccountId, FireflyAccountId>,
         accountAccessTokenSequence: Sequence<Pair<PlaidAccessToken, List<PlaidAccountId>>>,
         cursorMap: MutableMap<PlaidAccessToken, PlaidSyncCursor>
-    ) {
+    ): PollResult {
         // Fetch existing Firefly transactions
         val existingFireflyTxs = fireflyTransactionService.fetchExistingFireflyTransactions()
 
@@ -96,6 +103,37 @@ class PolledSyncOrchestrator(
 
         // Update cursor map after successful processing
         cursorManager.writeCursorMap(cursorMap)
+
+        return PollResult(
+            existingFireflyTransactionsRead = existingFireflyTxs.size,
+            plaidCreated = plaidTransactions.created.size,
+            plaidUpdated = plaidTransactions.updated.size,
+            plaidDeleted = plaidTransactions.deleted.size,
+            fireflyCreated = convertResult.creates.size,
+            fireflyUpdated = convertResult.updates.size,
+            fireflyDeleted = convertResult.deletes.size,
+        )
+    }
+
+    /**
+     * Runs one poll iteration and reports its outcome to the optional result callback. A failure is reported to the
+     * callback and then rethrown, so the callback is notified before the exception leaves the loop.
+     */
+    suspend fun runIteration(
+        accountMap: Map<PlaidAccountId, FireflyAccountId>,
+        accountAccessTokenSequence: Sequence<Pair<PlaidAccessToken, List<PlaidAccountId>>>,
+        cursorMap: MutableMap<PlaidAccessToken, PlaidSyncCursor>
+    ) {
+        val iterationStart = Instant.now()
+        val pollResult = try {
+            processTransactions(accountMap, accountAccessTokenSequence, cursorMap)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            webhookService?.post(iterationStart, Instant.now(), null, e)
+            throw e
+        }
+        webhookService?.post(iterationStart, Instant.now(), pollResult)
     }
 
     override fun run() {
@@ -116,8 +154,7 @@ class PolledSyncOrchestrator(
                 do {
                     logger.debug("Polling loop start")
 
-                    // Process transactions
-                    processTransactions(accountMap, accountAccessTokenSequence, cursorMap)
+                    runIteration(accountMap, accountAccessTokenSequence, cursorMap)
 
                     // Trigger GC to try to reduce heap size
                     logger.trace("Calling System.gc()")
