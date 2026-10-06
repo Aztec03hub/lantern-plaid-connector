@@ -71,7 +71,7 @@ internal class NetworkResilienceTest {
     )
 
     @Test
-    fun wrapperRetriesTransientFailureThenSucceeds() = runBlocking {
+    fun wrapperRetriesTransientFailureThenSucceeds() = runBlocking<Unit> {
         var attempts = 0
         val result = wrapper(3).executeRequest({
             attempts++
@@ -83,7 +83,7 @@ internal class NetworkResilienceTest {
     }
 
     @Test
-    fun wrapperGivesUpAfterMaxRetriesKeepingTheCause() = runBlocking {
+    fun wrapperGivesUpAfterMaxRetriesKeepingTheCause() = runBlocking<Unit> {
         var attempts = 0
         val e = assertThrows<RuntimeException> {
             runBlocking {
@@ -100,7 +100,7 @@ internal class NetworkResilienceTest {
     }
 
     @Test
-    fun wrapperDoesNotSwallowCancellation() = runBlocking {
+    fun wrapperDoesNotSwallowCancellation() = runBlocking<Unit> {
         var attempts = 0
         assertThrows<CancellationException> {
             runBlocking {
@@ -118,7 +118,7 @@ internal class NetworkResilienceTest {
     // region PlaidSyncService
 
     @Test
-    fun allowItemToFailAlsoCoversNetworkFailures() = runBlocking {
+    fun allowItemToFailAlsoCoversNetworkFailures() = runBlocking<Unit> {
         // A wrapper that throws like the real one does once its retries are exhausted
         val wrapper: PlaidApiWrapper = mock()
         whenever(wrapper.executeRequest<Any>(any(), any(), any())).doSuspendableAnswer {
@@ -146,7 +146,7 @@ internal class NetworkResilienceTest {
     )
 
     @Test
-    fun cursorIsNotAdvancedWhenFireflyProcessingFails() = runBlocking {
+    fun cursorIsNotAdvancedWhenFireflyProcessingFails() = runBlocking<Unit> {
         val accountMap = mapOf("account1" to 1)
         val sequence = sequenceOf(Pair("token1", listOf("account1")))
         val committed = mutableMapOf("token1" to "cursor-old")
@@ -172,7 +172,7 @@ internal class NetworkResilienceTest {
     }
 
     @Test
-    fun cursorIsCommittedAfterSuccess() = runBlocking {
+    fun cursorIsCommittedAfterSuccess() = runBlocking<Unit> {
         val accountMap = mapOf("account1" to 1)
         val sequence = sequenceOf(Pair("token1", listOf("account1")))
         val committed = mutableMapOf("token1" to "cursor-old")
@@ -193,7 +193,7 @@ internal class NetworkResilienceTest {
     }
 
     @Test
-    fun retryWhileNetworkDownRetriesThenSucceeds() = runBlocking {
+    fun retryWhileNetworkDownRetriesThenSucceeds() = runBlocking<Unit> {
         var attempts = 0
         val result = orchestrator().retryWhileNetworkDown("test", 1.milliseconds) {
             attempts++
@@ -205,7 +205,7 @@ internal class NetworkResilienceTest {
     }
 
     @Test
-    fun retryWhileNetworkDownDoesNotRetryNonNetworkErrors() = runBlocking {
+    fun retryWhileNetworkDownDoesNotRetryNonNetworkErrors() = runBlocking<Unit> {
         var attempts = 0
         assertThrows<IllegalStateException> {
             runBlocking {
@@ -223,7 +223,7 @@ internal class NetworkResilienceTest {
     // region SyncHelper
 
     @Test
-    fun optimisticInsertFailsTheBatchOnTimeoutInsteadOfSilentlyDroppingIt() = runBlocking {
+    fun optimisticInsertFailsTheBatchOnTimeoutInsteadOfSilentlyDroppingIt() = runBlocking<Unit> {
         val firefly = FireflyMock()
         var calls = 0
         whenever(firefly.transactionsApi.storeTransaction(any())).doSuspendableAnswer {
