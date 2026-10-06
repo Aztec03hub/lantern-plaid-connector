@@ -3,12 +3,16 @@ package net.djvk.fireflyPlaidConnector2.sync
 import io.ktor.client.plugins.*
 import net.djvk.fireflyPlaidConnector2.api.plaid.PlaidApiWrapper
 import net.djvk.fireflyPlaidConnector2.api.plaid.PlaidTransactionId
+import net.djvk.fireflyPlaidConnector2.api.plaid.models.InvestmentTransaction
+import net.djvk.fireflyPlaidConnector2.api.plaid.models.InvestmentsTransactionsGetRequest
+import net.djvk.fireflyPlaidConnector2.api.plaid.models.InvestmentsTransactionsGetRequestOptions
 import net.djvk.fireflyPlaidConnector2.api.plaid.models.TransactionsSyncRequest
 import net.djvk.fireflyPlaidConnector2.api.plaid.models.TransactionsSyncRequestOptions
 import net.djvk.fireflyPlaidConnector2.api.plaid.models.TransactionsSyncResponse
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.stereotype.Component
+import java.time.LocalDate
 import net.djvk.fireflyPlaidConnector2.api.plaid.models.Transaction as PlaidTransaction
 
 /**
@@ -69,6 +73,35 @@ class PlaidSyncService(
                 return null
             } else throw cre
         }
+    }
+
+    /**
+     * Reads investment transactions (upstream issue #68) for [accountIds] of one Item between [startDate] and
+     * [endDate], following Plaid's offset pagination. Unlike /transactions/sync this has no cursor and no
+     * modified/removed events, so callers re-read a recent window and rely on de-duplication.
+     *
+     * Throws on failure, including when the Item was not linked with the investments product.
+     */
+    suspend fun fetchInvestmentTransactions(
+        accessToken: PlaidAccessToken,
+        accountIds: List<PlaidAccountId>,
+        startDate: LocalDate,
+        endDate: LocalDate,
+    ): List<InvestmentTransaction> {
+        val all = mutableListOf<InvestmentTransaction>()
+        do {
+            val request = InvestmentsTransactionsGetRequest(
+                accessToken, startDate, endDate,
+                options = InvestmentsTransactionsGetRequestOptions(accountIds, plaidBatchSize, all.size),
+            )
+            val response = plaidApiWrapper.executeRequest(
+                { plaidApi -> plaidApi.investmentsTransactionsGet(request) },
+                "investment transactions request"
+            ).body()
+            all.addAll(response.investmentTransactions)
+            // Stop on an empty page too, so a total that never converges can't loop forever
+        } while (response.investmentTransactions.isNotEmpty() && all.size < response.totalInvestmentTransactions)
+        return all
     }
 
     /**
