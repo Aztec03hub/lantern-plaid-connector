@@ -11,6 +11,7 @@ import org.springframework.beans.factory.DisposableBean
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty
 import org.springframework.stereotype.Component
+import java.time.Instant
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.time.Duration.Companion.minutes
 
@@ -34,11 +35,39 @@ class PolledSyncOrchestrator(
     private val plaidSyncService: PlaidSyncService,
     private val fireflyTransactionService: FireflyTransactionService,
     private val converter: TransactionConverter,
+
+    /**
+     * If greater than zero, ask Plaid to refresh each Item (/transactions/refresh) at most this often, before the
+     * poll that follows. 0 (the default) disables it. See [refreshItemsDue].
+     */
+    @Value("\${fireflyPlaidConnector2.polled.refreshIntervalMinutes:0}")
+    private val refreshIntervalMinutes: Long = 0,
 ) : Runner, DisposableBean {
     private val logger = LoggerFactory.getLogger(this::class.java)
 
     private val terminated = AtomicBoolean(false)
     private lateinit var mainJob: Job
+
+    /** When each Item (by access token) was last asked to refresh; in memory only, so every restart refreshes once. */
+    private val lastRefreshAt = mutableMapOf<PlaidAccessToken, Instant>()
+
+    /**
+     * Requests a Plaid refresh for every Item that hasn't been asked within [refreshIntervalMinutes]. The attempt
+     * time is recorded even if Plaid rejects the request, so a failing or unsupported Item is retried only on the
+     * interval rather than every poll (Plaid bills successful refreshes).
+     */
+    suspend fun refreshItemsDue(
+        accessTokens: Sequence<Pair<PlaidAccessToken, List<PlaidAccountId>>>,
+        now: Instant = Instant.now(),
+    ) {
+        if (refreshIntervalMinutes <= 0) return
+        for ((accessToken, _) in accessTokens) {
+            val last = lastRefreshAt[accessToken]
+            if (last != null && java.time.Duration.between(last, now).toMinutes() < refreshIntervalMinutes) continue
+            lastRefreshAt[accessToken] = now
+            plaidSyncService.refreshTransactions(accessToken)
+        }
+    }
 
     /**
      * Initializes cursors for access tokens that don't have one yet.
@@ -115,6 +144,9 @@ class PolledSyncOrchestrator(
                  */
                 do {
                     logger.debug("Polling loop start")
+
+                    // Optionally nudge Plaid to check for new data; it arrives on a later poll
+                    refreshItemsDue(accountAccessTokenSequence)
 
                     // Process transactions
                     processTransactions(accountMap, accountAccessTokenSequence, cursorMap)

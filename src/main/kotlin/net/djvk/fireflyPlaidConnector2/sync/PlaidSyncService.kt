@@ -1,8 +1,11 @@
 package net.djvk.fireflyPlaidConnector2.sync
 
 import io.ktor.client.plugins.*
+import kotlinx.coroutines.CancellationException
 import net.djvk.fireflyPlaidConnector2.api.plaid.PlaidApiWrapper
 import net.djvk.fireflyPlaidConnector2.api.plaid.PlaidTransactionId
+import net.djvk.fireflyPlaidConnector2.api.plaid.models.TransactionsRefreshRequest
+import net.djvk.fireflyPlaidConnector2.util.Utilities
 import net.djvk.fireflyPlaidConnector2.api.plaid.models.TransactionsSyncRequest
 import net.djvk.fireflyPlaidConnector2.api.plaid.models.TransactionsSyncRequestOptions
 import net.djvk.fireflyPlaidConnector2.api.plaid.models.TransactionsSyncResponse
@@ -68,6 +71,37 @@ class PlaidSyncService(
                 logger.warn("Querying transactions for access token $accessToken failed, allowing failure and continuing on to the next access token")
                 return null
             } else throw cre
+        }
+    }
+
+    /**
+     * Asks Plaid to check the institution for new transactions now (/transactions/refresh), instead of waiting for
+     * Plaid's own schedule, which for some institutions is infrequent (upstream issue #69).
+     *
+     * The call is asynchronous on Plaid's side: new data shows up on a later /transactions/sync, so the next poll
+     * picks it up. Plaid bills this endpoint per successful call.
+     *
+     * Never throws (except cancellation): a refresh is best effort and must not stop the sync. For example it fails
+     * with a 4xx if the Item was not set up with the Transactions Refresh capability.
+     *
+     * @return true if Plaid accepted the request
+     */
+    suspend fun refreshTransactions(accessToken: PlaidAccessToken): Boolean {
+        return try {
+            plaidApiWrapper.executeRequest(
+                { plaidApi -> plaidApi.transactionsRefresh(TransactionsRefreshRequest(accessToken)) },
+                "transactions refresh request"
+            )
+            logger.info("Requested transactions refresh for access token ${Utilities.redactAccessToken(accessToken)}")
+            true
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (e: Exception) {
+            logger.warn(
+                "Transactions refresh failed for access token ${Utilities.redactAccessToken(accessToken)}: " +
+                        "${e::class.simpleName}; continuing with the normal sync"
+            )
+            false
         }
     }
 
