@@ -53,7 +53,11 @@ fireflyPlaidConnector2:
     cursorFileDirectoryPath: persistence/
     # Configuration element specifying whether the remainder of the poll sync session should continue if one item
     # has failed to fetch from Plaid for any reason.
-    allowItemToFail: false
+    # Lantern default is true (upstream's is false): with several banks, one Item that needs re-login (for example
+    #   ITEM_LOGIN_REQUIRED) or one that Plaid errors on must not stop every other bank from syncing. The failed Item
+    #   keeps its cursor and is retried next poll; each failure is logged at ERROR (it is not reported to the result
+    #   callback). With false, a single failing Item fails the whole iteration and no Item's cursor advances.
+    allowItemToFail: true
     # Optional. If set to an http(s) URL, the connector POSTs a JSON summary there after every poll iteration
     #   (status success/error, timings, connector version, and counts of Plaid/Firefly creates, updates and deletes;
     #   no transaction content). Delivery failures are logged and never affect syncing.
