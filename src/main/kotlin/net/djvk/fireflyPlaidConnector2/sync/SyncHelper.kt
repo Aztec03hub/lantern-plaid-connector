@@ -7,6 +7,7 @@ import io.ktor.http.*
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.AboutApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.AccountsApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.FireflyTransactionId
+import net.djvk.fireflyPlaidConnector2.api.firefly.apis.SearchApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.TransactionsApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.FireflyApiError
 import net.djvk.fireflyPlaidConnector2.config.properties.AccountConfigs
@@ -31,6 +32,7 @@ class SyncHelper(
     private val fireflyAboutApi: AboutApi,
     private val fireflyTxApi: TransactionsApi,
     private val fireflyAccountsApi: AccountsApi,
+    private val fireflySearchApi: SearchApi? = null,
 ) {
     private val logger = LoggerFactory.getLogger(this::class.java)
 
@@ -40,6 +42,7 @@ class SyncHelper(
         fireflyTxApi.setAccessToken(fireflyAccessToken)
         fireflyAccountsApi.setAccessToken(fireflyAccessToken)
         fireflyAboutApi.setAccessToken(fireflyAccessToken)
+        fireflySearchApi?.setAccessToken(fireflyAccessToken)
         validateFireflyApiVersion()
     }
 

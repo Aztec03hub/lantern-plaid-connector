@@ -19,6 +19,7 @@ import org.mockito.kotlin.argumentCaptor
 import org.mockito.kotlin.eq
 import org.mockito.kotlin.isNull
 import org.mockito.kotlin.mock
+import org.mockito.kotlin.never
 import org.mockito.kotlin.verify
 import org.mockito.kotlin.whenever
 import java.util.stream.Stream
@@ -250,6 +251,7 @@ internal class PolledSyncOrchestratorTest {
         whenever(cursorManager.readCursorMap()).thenReturn(cursorMap)
         whenever(syncHelper.getAllPlaidAccessTokenAccountIdSets()).thenReturn(Pair(accountMap, accountAccessTokenSequence))
         whenever(fireflyTransactionService.fetchExistingFireflyTransactions()).thenReturn(existingFireflyTxs)
+        whenever(fireflyTransactionService.fetchMissingByPlaidId(any(), any(), any())).thenReturn(emptyList())
         whenever(plaidSyncService.processPlaidTransactions(eq(accountAccessTokenSequence), eq(cursorMap))).thenReturn(plaidTransactionResult)
         whenever(converter.convertPollSync(
             eq(accountMap),
@@ -273,8 +275,18 @@ internal class PolledSyncOrchestratorTest {
         orchestrator.processTransactions(accountMap, accountAccessTokenSequence, cursorMap)
 
         // Verify interactions
-        verify(fireflyTransactionService).fetchExistingFireflyTransactions()
         verify(plaidSyncService).processPlaidTransactions(eq(accountAccessTokenSequence), eq(cursorMap))
+        val plaidHadChanges = plaidTransactionResult.created.isNotEmpty() ||
+                plaidTransactionResult.updated.isNotEmpty() || plaidTransactionResult.deleted.isNotEmpty()
+        if (!plaidHadChanges) {
+            // A poll with nothing new must not touch Firefly at all, but must still commit the cursors
+            verify(fireflyTransactionService, never()).fetchExistingFireflyTransactions()
+            verify(converter, never()).convertPollSync(any(), any(), any(), any(), any())
+            verify(fireflyTransactionService, never()).processFireflyTransactionUpdates(any(), any(), any())
+            verify(cursorManager).writeCursorMap(eq(cursorMap))
+            return@runBlocking
+        }
+        verify(fireflyTransactionService).fetchExistingFireflyTransactions()
         verify(converter).convertPollSync(
             eq(accountMap),
             eq(plaidTransactionResult.created),
@@ -311,6 +323,7 @@ internal class PolledSyncOrchestratorTest {
         )
         runBlocking {
             whenever(fireflyTransactionService.fetchExistingFireflyTransactions()).thenReturn(emptyList())
+            whenever(fireflyTransactionService.fetchMissingByPlaidId(any(), any(), any())).thenReturn(emptyList())
             whenever(plaidSyncService.processPlaidTransactions(eq(sequence), eq(cursorMap))).thenReturn(plaidResult)
             whenever(converter.convertPollSync(any(), any(), any(), any(), any())).thenReturn(convertResult)
         }

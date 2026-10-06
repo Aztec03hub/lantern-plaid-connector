@@ -234,7 +234,10 @@ class BatchSyncRunner(
                                  */
                                 type = if (initialBalance < 0) TransactionTypeProperty.withdrawal else TransactionTypeProperty.deposit,
                                 date = earliestTimestamp.minusHours(1),
-                                amount = (initialBalance.absoluteValue).toString(),
+                                // Sums of doubles carry binary noise (0.30000000000000004), so round to cents, and
+                                //  avoid scientific notation, which Firefly rejects
+                                amount = java.math.BigDecimal.valueOf(initialBalance.absoluteValue)
+                                    .setScale(2, java.math.RoundingMode.HALF_UP).toPlainString(),
                                 description = "Plaid Connector Initial Balance",
                                 sourceName = "Initial Balance",
                                 sourceId = if (initialBalance < 0) fireflyAccountId.toString() else null,

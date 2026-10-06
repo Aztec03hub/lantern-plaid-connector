@@ -72,9 +72,6 @@ class PolledSyncOrchestrator(
         accountAccessTokenSequence: Sequence<Pair<PlaidAccessToken, List<PlaidAccountId>>>,
         cursorMap: MutableMap<PlaidAccessToken, PlaidSyncCursor>
     ): PollResult {
-        // Fetch existing Firefly transactions
-        val existingFireflyTxs = fireflyTransactionService.fetchExistingFireflyTransactions()
-
         // Advance a working copy of the cursors. The real map is only updated after Firefly has accepted the
         //  changes, so a failure part way through (network down, Firefly error) never skips Plaid data: the next
         //  iteration re-reads from the last committed cursors.
@@ -83,6 +80,25 @@ class PolledSyncOrchestrator(
             accountAccessTokenSequence,
             workingCursors
         )
+
+        // Most polls find nothing new. Don't page through Firefly every interval just to do nothing with it.
+        if (plaidTransactions.created.isEmpty() && plaidTransactions.updated.isEmpty() &&
+            plaidTransactions.deleted.isEmpty()
+        ) {
+            logger.debug("No Plaid changes; skipping Firefly")
+            cursorMap.putAll(workingCursors)
+            cursorManager.writeCursorMap(cursorMap)
+            return PollResult()
+        }
+
+        // Fetch existing Firefly transactions in the pull window, plus any older ones that Plaid's updates, removals
+        //  and pending-to-posted links refer to (which the window would otherwise miss)
+        val windowFireflyTxs = fireflyTransactionService.fetchExistingFireflyTransactions()
+        val referencedPlaidIds = plaidTransactions.updated.map { it.transactionId } +
+                plaidTransactions.deleted +
+                plaidTransactions.created.mapNotNull { it.pendingTransactionId }
+        val existingFireflyTxs = windowFireflyTxs +
+                fireflyTransactionService.fetchMissingByPlaidId(referencedPlaidIds, windowFireflyTxs)
 
         // Convert Plaid transactions to Firefly format
         logger.trace("Converting Plaid transactions to Firefly transactions")
