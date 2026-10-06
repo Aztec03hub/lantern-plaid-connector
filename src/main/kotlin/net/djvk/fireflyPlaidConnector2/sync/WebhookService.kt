@@ -35,12 +35,35 @@ data class PollResult(
     val fireflyCreated: Int = 0,
     val fireflyUpdated: Int = 0,
     val fireflyDeleted: Int = 0,
+    /** Items (bank logins) that failed this poll and were skipped; empty on a clean poll. See [FailedItemReport]. */
+    val failedItems: List<FailedItemReport> = listOf(),
+    /** Firefly writes that were permanently rejected and are waiting in the dead letter file, retried every poll. */
+    val deadLetters: Int = 0,
+    /** Investment Items that failed this poll. */
+    val investmentFailures: Int = 0,
+) {
+    /** True when the poll ran but something needs attention: a bank is failing, a write is dead-lettered. */
+    @get:com.fasterxml.jackson.annotation.JsonIgnore
+    val partial: Boolean get() = failedItems.isNotEmpty() || deadLetters > 0 || investmentFailures > 0
+}
+
+/**
+ * One failing Item in the callback. No secrets: [accessToken] is the masked token, [errorCode] Plaid's error_code
+ * (for example ITEM_LOGIN_REQUIRED) or an exception class, [lastSuccessfulSync] the ISO time of the Item's last good
+ * poll (null if it has never synced under this connector).
+ */
+data class FailedItemReport(
+    val institution: String,
+    val accessToken: String,
+    val errorCode: String,
+    val lastSuccessfulSync: String? = null,
 )
 
 /**
  * The JSON body POSTed to the result callback after every polled sync iteration.
  *
- * [status] is "success" or "error". On "error", [errorType] holds the simple class name of the exception that ended
+ * [status] is "success", "partial" (the poll ran, but a bank failed or a write is dead-lettered: see
+ * [PollResult.failedItems]) or "error". On "error", [errorType] holds the simple class name of the exception that ended
  * the iteration (never its message, which can contain user data) and the details are in the connector's logs.
  */
 data class WebhookPayload(
@@ -127,7 +150,11 @@ class WebhookService(
      */
     suspend fun post(startedAt: Instant, completedAt: Instant, result: PollResult?, failure: Throwable? = null) {
         val payload = WebhookPayload(
-            status = if (failure == null) "success" else "error",
+            status = when {
+                failure != null -> "error"
+                result?.partial == true -> "partial"
+                else -> "success"
+            },
             startedAt = startedAt.toString(),
             completedAt = completedAt.toString(),
             durationSeconds = Duration.between(startedAt, completedAt).toMillis() / 1000.0,

@@ -1,5 +1,7 @@
 package net.djvk.fireflyPlaidConnector2.sync
 
+import io.ktor.client.plugins.ClientRequestException
+import io.ktor.client.statement.bodyAsText
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.SearchApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.TransactionsApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionRead
@@ -28,19 +30,30 @@ class FireflyTransactionService(
     timeZoneString: String = "UTC",
 
     /** Used to look up Firefly transactions that are older than the pull window; see [fetchMissingByPlaidId]. */
-    private val fireflySearchApi: SearchApi? = null,
+    private val fireflySearchApi: SearchApi,
+
+    /** Where Firefly writes that were permanently rejected are kept; null means a rejected write fails the iteration. */
+    private val deadLetters: DeadLetterStore? = null,
 ) {
     private val logger = LoggerFactory.getLogger(this::class.java)
     private val fireflyPageCountMax = 20
     private val zoneId = ZoneId.of(timeZoneString)
 
     /**
-     * Fetches all Firefly transactions within the configured window.
+     * Fetches all Firefly transactions within the configured window, or between [start] and [end] (inclusive) when
+     * given. [maxPages] is a failsafe: exceeding it is an error rather than a silently truncated list.
      */
-    suspend fun fetchExistingFireflyTransactions(): List<TransactionRead> {
+    suspend fun fetchExistingFireflyTransactions(): List<TransactionRead> =
+        fetchFireflyTransactionsBetween(windowStart(), LocalDate.now(zoneId), fireflyPageCountMax)
+
+    suspend fun fetchFireflyTransactionsBetween(
+        start: LocalDate,
+        end: LocalDate,
+        maxPages: Int,
+    ): List<TransactionRead> {
         val existingFireflyTxs = mutableListOf<TransactionRead>()
-        val today = LocalDate.now(zoneId)
-        val transferWindowStart = today.minusDays(existingFireflyPullWindowDays.toLong())
+        val today = end
+        val transferWindowStart = start
 
         // Firefly pages are 1-based; starting at 0 fetched page 1 twice
         var fireflyTxPage = 1
@@ -67,12 +80,12 @@ class FireflyTransactionService(
             existingFireflyTxs.addAll(filteredTxs)
             lastPageHadMore = pagination != null && pagination.currentPage < pagination.totalPages
             // The page cap is a failsafe against an infinite loop
-        } while (lastPageHadMore && fireflyTxPage <= fireflyPageCountMax)
+        } while (lastPageHadMore && fireflyTxPage <= maxPages)
 
         // Only an error if there really were more pages we refused to read (not merely when the last allowed page
         //  was also the last page)
         if (lastPageHadMore) {
-            throw RuntimeException("Exceeded Firefly failsafe max page count $fireflyPageCountMax")
+            throw RuntimeException("Exceeded Firefly failsafe max page count $maxPages")
         }
 
         return existingFireflyTxs
@@ -96,7 +109,7 @@ class FireflyTransactionService(
         plaidTransactionIds: Collection<String>,
         alreadyFetched: List<TransactionRead>,
     ): List<TransactionRead> {
-        val searchApi = fireflySearchApi ?: return listOf()
+        val searchApi = fireflySearchApi
         val known = FireflyTransactionExternalIdIndexer(alreadyFetched)
         val missing = plaidTransactionIds.distinct().filter { known.findExistingFireflyTx(it) == null }
         if (missing.isEmpty()) return listOf()
@@ -104,8 +117,12 @@ class FireflyTransactionService(
         val found = mutableListOf<TransactionRead>()
         for (plaidId in missing) {
             val externalId = FireflyTransactionExternalIdIndexer.getExternalId(plaidId)
+            // A transfer built from two Plaid transactions has one leg's id as its external id and the other's as
+            //  its internal reference, so a miss on the first is followed by the second.
             val match = searchApi.searchTransactions("external_id_is:\"$externalId\"", 1).body().data
                 .firstOrNull { read -> read.attributes.transactions.any { it.externalId == externalId } }
+                ?: searchApi.searchTransactions("internal_reference_is:\"$externalId\"", 1).body().data
+                    .firstOrNull { read -> read.attributes.transactions.any { it.internalReference == externalId } }
             if (match != null) found.add(match)
         }
         logger.debug("Found {} of {} out-of-window Firefly transactions by external id", found.size, missing.size)
@@ -114,6 +131,10 @@ class FireflyTransactionService(
 
     /**
      * Processes transaction updates in Firefly.
+     *
+     * Each write goes through [guarded]: a write Firefly permanently rejects for one transaction is kept in the dead
+     * letter file and the rest carry on, so one bad transaction can't stall every bank. Anything else (network, 5xx,
+     * authentication, rate limit) still fails the iteration, which is then retried as a whole.
      */
     suspend fun processFireflyTransactionUpdates(
         creates: List<FireflyTransactionDto>,
@@ -121,13 +142,68 @@ class FireflyTransactionService(
         deletes: List<String>
     ) {
         // Insert new transactions
-        syncHelper.optimisticInsertBatchIntoFirefly(creates)
-        
+        for (create in creates) {
+            guarded(DeadLetter("create", create.tx.externalId ?: "", null, create.tx, false)) {
+                syncHelper.optimisticInsertBatchIntoFirefly(listOf(create))
+            }
+        }
+
         // Process updates. This includes converting an existing deposit/withdrawal into a transfer, which is an in-place
         //  update with type=transfer (Firefly 6.7.7 accepts that), so every Firefly write here is safe to repeat.
-        syncHelper.updateBatchInFirefly(updates)
+        for (update in updates) {
+            guarded(DeadLetter("update", update.transactionId, update.id, update.tx, update.changesType)) {
+                syncHelper.updateBatchInFirefly(listOf(update))
+            }
+        }
 
         // Process deletes
-        syncHelper.deleteBatchInFirefly(deletes)
+        for (id in deletes) {
+            guarded(DeadLetter("delete", id, id)) { syncHelper.deleteBatchInFirefly(listOf(id)) }
+        }
+    }
+
+    /**
+     * Retries the writes Firefly rejected in earlier polls. The ones that go through are removed from the dead letter
+     * file; the ones that are still rejected stay (with Firefly's latest message). A create whose external id is
+     * already in Firefly is dropped rather than inserted again.
+     */
+    suspend fun retryDeadLetters() {
+        val store = deadLetters ?: return
+        for (letter in store.read()) {
+            if (letter.operation == "create" && letter.key.startsWith(FireflyTransactionExternalIdIndexer.EXTERNAL_ID_PREFIX) &&
+                fetchMissingByPlaidId(listOf(letter.key.removePrefix(FireflyTransactionExternalIdIndexer.EXTERNAL_ID_PREFIX)), listOf()).isNotEmpty()
+            ) {
+                store.remove(letter.operation, letter.key)
+                continue
+            }
+            guarded(letter) {
+                val split = letter.split
+                when (letter.operation) {
+                    "create" -> syncHelper.optimisticInsertBatchIntoFirefly(listOf(FireflyTransactionDto(null, split!!)))
+                    "update" -> syncHelper.updateBatchInFirefly(listOf(FireflyTransactionDto(letter.fireflyId, split!!, letter.changesType)))
+                    "delete" -> syncHelper.deleteBatchInFirefly(listOf(letter.fireflyId!!))
+                }
+            }
+        }
+    }
+
+    /** Runs [write] for [letter]'s transaction; see [processFireflyTransactionUpdates] for what is and isn't dead-lettered. */
+    private suspend fun guarded(letter: DeadLetter, write: suspend () -> Unit) {
+        val store = deadLetters
+        try {
+            write()
+            store?.remove(letter.operation, letter.key)
+        } catch (cre: ClientRequestException) {
+            val status = cre.response.status.value
+            // 401/403 mean the Firefly credentials are wrong for every transaction; 408/429 are transient
+            if (store == null || status !in 400..499 || status in setOf(401, 403, 408, 429)) throw cre
+            val message = runCatching { cre.response.bodyAsText() }.getOrDefault("")
+                .let { Regex("\"message\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"").find(it)?.groupValues?.get(1) } ?: "HTTP $status"
+            logger.error(
+                "Firefly permanently rejected ${letter.operation} of ${letter.key} (HTTP $status: $message); " +
+                        "kept in the dead letter file and retried every poll"
+            )
+            store.add(letter.copy(message = "HTTP $status: $message"))
+        }
     }
 }

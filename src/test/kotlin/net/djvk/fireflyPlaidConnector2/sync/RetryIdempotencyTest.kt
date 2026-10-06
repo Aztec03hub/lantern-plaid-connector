@@ -154,14 +154,44 @@ internal class RetryIdempotencyTest {
         whenever(fireflyTransactionService.fetchExistingFireflyTransactions()).thenReturn(emptyList())
         whenever(fireflyTransactionService.windowStart()).thenReturn(LocalDate.now().minusDays(5))
         whenever(fireflyTransactionService.fetchMissingByPlaidId(any(), any())).thenReturn(emptyList())
+        whenever(fireflyTransactionService.fetchFireflyTransactionsBetween(any(), any(), any())).thenReturn(emptyList())
         whenever(mockConverter.convertPollSync(any(), any(), any(), any(), any()))
             .thenReturn(TransactionConverter.ConvertPollSyncResult(listOf(), listOf(), listOf()))
 
         orchestrator().processTransactions(mapOf(accountA to 1), sequence, cursorMap)
 
+        // L4-R2: the old create is covered by ONE dated range read ending the day before the window, not a search per id
+        val start = argumentCaptor<LocalDate>()
+        val end = argumentCaptor<LocalDate>()
+        verify(fireflyTransactionService, times(1)).fetchFireflyTransactionsBetween(start.capture(), end.capture(), any())
+        assertThat(start.firstValue).isEqualTo(LocalDate.now().minusDays(401))
+        assertThat(end.firstValue).isEqualTo(LocalDate.now().minusDays(6))
         val ids = argumentCaptor<Collection<String>>()
         verify(fireflyTransactionService).fetchMissingByPlaidId(ids.capture(), any())
-        assertThat(ids.firstValue).containsExactly("old")
+        assertThat(ids.firstValue).isEmpty()
+    }
+
+    /** R4 survivor: only the authorized date is before the window, and that is the date Firefly will carry. */
+    @Test
+    fun aCreateWhoseAuthorizedDateIsBeforeTheWindowIsReadByRangeToo() = runBlocking<Unit> {
+        val sequence = sequenceOf(Pair("tok", listOf(accountA)))
+        val cursorMap = mutableMapOf<String, String>()
+        val create = PlaidFixtures.getPaymentTransaction(
+            accountId = accountA, transactionId = "auth", pendingTransactionId = null,
+            date = LocalDate.now(), authorizedDate = LocalDate.now().minusDays(20),
+        )
+        whenever(plaidSyncService.processPlaidTransactions(eq(sequence), eq(cursorMap)))
+            .thenReturn(PlaidTransactionResult(listOf(create), listOf(), listOf()))
+        whenever(fireflyTransactionService.fetchExistingFireflyTransactions()).thenReturn(emptyList())
+        whenever(fireflyTransactionService.windowStart()).thenReturn(LocalDate.now().minusDays(5))
+        whenever(fireflyTransactionService.fetchMissingByPlaidId(any(), any())).thenReturn(emptyList())
+        whenever(fireflyTransactionService.fetchFireflyTransactionsBetween(any(), any(), any())).thenReturn(emptyList())
+        whenever(mockConverter.convertPollSync(any(), any(), any(), any(), any()))
+            .thenReturn(TransactionConverter.ConvertPollSyncResult(listOf(), listOf(), listOf()))
+
+        orchestrator().processTransactions(mapOf(accountA to 1), sequence, cursorMap)
+
+        verify(fireflyTransactionService).fetchFireflyTransactionsBetween(eq(LocalDate.now().minusDays(21)), any(), any())
     }
 
     // endregion
@@ -187,7 +217,10 @@ internal class RetryIdempotencyTest {
 
         val e = runCatching { orchestrator.runIteration(mapOf(accountA to 1), sequence, cursorMap) }.exceptionOrNull()
         assertThat(e).isInstanceOf(IllegalStateException::class.java)
-        verify(webhook).post(any(), any(), org.mockito.kotlin.isNull(), any())
+        // L3-R2: the bank sync worked, so its counts are reported alongside the investment failure
+        val reported = argumentCaptor<PollResult>()
+        verify(webhook).post(any(), any(), reported.capture(), any())
+        assertThat(reported.firstValue.investmentFailures).isEqualTo(1)
 
         // and the poll loop's iteration swallows it instead of ending the process
         orchestrator.pollOnce(mapOf(accountA to 1), sequence, cursorMap)

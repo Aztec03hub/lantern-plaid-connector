@@ -64,6 +64,12 @@ class PolledSyncOrchestrator(
     /** How many days back each poll re-reads investment transactions (Plaid has no change feed for them). */
     @Value("\${fireflyPlaidConnector2.polled.investmentLookbackDays:14}")
     private val investmentLookbackDays: Long = 14,
+
+    /** Each Item's last successful sync, for Lantern to read; null (tests) means it isn't kept. */
+    private val itemStatusStore: ItemStatusStore? = null,
+
+    /** Counts the writes Firefly permanently rejected, for the result callback; null (tests) means none are kept. */
+    private val deadLetterStore: DeadLetterStore? = null,
 ) : Runner, DisposableBean {
     private val logger = LoggerFactory.getLogger(this::class.java)
 
@@ -154,7 +160,7 @@ class PolledSyncOrchestrator(
         // Every Item gets its turn, but a failure is not silent: it fails the iteration, so it is reported through the
         //  result callback and logged by the poll loop (an outage longer than the lookback loses transactions).
         if (failedItems.isNotEmpty()) {
-            throw IllegalStateException("Investment sync failed for ${failedItems.size} Item(s): $failedItems")
+            throw InvestmentSyncException(failedItems)
         }
     }
 
@@ -186,6 +192,33 @@ class PolledSyncOrchestrator(
     }
 
     /**
+     * Stamps each Item's outcome in the item status file and builds the callback's failure report.
+     *
+     * @param accessTokens every Item polled
+     * @param failed the Items that failed (a subset of [accessTokens]); a failed Item's cursor did not move
+     */
+    private suspend fun recordItemOutcomes(
+        accessTokens: List<PlaidAccessToken>,
+        failed: List<ItemFailure>,
+    ): List<FailedItemReport> {
+        val store = itemStatusStore
+            ?: return failed.map { FailedItemReport(it.institution, it.accessTokenRedacted, it.errorCode) }
+        val failedRedacted = failed.map { it.accessTokenRedacted }.toSet()
+        val succeeded = accessTokens
+            .filter { Utilities.redactAccessToken(it) !in failedRedacted }
+            .map { store.ref(it, plaidSyncService.describeInstitution(it)) }
+        val failedRefs = failed.mapNotNull { f ->
+            accessTokens.firstOrNull { Utilities.redactAccessToken(it) == f.accessTokenRedacted }
+                ?.let { store.ref(it, f.institution) to f.errorCode }
+        }
+        val lastSuccess = store.record(Instant.now(), succeeded, failedRefs)
+        return failed.map { f ->
+            val ref = failedRefs.firstOrNull { it.first.redactedToken == f.accessTokenRedacted }?.first
+            FailedItemReport(f.institution, f.accessTokenRedacted, f.errorCode, ref?.let { lastSuccess[it.id] })
+        }
+    }
+
+    /**
      * Processes transactions by fetching from Plaid, converting, and updating Firefly.
      *
      * @return counts of what this iteration did, for the optional result callback
@@ -195,6 +228,10 @@ class PolledSyncOrchestrator(
         accountAccessTokenSequence: Sequence<Pair<PlaidAccessToken, List<PlaidAccountId>>>,
         cursorMap: MutableMap<PlaidAccessToken, PlaidSyncCursor>
     ): PollResult {
+        // Writes Firefly rejected in earlier polls are retried first, so a newer write for the same transaction
+        //  (below) always lands after the stale one
+        fireflyTransactionService.retryDeadLetters()
+
         // Advance a working copy of the cursors. The real map is only updated after Firefly has accepted the
         //  changes, so a failure part way through (network down, Firefly error) never skips Plaid data: the next
         //  iteration re-reads from the last committed cursors.
@@ -203,6 +240,7 @@ class PolledSyncOrchestrator(
             accountAccessTokenSequence,
             workingCursors
         )
+        val accessTokens = accountAccessTokenSequence.map { it.first }.toList()
 
         // Most polls find nothing new. Don't page through Firefly every interval just to do nothing with it.
         if (plaidTransactions.created.isEmpty() && plaidTransactions.updated.isEmpty() &&
@@ -210,7 +248,10 @@ class PolledSyncOrchestrator(
         ) {
             logger.debug("No Plaid changes; skipping Firefly")
             commitCursors(cursorMap, workingCursors)
-            return PollResult()
+            return PollResult(
+                failedItems = recordItemOutcomes(accessTokens, plaidTransactions.failedItems),
+                deadLetters = deadLetterStore?.read()?.size ?: 0,
+            )
         }
 
         // Fetch existing Firefly transactions in the pull window, plus any older ones that Plaid's updates, removals
@@ -218,16 +259,23 @@ class PolledSyncOrchestrator(
         val windowFireflyTxs = fireflyTransactionService.fetchExistingFireflyTransactions()
         //  Creates dated before the window are looked up too: an iteration that failed part way is retried with the
         //  same creates, and without this the only protection against inserting them twice is Firefly's content hash,
-        //  which changes with the import tag and with Plaid edits.
+        //  which changes with the import tag and with Plaid edits. They are read as one dated range (a first import
+        //  has thousands, and one search request each was measured at ~50 ms apiece); the few updates, removals and
+        //  pending links older than the window are still looked up one by one.
         val windowStart = fireflyTransactionService.windowStart()
+        val oldCreateDates = plaidTransactions.created
+            .map { minOf(it.date, it.authorizedDate ?: it.date) }
+            .filter { it < windowStart }
+        val oldFireflyTxs = if (oldCreateDates.isEmpty()) listOf() else
+            fireflyTransactionService.fetchFireflyTransactionsBetween(
+                oldCreateDates.min().minusDays(1), windowStart.minusDays(1), maxHistoryPages,
+            )
         val referencedPlaidIds = plaidTransactions.updated.map { it.transactionId } +
                 plaidTransactions.deleted +
-                plaidTransactions.created.mapNotNull { it.pendingTransactionId } +
-                plaidTransactions.created
-                    .filter { minOf(it.date, it.authorizedDate ?: it.date) < windowStart }
-                    .map { it.transactionId }
-        val existingFireflyTxs = windowFireflyTxs +
-                fireflyTransactionService.fetchMissingByPlaidId(referencedPlaidIds, windowFireflyTxs)
+                plaidTransactions.created.mapNotNull { it.pendingTransactionId }
+        val knownFireflyTxs = windowFireflyTxs + oldFireflyTxs
+        val existingFireflyTxs = knownFireflyTxs +
+                fireflyTransactionService.fetchMissingByPlaidId(referencedPlaidIds, knownFireflyTxs)
 
         // Convert Plaid transactions to Firefly format
         logger.trace("Converting Plaid transactions to Firefly transactions")
@@ -262,12 +310,18 @@ class PolledSyncOrchestrator(
             fireflyCreated = convertResult.creates.size,
             fireflyUpdated = convertResult.updates.size,
             fireflyDeleted = convertResult.deletes.size,
+            failedItems = recordItemOutcomes(accessTokens, plaidTransactions.failedItems),
+            deadLetters = deadLetterStore?.read()?.size ?: 0,
         )
     }
 
     /**
      * Runs one poll iteration and reports its outcome to the optional result callback. A failure is reported to the
      * callback and then rethrown, so the callback is notified before the exception leaves the loop.
+     *
+     * Banks and investments are independent: each is tried even if the other fails, so a bank outage doesn't starve
+     * investment syncing (which only looks back [investmentLookbackDays]) and a failing investment Item doesn't hide
+     * a bank sync that worked. One callback carries both outcomes, then the first failure is rethrown.
      */
     suspend fun runIteration(
         accountMap: Map<PlaidAccountId, FireflyAccountId>,
@@ -275,18 +329,34 @@ class PolledSyncOrchestrator(
         cursorMap: MutableMap<PlaidAccessToken, PlaidSyncCursor>
     ) {
         val iterationStart = Instant.now()
-        val pollResult = try {
-            processTransactions(accountMap, accountAccessTokenSequence, cursorMap)
-                // Accounts marked investment: true. Inside this try so a failure is reported to the callback and,
-                //  like any other, caught by the poll loop (see [pollOnce]) instead of ending the process.
-                .also { syncInvestments(accountMap) }
+        var bankResult: PollResult? = null
+        var bankFailure: Exception? = null
+        try {
+            bankResult = processTransactions(accountMap, accountAccessTokenSequence, cursorMap)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            webhookService?.post(iterationStart, Instant.now(), null, e)
-            throw e
+            bankFailure = e
         }
-        webhookService?.post(iterationStart, Instant.now(), pollResult)
+        // Accounts marked investment: true. Its failure is reported to the callback and, like any other, caught by the
+        //  poll loop (see [pollOnce]) instead of ending the process.
+        var investmentFailure: Exception? = null
+        try {
+            syncInvestments(accountMap)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            investmentFailure = e
+        }
+
+        val failure = bankFailure ?: investmentFailure
+        if (bankFailure != null && investmentFailure != null) bankFailure.addSuppressed(investmentFailure)
+        val reported = bankResult?.let {
+            if (investmentFailure == null) it
+            else it.copy(investmentFailures = (investmentFailure as? InvestmentSyncException)?.failedItems ?: 1)
+        }
+        webhookService?.post(iterationStart, Instant.now(), reported, failure)
+        if (failure != null) throw failure
     }
 
     /**
@@ -383,3 +453,12 @@ class PolledSyncOrchestrator(
         mainJob.cancel()
     }
 }
+
+/** Investment sync failed for the Items in [failedItemNames] (redacted tokens), after every Item had its turn. */
+class InvestmentSyncException(val failedItemNames: List<String>) :
+    IllegalStateException("Investment sync failed for ${failedItemNames.size} Item(s): $failedItemNames") {
+    val failedItems: Int get() = failedItemNames.size
+}
+
+/** A history import has thousands of transactions; this caps reading the Firefly range they fall in (50 per page). */
+private const val maxHistoryPages = 1000

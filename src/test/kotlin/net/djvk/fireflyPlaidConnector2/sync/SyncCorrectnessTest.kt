@@ -66,7 +66,7 @@ internal class SyncCorrectnessTest {
                 page(totalPages, it.getArgument<Int>(0))
             }
         }
-        return FireflyTransactionService(txApi, mock(), 5)
+        return FireflyTransactionService(txApi, mock(), 5, "UTC", mock())
     }
 
     @Test
@@ -139,7 +139,8 @@ internal class SyncCorrectnessTest {
 
         service.fetchMissingByPlaidId((1..250).map { "id$it" }, listOf())
 
-        verify(searchApi, times(250)).searchTransactions(any(), any())
+        // each miss is searched by external id, then by the transfer's internal reference (H1-R2)
+        verify(searchApi, times(500)).searchTransactions(any(), any())
     }
 
     @Test
@@ -148,13 +149,6 @@ internal class SyncCorrectnessTest {
         whenever(searchApi.searchTransactions(any(), any())).thenReturn(wrongResult)
 
         assertThat(service.fetchMissingByPlaidId(listOf("old1"), listOf())).isEmpty()
-    }
-
-    @Test
-    fun noSearchApiMeansNoLookups() = runBlocking<Unit> {
-        val noSearch = FireflyTransactionService(txApi, mock(), 5)
-
-        assertThat(noSearch.fetchMissingByPlaidId(listOf("old1"), listOf())).isEmpty()
     }
 
     // endregion

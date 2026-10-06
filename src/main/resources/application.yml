@@ -55,11 +55,13 @@ fireflyPlaidConnector2:
     # has failed to fetch from Plaid for any reason.
     # Lantern default is true (upstream's is false): with several banks, one Item that needs re-login (for example
     #   ITEM_LOGIN_REQUIRED) or one that Plaid errors on must not stop every other bank from syncing. The failed Item
-    #   keeps its cursor and is retried next poll; each failure is logged at ERROR (it is not reported to the result
-    #   callback). With false, a single failing Item fails the whole iteration and no Item's cursor advances.
+    #   keeps its cursor (anything it returned this poll is discarded) and is retried next poll. A failure is never
+    #   silent: it is logged at ERROR naming the institution and Plaid's error code, the result callback gets status
+    #   "partial" with the Item in `failedItems`, and `item_status.json` next to the cursor file keeps each Item's
+    #   last successful sync time. With false, a single failing Item fails the whole iteration and no Item's cursor advances.
     allowItemToFail: true
     # Optional. If set to an http(s) URL, the connector POSTs a JSON summary there after every poll iteration
-    #   (status success/error, timings, connector version, and counts of Plaid/Firefly creates, updates and deletes;
+    #   (status success/partial/error, timings, connector version, and counts of Plaid/Firefly creates, updates and deletes;
     #   no transaction content). Delivery failures are logged and never affect syncing.
     # resultCallbackUrl: https://monitor.example.com/connector-result
     # Optional. If set, sent as "Authorization: Bearer <token>" on the callback. Prefer https when using this.
@@ -201,6 +203,10 @@ fireflyPlaidConnector2:
       #   Later corrections of an already imported investment transaction are not propagated.
       # Defaults to false.
 #      investment: false
+      # Optional. A label for the bank this account is at, for example "Chase". It is only used to name the institution
+      #   in the log line and the failure report (callback `failedItems`) when this Item's sync fails. The same Item
+      #   may be listed on several accounts; the first one with a name wins.
+#      institutionName: Chase
   product:
     name: Firefly Plaid Connector 2
 logging:

@@ -3,6 +3,7 @@ package net.djvk.fireflyPlaidConnector2.sync
 import io.ktor.client.plugins.ClientRequestException
 import io.ktor.client.statement.bodyAsText
 import kotlinx.coroutines.CancellationException
+import net.djvk.fireflyPlaidConnector2.config.properties.AccountConfigs
 import net.djvk.fireflyPlaidConnector2.util.Utilities.redactAccessToken
 import net.djvk.fireflyPlaidConnector2.api.plaid.PlaidApiWrapper
 import net.djvk.fireflyPlaidConnector2.api.plaid.PlaidTransactionId
@@ -32,6 +33,9 @@ class PlaidSyncService(
 
     @Value("\${fireflyPlaidConnector2.polled.allowItemToFail:false}")
     private val allowItemToFail: Boolean,
+
+    /** Only used to put an institution name on a failure report (see [ItemFailure]). */
+    private val accountConfigs: AccountConfigs = AccountConfigs(listOf()),
 ) {
     private val logger = LoggerFactory.getLogger(this::class.java)
 
@@ -63,7 +67,9 @@ class PlaidSyncService(
     suspend fun executeTransactionSyncRequest(
         accessToken: PlaidAccessToken,
         cursor: PlaidSyncCursor?,
-        batchSize: Int = plaidBatchSize
+        batchSize: Int = plaidBatchSize,
+        /** Called with the failure when [allowItemToFail] swallows it, so the caller can report the Item. */
+        onFailure: (Exception) -> Unit = {},
     ): TransactionsSyncResponse? {
         val request = getTransactionSyncRequest(accessToken, cursor, batchSize)
         try {
@@ -78,9 +84,9 @@ class PlaidSyncService(
             if (runCatching { cre.response.bodyAsText() }.getOrDefault("").contains(MUTATION_DURING_PAGINATION)) {
                 throw SyncMutationDuringPaginationException(cre)
             }
-            return handleSyncFailure(accessToken, cre)
+            return handleSyncFailure(accessToken, cre, onFailure)
         } catch (e: Exception) {
-            return handleSyncFailure(accessToken, e)
+            return handleSyncFailure(accessToken, e, onFailure)
         }
     }
 
@@ -88,13 +94,42 @@ class PlaidSyncService(
      * Network failures surface as RuntimeException (after the wrapper's retries) as well as ClientRequestException;
      * allowItemToFail applies to all of them.
      */
-    private fun handleSyncFailure(accessToken: PlaidAccessToken, e: Exception): TransactionsSyncResponse? {
-        logger.error("Error requesting Plaid transactions for ${redactAccessToken(accessToken)}: ${e::class.simpleName}")
+    private suspend fun handleSyncFailure(
+        accessToken: PlaidAccessToken,
+        e: Exception,
+        onFailure: (Exception) -> Unit,
+    ): TransactionsSyncResponse? {
+        val errorCode = plaidErrorCode(e)
+        logger.error(
+            "Error requesting Plaid transactions for ${describeItem(accessToken)}: $errorCode"
+        )
         if (allowItemToFail) {
-            logger.warn("Querying transactions for access token ${redactAccessToken(accessToken)} failed, allowing failure and continuing on to the next access token")
+            logger.warn("Querying transactions for ${describeItem(accessToken)} failed ($errorCode), allowing failure and continuing on to the next access token")
+            onFailure(e)
             return null
         }
         throw e
+    }
+
+    /** The institution name configured for the Item, or "unnamed Item" (the redacted token tells Items apart). */
+    fun describeInstitution(accessToken: PlaidAccessToken): String =
+        accountConfigs.accounts.firstOrNull { it.plaidItemAccessToken == accessToken && !it.institutionName.isNullOrBlank() }
+            ?.institutionName ?: "unnamed Item"
+
+    private fun describeItem(accessToken: PlaidAccessToken): String =
+        "${describeInstitution(accessToken)} (${redactAccessToken(accessToken)})"
+
+    /**
+     * Plaid's `error_code` from a failed call (for example ITEM_LOGIN_REQUIRED), or the exception class when there is
+     * none (a network failure). Never the message, which can contain user data.
+     */
+    suspend fun plaidErrorCode(e: Exception): String {
+        if (e is ClientRequestException) {
+            val body = runCatching { e.response.bodyAsText() }.getOrDefault("")
+            Regex("\"error_code\"\\s*:\\s*\"([A-Z_0-9]+)\"").find(body)?.let { return it.groupValues[1] }
+            return "HTTP_${e.response.status.value}"
+        }
+        return e::class.simpleName ?: "UnknownError"
     }
 
     /**
@@ -168,6 +203,7 @@ class PlaidSyncService(
         val plaidCreatedTxs = mutableListOf<PlaidTransaction>()
         val plaidUpdatedTxs = mutableListOf<PlaidTransaction>()
         val plaidDeletedTxs = mutableListOf<PlaidTransactionId>()
+        val failedItems = mutableListOf<ItemFailure>()
 
         accessTokenLoop@ for ((accessToken, accountIds) in accountAccessTokenSequence) {
             logger.debug(
@@ -177,18 +213,26 @@ class PlaidSyncService(
             val accountIdSet = accountIds.toSet()
 
             /**
-             * If the Item's data changes while we're paging through it, Plaid rejects the next page with
-             *  TRANSACTIONS_SYNC_MUTATION_DURING_PAGINATION and requires the whole pagination to restart from the
-             *  cursor it started at (https://plaid.com/docs/api/products/transactions/#transactionssync). Anything
-             *  fetched in the failed attempt is discarded so it isn't counted twice.
+             * Plaid's contract for /transactions/sync is to keep the cursor an Item's pagination started from until
+             *  the last page (has_more = false) has arrived, and only then store the final one
+             *  (https://plaid.com/docs/transactions/ , https://plaid.com/docs/api/products/transactions/#transactionssync).
+             *  Two consequences here:
+             *  - If the Item's data changes while we're paging through it, Plaid rejects the next page with
+             *    TRANSACTIONS_SYNC_MUTATION_DURING_PAGINATION and requires the whole pagination to restart from the
+             *    cursor it started at. Anything fetched in the failed attempt is discarded so it isn't counted twice.
+             *  - If an Item fails on any page (allowItemToFail), everything fetched for it in this call is discarded and
+             *    its cursor goes back to where it started, so nothing is committed from the middle of a pagination.
              */
             val startCursor = cursorMap[accessToken]
+            fun restoreStartCursor() {
+                if (startCursor == null) cursorMap.remove(accessToken) else cursorMap[accessToken] = startCursor
+            }
             var restarts = 0
             while (true) {
                 val created = mutableListOf<PlaidTransaction>()
                 val updated = mutableListOf<PlaidTransaction>()
                 val deleted = mutableListOf<PlaidTransactionId>()
-                var abandonItem = false
+                var failure: Exception? = null
                 try {
                     // Plaid transaction batch loop
                     var hasMore: Boolean
@@ -198,11 +242,11 @@ class PlaidSyncService(
                         val response = executeTransactionSyncRequest(
                             accessToken,
                             cursorMap[accessToken],
-                            plaidBatchSize
+                            plaidBatchSize,
+                            onFailure = { failure = it },
                         )
                         if (response == null) {
-                            // allowItemToFail: keep what earlier batches returned, move on to the next Item
-                            abandonItem = true
+                            // allowItemToFail: drop this Item for this poll, move on to the next one
                             break
                         }
 
@@ -227,13 +271,18 @@ class PlaidSyncService(
                         "Plaid data for ${redactAccessToken(accessToken)} changed during pagination; " +
                                 "restarting from the cursor this sync began at (restart $restarts of $maxMutationRestarts)"
                     )
-                    if (startCursor == null) cursorMap.remove(accessToken) else cursorMap[accessToken] = startCursor
+                    restoreStartCursor()
                     continue
+                }
+                val failed = failure
+                if (failed != null) {
+                    restoreStartCursor()
+                    failedItems.add(ItemFailure(describeInstitution(accessToken), redactAccessToken(accessToken), plaidErrorCode(failed)))
+                    continue@accessTokenLoop
                 }
                 plaidCreatedTxs.addAll(created)
                 plaidUpdatedTxs.addAll(updated)
                 plaidDeletedTxs.addAll(deleted)
-                if (abandonItem) continue@accessTokenLoop
                 break
             }
         }
@@ -241,7 +290,8 @@ class PlaidSyncService(
         return PlaidTransactionResult(
             plaidCreatedTxs,
             plaidUpdatedTxs,
-            plaidDeletedTxs
+            plaidDeletedTxs,
+            failedItems,
         )
     }
 
@@ -296,5 +346,13 @@ class SyncMutationDuringPaginationException(cause: Throwable) :
 data class PlaidTransactionResult(
     val created: List<PlaidTransaction>,
     val updated: List<PlaidTransaction>,
-    val deleted: List<PlaidTransactionId>
+    val deleted: List<PlaidTransactionId>,
+    /** Items that failed and were skipped for this poll ([PlaidSyncService]'s allowItemToFail); their cursors did not move. */
+    val failedItems: List<ItemFailure> = listOf(),
 )
+
+/**
+ * An Item (one bank login) that failed this poll. Holds no secrets: [accessTokenRedacted] is the masked token,
+ * [errorCode] is Plaid's `error_code` (for example ITEM_LOGIN_REQUIRED) or the exception class for a network failure.
+ */
+data class ItemFailure(val institution: String, val accessTokenRedacted: String, val errorCode: String)

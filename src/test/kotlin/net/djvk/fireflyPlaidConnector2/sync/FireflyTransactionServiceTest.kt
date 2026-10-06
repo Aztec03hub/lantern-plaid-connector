@@ -24,7 +24,9 @@ class FireflyTransactionServiceTest {
     private val fireflyTransactionService = FireflyTransactionService(
         fireflyTxApi,
         syncHelper,
-        existingFireflyPullWindowDays
+        existingFireflyPullWindowDays,
+        "UTC",
+        mock(),
     )
 
     @Test
@@ -52,15 +54,18 @@ class FireflyTransactionServiceTest {
             fireflyTransactionService.processFireflyTransactionUpdates(creates, updates, deletes)
 
             // Verify
+            // M3-R2: each write is made on its own, so one rejected transaction can be set aside without the rest
             verify(syncHelper).optimisticInsertBatchIntoFirefly(eq(creates))
 
             // H1: a transfer conversion is an in-place update like any other, never a delete plus create
-            verify(syncHelper).updateBatchInFirefly(eq(updates))
+            verify(syncHelper).updateBatchInFirefly(eq(listOf(transferUpdate)))
+            verify(syncHelper).updateBatchInFirefly(eq(listOf(nonTransferUpdate)))
             verify(syncHelper, never()).pessimisticInsertBatchIntoFirefly(any())
             verify(syncHelper, never()).deleteBatchInFirefly(eq(listOf("transfer-update-id")))
 
             // Verify deletes
-            verify(syncHelper).deleteBatchInFirefly(eq(deletes))
+            verify(syncHelper).deleteBatchInFirefly(eq(listOf("1")))
+            verify(syncHelper).deleteBatchInFirefly(eq(listOf("2")))
         }
     }
 

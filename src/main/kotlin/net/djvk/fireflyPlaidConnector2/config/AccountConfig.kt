@@ -10,4 +10,9 @@ data class AccountConfig(
      * product. Only used in polled mode.
      */
     val investment: Boolean = false,
+    /**
+     * Optional label for the bank this account is at (for example "Chase"). Only used to name the institution in
+     * the log and in the failure report when the Item's sync fails; Plaid itself is never asked for it.
+     */
+    val institutionName: String? = null,
 )
