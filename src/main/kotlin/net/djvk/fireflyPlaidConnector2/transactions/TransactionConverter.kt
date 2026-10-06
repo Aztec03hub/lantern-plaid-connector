@@ -51,6 +51,13 @@ class TransactionConverter(
     private val detailedCategoryPrefix: String,
 
     private val txStyle: TransactionStyleConfig,
+
+    /**
+     * Optional tag added to transactions while Plaid reports them as pending, and removed when they post.
+     * Blank (the default) disables it.
+     */
+    @Value("\${fireflyPlaidConnector2.pendingTag:}")
+    private val pendingTag: String = "",
 ) {
     private val logger = LoggerFactory.getLogger(this::class.java)
     private val timeZone = TimeZone.getTimeZone(timeZoneString)
@@ -240,14 +247,28 @@ class TransactionConverter(
         val creates = mutableListOf<FireflyTransactionDto>()
         val updates = mutableListOf<FireflyTransactionDto>()
         val deletes = mutableListOf<FireflyTransactionId>()
+        val indexer = FireflyTransactionExternalIdIndexer(existingFireflyTxs)
+
+        /**
+         * Firefly ids of pending transactions that we're updating in place into their posted version, so that the
+         *  Plaid "removed" event for the pending id doesn't also delete them.
+         */
+        val promotedFireflyIds = mutableSetOf<FireflyTransactionId>()
 
         /**
          * Don't pass in [plaidUpdatedTxs] here because we're not going to try to update transfers for now
          *  because it's more complexity than I want to deal with, and I haven't seen any Plaid updates in the wild yet
+         *
+         * Pending transactions are never matched as transfers: they are provisional, and keeping them as plain
+         *  deposits/withdrawals is what allows them to be updated in place when they post (Firefly can't change a
+         *  transaction's type on update).
          */
+        val (pendingCreates, settledCreates) = plaidCreatedTxs.partition { it.pending }
         val wrappedCreates = transferMatcher.match(
-            PlaidFireflyTransaction.normalizeByTransactionId(plaidCreatedTxs, transferCandidateExistingFireflyTxs, accountMap)
-        )
+            PlaidFireflyTransaction.normalizeByTransactionId(settledCreates, transferCandidateExistingFireflyTxs, accountMap)
+        ) + PlaidFireflyTransaction.normalizeByTransactionId(pendingCreates, transferCandidateExistingFireflyTxs, accountMap)
+            // Existing Firefly transactions are only needed here to recognize pending creates we already imported
+            .filter { it !is PlaidFireflyTransaction.FireflyTransaction }
         logger.debug(
             "{} call to transferMatcher returned {} transactions",
             ::convertPollSync.name,
@@ -259,7 +280,18 @@ class TransactionConverter(
          */
         for (create in wrappedCreates) {
             val convertedSingle = when (create) {
-                is PlaidFireflyTransaction.PlaidTransaction -> convertSingle(create.plaidTransaction, accountMap)
+                is PlaidFireflyTransaction.PlaidTransaction -> {
+                    // A posted transaction that replaces a pending one we already imported updates that Firefly
+                    //  transaction in place (keeping its id, categories, budgets, notes and user tags) rather than
+                    //  deleting and re-creating it.
+                    val promotion = convertPendingPromotion(create.plaidTransaction, indexer, accountMap)
+                    if (promotion != null) {
+                        promotedFireflyIds.add(promotion.transactionId)
+                        updates.add(promotion)
+                        continue
+                    }
+                    convertSingle(create.plaidTransaction, accountMap)
+                }
 
                 // In both of these cases a Firefly transaction already exists. We don't need to do anything to it.
                 // If we have an associated Plaid transaction, log a message. Otherwise, silently ignore it.
@@ -305,7 +337,6 @@ class TransactionConverter(
             }
         }
 
-        val indexer = FireflyTransactionExternalIdIndexer(existingFireflyTxs)
         /**
          * Handle Plaid updates
          */
@@ -317,7 +348,7 @@ class TransactionConverter(
             }
 
             val convertedUpdate = convertSingle(plaidUpdate, accountMap)
-            updates.add(FireflyTransactionDto(target.id, convertedUpdate.tx))
+            updates.add(FireflyTransactionDto(target.id, preserveUserFields(convertedUpdate.tx, target)))
         }
         /**
          * Handle Plaid deletes
@@ -326,6 +357,10 @@ class TransactionConverter(
             val target = indexer.findExistingFireflyTx(plaidDeleteId)
             if (target == null) {
                 logger.error("Failed to find existing Firefly transaction to delete for Plaid id $plaidDeleteId")
+                continue
+            }
+            if (promotedFireflyIds.contains(target.id)) {
+                logger.debug("Not deleting Firefly transaction {}: it was updated in place from pending to posted", target.id)
                 continue
             }
 
@@ -337,6 +372,63 @@ class TransactionConverter(
             updates = updates,
             deletes = deletes,
         )
+    }
+
+    /**
+     * If [posted] is the posted version of a pending transaction that we already imported into Firefly (found via
+     * Plaid's pending_transaction_id), builds an in-place update of that Firefly transaction. The external id moves to
+     * the posted Plaid id so later Plaid updates and deletes find it.
+     *
+     * Returns null when the transaction should instead go through the normal delete-and-create path: it isn't linked
+     * to a pending one, the pending one isn't in Firefly (outside the pull window, or never imported), or the
+     * Firefly transaction can't be updated in place (it's split, or its type differs from the posted one, as when it
+     * has since become a transfer or the amount changed sign; Firefly can't change a transaction's type on update).
+     */
+    private suspend fun convertPendingPromotion(
+        posted: PlaidTransaction,
+        indexer: FireflyTransactionExternalIdIndexer,
+        accountMap: Map<PlaidAccountId, FireflyAccountId>,
+    ): FireflyTransactionDto? {
+        val pendingId = posted.pendingTransactionId ?: return null
+        val target = indexer.findExistingFireflyTx(pendingId) ?: return null
+        val existingSplit = target.attributes.transactions.singleOrNull() ?: return null
+        if (existingSplit.type != getFireflyTransactionDtoType(posted, false)) {
+            logger.debug(
+                "Not updating pending Firefly transaction {} in place: type {} differs from posted type",
+                target.id, existingSplit.type,
+            )
+            return null
+        }
+        val converted = convertSingle(posted, accountMap)
+        return FireflyTransactionDto(target.id, preserveUserFields(converted.tx, target))
+    }
+
+    /**
+     * Prepares a converted transaction to be sent as an update to the existing Firefly transaction [target]:
+     * - Plaid-derived tags (category and pending tags) are refreshed, but tags the user added in Firefly are kept.
+     *   Sending just the Plaid tags would remove the user's.
+     * - The existing currency is carried over, which Firefly requires on updates.
+     * Fields the connector never sets (category, budget, notes, ...) are null here and are omitted from the update
+     *  JSON (see TransactionSplitUpdate), so the user's values for them are untouched.
+     */
+    private fun preserveUserFields(update: TransactionSplit, target: TransactionRead): TransactionSplit {
+        val existingSplit = target.attributes.transactions.firstOrNull() ?: return update
+        return update.copy(
+            tags = mergeTags(existingSplit.tags, update.tags),
+            currencyId = existingSplit.currencyId ?: update.currencyId,
+            currencyCode = existingSplit.currencyCode ?: update.currencyCode,
+        )
+    }
+
+    /**
+     * Existing tags minus the ones this connector manages (category prefixes, pending tag), plus [plaidTags].
+     */
+    private fun mergeTags(existing: List<String>?, plaidTags: List<String>?): List<String> {
+        val managedPrefixes = listOf(primaryCategoryPrefix, detailedCategoryPrefix).filter { it.isNotBlank() }
+        val userTags = (existing ?: listOf()).filter { tag ->
+            tag != pendingTag && managedPrefixes.none { tag.startsWith(it) }
+        }
+        return (userTags + (plaidTags ?: listOf())).distinct()
     }
 
     fun filterFireflyCandidateTransferTxs(
@@ -533,6 +625,9 @@ class TransactionConverter(
      */
     protected suspend fun getFireflyCategoryTags(tx: PlaidTransaction): List<String> {
         val tagz = mutableListOf<String>()
+        if (tx.pending && pendingTag.isNotBlank()) {
+            tagz.add(pendingTag)
+        }
         if (tx.personalFinanceCategory == null) {
             return tagz
         }
