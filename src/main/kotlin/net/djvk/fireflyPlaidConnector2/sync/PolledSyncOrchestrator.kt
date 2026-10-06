@@ -34,6 +34,14 @@ class PolledSyncOrchestrator(
     private val plaidSyncService: PlaidSyncService,
     private val fireflyTransactionService: FireflyTransactionService,
     private val converter: TransactionConverter,
+
+    /**
+     * By default the first run for an Item skips its existing history and only picks up what changes afterwards (see
+     * [initializeCursors]). When true, the first sync of a new Item imports everything Plaid has for it (up to the
+     * history it was linked with, typically 24 months), which is what you want when adding a bank to a new Firefly.
+     */
+    @Value("\${fireflyPlaidConnector2.polled.importHistoryOnFirstSync:false}")
+    private val importHistoryOnFirstSync: Boolean = false,
 ) : Runner, DisposableBean {
     private val logger = LoggerFactory.getLogger(this::class.java)
 
@@ -44,6 +52,12 @@ class PolledSyncOrchestrator(
      * Initializes cursors for access tokens that don't have one yet.
      */
     suspend fun initializeCursors() {
+        if (importHistoryOnFirstSync) {
+            // Leave new Items without a cursor: their first poll then starts from the beginning of Plaid's history
+            logger.info("importHistoryOnFirstSync is enabled; not fast-forwarding cursors for new Items")
+            return
+        }
+
         // Read cursor map from storage
         val cursorMap = cursorManager.readCursorMap()
 
