@@ -15,4 +15,10 @@ data class AccountConfig(
      * the log and in the failure report when the Item's sync fails; Plaid itself is never asked for it.
      */
     val institutionName: String? = null,
+    /** Last four digits of the account number (for example "0836"); a bank text that names it makes an exact destination. */
+    val mask: String? = null,
+    /** What this account is for the pairer: "card", "vault", ... (a named destination can ask for a role). */
+    val roles: List<String> = listOf(),
+    /** The account's display name, used in pairing reports. */
+    val displayName: String? = null,
 )

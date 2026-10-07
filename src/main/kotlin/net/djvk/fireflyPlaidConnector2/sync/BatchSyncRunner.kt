@@ -1,5 +1,7 @@
 package net.djvk.fireflyPlaidConnector2.sync
 
+import net.djvk.fireflyPlaidConnector2.pairing.PairPass
+import net.djvk.fireflyPlaidConnector2.pairing.PairSettings
 import io.ktor.client.plugins.*
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -51,8 +53,9 @@ class BatchSyncRunner(
 
     private val converter: TransactionConverter,
 
-    /** Pairs what is left unpaired in Firefly after the run; null (tests) skips it. */
-    private val reconciler: TransferReconciler? = null,
+    /** Pairs what is left unpaired in Firefly after the run (when pair.afterRun is on); null (tests) skips it. */
+    private val pairPass: PairPass? = null,
+    private val pairSettings: PairSettings? = null,
 
     /** Used only for [disableRunningBalance]; null (tests) leaves Firefly's configuration alone. */
     private val configurationApi: ConfigurationApi? = null,
@@ -104,7 +107,9 @@ class BatchSyncRunner(
 
                 // Whatever this run could not pair in memory (a leg imported by an earlier or parallel run) is paired
                 //  from what Firefly holds now
-                reconciler?.let { it.reconcile(startDate.minusDays(it.transferMatchWindowDays), endDate) }
+                if (pairPass != null && pairSettings?.afterRun == true) {
+                    pairPass.run(startDate, endDate, pairSettings.dryRun)
+                }
             } finally {
                 if (switchRunningBalance) {
                     configurationApi!!.setUseRunningBalance(true)

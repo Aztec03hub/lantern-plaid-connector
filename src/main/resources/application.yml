@@ -41,9 +41,20 @@ fireflyPlaidConnector2:
   # The maximum number of days apart transactions can be and still be candidates for matching up as a Firefly transfer.
   # Must be less than fireflyPlaidConnector2.polled.existingFireflyPullWindowDays.
   transferMatchWindowDays: 3
-  # Pair own-account transfer legs that are already in Firefly after every batch run and poll. Off by default: see
-  #   docs/design/transfer-pairer.md in the Lantern repo; syncMode "pair" runs it on demand.
-  # reconcileTransfers: false
+  # Transfer pairing (docs/design/transfer-pairer.md in the Lantern repo). syncMode "pair" runs one pass and exits.
+  #   Every pass is a DRY RUN (prints the plan, writes nothing) until dryRun is false. afterRun adds a pass after every
+  #   batch run and poll (off by default). Account mask / roles / institutionName in the accounts list feed its
+  #   named-destination rules. configFile is an optional JSON file with externalPayees, hints and scheduled flows.
+  pair:
+    dryRun: true
+    afterRun: false
+    lookbackDays: 3650
+    markerDays: 5
+    fallbackDays: 10
+    autoMin: 6
+    reviewMin: 3
+    useWatermark: false
+    # unmerge: <pair_merge_id>
   polled:
     # How often to run the poll sync process
     syncFrequencyMinutes: 10

@@ -83,8 +83,8 @@ internal class BatchParallelFetchTest {
         val pageResponse = createPlaidResponse(page)
         whenever(plaid.api.transactionsGet(any<TransactionsGetRequest>())).thenReturn(pageResponse)
         val configurationApi = mock<net.djvk.fireflyPlaidConnector2.api.firefly.apis.ConfigurationApi>()
-        val reconciler = mock<TransferReconciler>()
-        whenever(reconciler.reconcile(any(), any(), any())).doSuspendableAnswer { throw IllegalStateException("pairing blew up") }
+        val pairPass = mock<net.djvk.fireflyPlaidConnector2.pairing.PairPass>()
+        whenever(pairPass.run(any(), any(), any(), any())).doSuspendableAnswer { throw IllegalStateException("pairing blew up") }
         val items = (1..4).map { AccountConfig(it, "token$it", "plaid$it") }
         val helper = SyncHelper(AccountConfigs(items), "t", firefly.aboutApi, firefly.transactionsApi, firefly.accountsApi, firefly.plaidLinksApi)
         val runner = BatchSyncRunner(
@@ -92,7 +92,7 @@ internal class BatchParallelFetchTest {
             net.djvk.fireflyPlaidConnector2.transactions.TransactionConverter(
                 false, "America/New_York", 5, false, "p-", false, "d-", net.djvk.fireflyPlaidConnector2.config.properties.TransactionStyleConfig(),
             ),
-            reconciler, configurationApi, true, "tok",
+            pairPass, net.djvk.fireflyPlaidConnector2.pairing.PairSettings(dryRun = false, afterRun = true), configurationApi, true, "tok",
         )
 
         val failure = runCatching { runner.run() }.exceptionOrNull()

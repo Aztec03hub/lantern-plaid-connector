@@ -1,5 +1,7 @@
 package net.djvk.fireflyPlaidConnector2.sync
 
+import net.djvk.fireflyPlaidConnector2.pairing.PairPass
+import net.djvk.fireflyPlaidConnector2.pairing.PairSettings
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -78,8 +80,9 @@ class PolledSyncOrchestrator(
     @Value("\${fireflyPlaidConnector2.pendingTag:}")
     pendingTag: String = "pending",
 
-    /** Pairs what is left unpaired in Firefly after each poll's writes; null (tests) skips it. */
-    private val reconciler: TransferReconciler? = null,
+    /** Pairs what is left unpaired in Firefly after each poll's writes (when pair.afterRun is on); null (tests) skips it. */
+    private val pairPass: PairPass? = null,
+    private val pairSettings: PairSettings? = null,
 ) : Runner, DisposableBean {
     private val logger = LoggerFactory.getLogger(this::class.java)
 
@@ -328,7 +331,10 @@ class PolledSyncOrchestrator(
         // What this poll could not pair in memory (a leg imported by another run) is paired from Firefly's state. A
         //  failure is logged and retried by the next poll: it must not hold back the cursors of imported data.
         try {
-            reconciler?.reconcileWindow()
+            if (pairPass != null && pairSettings?.afterRun == true) {
+                val today = java.time.LocalDate.now()
+                pairPass.run(today.minusDays(pairSettings.lookbackDays), today, pairSettings.dryRun)
+            }
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (e: Exception) {
