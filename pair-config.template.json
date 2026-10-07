@@ -1,0 +1,11 @@
+{
+  "destinations": [
+    {"regex": "XXXX0000|YOUR NAME ACH XFER", "kind": "institution", "value": "Your Credit Union", "inflowNarrow": "(?i)type: ach xfer"},
+    {"regex": "YOURCU VSA PMT", "kind": "institution", "value": "Your Credit Union"},
+    {"regex": "(?i)to (?:loan|share) (\\d{4})", "kind": "mask", "value": "Your Credit Union", "group": 1}
+  ],
+  "externalPayees": ["(?i)relative's checking"],
+  "hints": [],
+  "scheduled": [],
+  "income": "(?i)payroll|direct dep|your employer|interest|refund|tax"
+}

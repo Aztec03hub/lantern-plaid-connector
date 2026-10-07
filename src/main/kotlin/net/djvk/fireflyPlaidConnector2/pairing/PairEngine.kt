@@ -105,6 +105,8 @@ class PairEngine(private val accounts: List<PairAccount>, private val config: Pa
                 // a card-payment text can only land on a card, so exactly one card at the named institution qualifies
                 inMarkers.contains("card-payment") && allowed.filter { "card" in it.roles }.singleOrNull()?.id == inn.account ->
                     points.add(RulePoints("destination-narrowed", 3, "destination", "the only card at the named institution"))
+                rule.inflowNarrow?.matchesAny(inn.text) == true ->
+                    points.add(RulePoints("destination-narrowed", 3, "destination", "the inflow's own wording names the institution"))
                 else -> {
                     flags.add("ambiguous-destination")
                     points.add(RulePoints("destination-ambiguous", 0, "destination", "${allowed.size} accounts qualify"))

@@ -23,7 +23,14 @@ internal class PairEngineTest {
     private fun inn(account: PairAccount, text: String, cents: Long = 10_000, date: LocalDate = day, id: String = "i${n++}") =
         Leg(id, account.id, Dir.IN, date, cents, text)
 
-    private fun engine(config: PairingConfig = PairingConfig()) = PairEngine(all, config)
+    /** Personal wording lives in the pair config file, so the tests bring their own invented bank. */
+    private val testDestinations = listOf(
+        DestRule(Regex("XXXX0198|ACMECU CLIENT ACH XFER"), DestTarget.Institution("DCU"), Regex("(?i)type: ach xfer")),
+        DestRule(Regex("ACMECU VSA PMT"), DestTarget.Institution("DCU")),
+        DestRule(Regex("(?i)to (?:loan|share) (\\d{4})"), DestTarget.Mask("DCU", 1)),
+    )
+
+    private fun engine(config: PairingConfig = PairingConfig()) = PairEngine(all, config.copy(destinations = testDestinations + config.destinations))
 
     // region the reported false positive
 
@@ -45,7 +52,7 @@ internal class PairEngineTest {
 
     @Test
     fun anAchPullWithAnOutMarkerAndACardPaymentReceivedIsMarkedAndAutoMerged() {
-        val o = out(o2, "AC DUPAGECU VSA PMT 123")
+        val o = out(o2, "AC ACH PULL 123")
         val i = inn(imagine, "Credit Card Payment Received")
         val result = engine().decide(listOf(o, i))
         val p = result.proposals.single()
@@ -84,8 +91,8 @@ internal class PairEngineTest {
 
     @Test
     fun aByInstitutionDestinationWithSeveralAccountsGetsNoPointsAndIsFlagged() {
-        // "PHILLIP LAFAYETT ACH XFER" names DCU, which has three linked accounts that could receive it
-        val result = engine().decide(listOf(out(o2, "AC PHILLIP LAFAYETT ACH XFER"), inn(dcuChecking, "AC ACH XFER")))
+        // "ACMECU CLIENT ACH XFER" names DCU, which has three linked accounts that could receive it
+        val result = engine().decide(listOf(out(o2, "AC ACMECU CLIENT ACH XFER"), inn(dcuChecking, "AC ACH XFER")))
         val edge = (result.proposals.singleOrNull()?.edge) ?: result.unmatched.single()
         assertThat(edge.flags).contains("ambiguous-destination")
         assertThat(edge.points.first { it.rule == "destination-ambiguous" }.points).isEqualTo(0)
@@ -94,12 +101,12 @@ internal class PairEngineTest {
 
     @Test
     fun aCardPaymentInflowNarrowsAnInstitutionToTheOnlyCardAndIsAutoMerged() {
-        val result = engine().decide(listOf(out(o2, "AC PHILLIP LAFAYETT ACH XFER"), inn(imagine, "Credit Card Payment Received")))
+        val result = engine().decide(listOf(out(o2, "AC ACMECU CLIENT ACH XFER"), inn(imagine, "Credit Card Payment Received")))
         val p = result.proposals.single()
         assertThat(p.edge.points.map { it.rule }).contains("destination-narrowed")
         assertThat(p.auto).isTrue()
         // a card payment landing on a non-card account is a contradiction of the narrowing, never narrowed
-        val wrong = engine().decide(listOf(out(o2, "AC PHILLIP LAFAYETT ACH XFER"), inn(dcuChecking, "Credit Card Payment Received")))
+        val wrong = engine().decide(listOf(out(o2, "AC ACMECU CLIENT ACH XFER"), inn(dcuChecking, "Credit Card Payment Received")))
         assertThat(wrong.proposals.flatMap { it.edge.points.map { r -> r.rule } }).doesNotContain("destination-narrowed")
     }
 
@@ -144,12 +151,12 @@ internal class PairEngineTest {
 
     @Test
     fun aHintWithACounterpartAccountLiftsTheP2pVetoForThatAccountOnly() {
-        val hint = Hint(account = sofi.id, regex = Regex("Zelle Payment to Phillip"), counterpartAccount = o2.id)
+        val hint = Hint(account = sofi.id, regex = Regex("Zelle Payment to Alex"), counterpartAccount = o2.id)
         val config = PairingConfig(hints = listOf(hint))
-        val pair = listOf(out(sofi, "Zelle Payment to Phillip Lafayette"), inn(o2, "Zelle payment from Phillip Lafayette"))
+        val pair = listOf(out(sofi, "Zelle Payment to Alex Smith"), inn(o2, "Zelle payment from Alex Smith"))
         // the inflow also says zelle: its own account has no hint, so it stays vetoed
         assertThat(engine(config).decide(pair).proposals).isEmpty()
-        val both = PairingConfig(hints = listOf(hint, Hint(o2.id, Regex("Zelle payment from Phillip"), sofi.id)))
+        val both = PairingConfig(hints = listOf(hint, Hint(o2.id, Regex("Zelle payment from Alex"), sofi.id)))
         val result = engine(both).decide(pair)
         assertThat(result.proposals.single().edge.families).contains("hint")
     }
@@ -167,7 +174,7 @@ internal class PairEngineTest {
     @Test
     fun atEqualScoreALowerLayerBeatsACloserFallbackCandidate() {
         // marked pair two days apart: 2 + 2 + 0 = 4 (layer 2); unmarked inflow the same day: 2 + 2 = 4 (layer 3)
-        val o = out(o2, "AC DUPAGECU VSA PMT", date = day)
+        val o = out(o2, "AC ACH PULL", date = day)
         val marked = inn(imagine, "Credit Card Payment Received", date = day.plusDays(2))
         val near = inn(chase, "Some Transfer", date = day)
         val engine = engine()
@@ -216,7 +223,7 @@ internal class PairEngineTest {
     @Test
     fun theOutcomeDoesNotDependOnTheOrderOfTheLegs() {
         val legs = listOf(
-            out(o2, "AC DUPAGECU VSA PMT", id = "o1"), inn(imagine, "Credit Card Payment Received", id = "i1"),
+            out(o2, "AC ACH PULL", id = "o1"), inn(imagine, "Credit Card Payment Received", id = "i1"),
             out(dcuSavings, "To Loan 0836", id = "o2", date = day.plusDays(1)), inn(imagine, "Credit Card Payment Received", id = "i2", date = day.plusDays(2)),
             out(sofi, "To Emergency Fund Vault", cents = 2_500, id = "o3"), inn(vault, "From checking balance", cents = 2_500, id = "i3"),
         )

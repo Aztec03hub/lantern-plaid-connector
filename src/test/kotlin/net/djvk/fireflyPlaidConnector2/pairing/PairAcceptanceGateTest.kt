@@ -75,7 +75,10 @@ internal class PairAcceptanceGateTest {
                 ScheduledFlow(from.id, to.id, (n["amount"].asDouble() * 100).roundToLong(), n["day"]?.asInt(), n["tolerance"]?.asInt() ?: 3)
             }
         } ?: listOf()
-        val engine = PairEngine(accounts, PairingConfig(scheduled = scheduled))
+        // the personal wording (destinations, payees, income) is in pair-config.json beside the fixtures, or in ../connector/
+        val configFile = listOf(File(dir, "pair-config.json"), File(dir.parentFile, "connector/pair-config.json")).firstOrNull { it.exists() }
+        println("pair config: ${configFile ?: "NONE FOUND (defaults only; destination rules naming a person or an account number are missing)"}")
+        val engine = PairEngine(accounts, PairConfigLoader.load(configFile?.path ?: "", PairingConfig(scheduled = scheduled)))
 
         val byId = universe.associateBy { it.id }
         fun leg(r: Row) = Leg(
@@ -97,7 +100,12 @@ internal class PairAcceptanceGateTest {
         val v2 = if (v2File.exists()) mapper.readTree(v2File) else null
         val truthRows = (v2 ?: oracle).filter { it.has("out") && it.has("inn") && (!it.has("label") || it["label"].asText() == "TRUE") }
             .map { it["out"].asText() to it["inn"].asText() }
-        val truth = truthRows.filter { it.first in legById && it.second in legById }
+        val inUniverse = truthRows.filter { it.first in legById && it.second in legById }
+        // a TRUE pair whose destination the engine vetoes as unlinked or contradicting has an inflow on an account that has no
+        // Plaid rows (a statement loan): section 9 routes it, it is not a pairing candidate
+        fun routed(p: Pair<String, String>) = engine.evaluate(legById.getValue(p.first), legById.getValue(p.second))?.veto
+            ?.let { it == "unlinked-destination" || it == "destination-contradiction" } == true
+        val truth = inUniverse.filterNot(::routed)
         val routedBy9 = truthRows.size - truth.size
         val traps = oracle.filter { it["label"].asText() == "FALSE" }.map { it["out"].asText() to it["inn"].asText() }
 
@@ -128,15 +136,16 @@ internal class PairAcceptanceGateTest {
             if ((stillWanted[s] ?: 0) > 0) { stillWanted[s] = stillWanted.getValue(s) - 1; missed.add(o to i) }
         }
         val minTrue = truth.mapNotNull { (o, i) -> engine.evaluate(legById.getValue(o), legById.getValue(i))?.takeIf { it.veto == null }?.score }.minOrNull()
+        val maxTrapAny = traps.filter { it !in truth }.mapNotNull { (o, i) -> engine.evaluate(legById.getValue(o), legById.getValue(i))?.score }.maxOrNull()
         val maxTrap = traps.filter { it !in truth }.mapNotNull { (o, i) -> engine.evaluate(legById.getValue(o), legById.getValue(i))?.takeIf { it.veto == null }?.score }.maxOrNull()
         val trapVetoed = traps.count { (o, i) -> engine.evaluate(legById.getValue(o), legById.getValue(i))?.veto != null }
 
         println("=== ACCEPTANCE GATE ===")
         println("universe: ${legs.size} settled legs, ${accounts.size} accounts; candidates scored: ${result.candidates}")
-        println("TRUE pairs found: ${foundAuto + foundReview}/${truth.size}  (auto ${foundAuto}, review band $foundReview); routed by 9: pending ($routedBy9 legs)")
+        println("TRUE pairs found: ${foundAuto + foundReview}/${truth.size}  (auto ${foundAuto}, review band $foundReview); routed by 9: pending ($routedBy9 pairs: ${truthRows.size - inUniverse.size} with a leg outside the universe, ${inUniverse.size - truth.size} destination-vetoed)")
         println("false positives: auto $falseAuto, review band $falseReview")
         println("traps rejected: ${traps.size - trapsAccepted.size}/${traps.size}  (of which hard-vetoed: $trapVetoed)")
-        println("min TRUE score: $minTrue   max trap score: $maxTrap   autoMin=${PairingConfig().autoMin} reviewMin=${PairingConfig().reviewMin}")
+        println("min TRUE score: $minTrue   max trap score (non-vetoed): $maxTrap  (including vetoed, meaningless: $maxTrapAny)   autoMin=${PairingConfig().autoMin} reviewMin=${PairingConfig().reviewMin}")
         println("ambiguous components: ${result.ambiguous.size}; waiting: ${result.waiting.size}")
         println("review-band TRUE pairs by rule set (rule:points only):")
         reviewHistogram.forEach { (k, n) -> println("  $n x $k") }

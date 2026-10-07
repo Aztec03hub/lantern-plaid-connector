@@ -51,7 +51,11 @@ sealed interface DestTarget {
     data object Unlinked : DestTarget
 }
 
-data class DestRule(val regex: Regex, val target: DestTarget)
+/**
+ * [inflowNarrow]: when the rule names an institution with several linked accounts, an inflow whose own text matches this
+ * (the institution's wording for an incoming ACH, say) narrows it to that inflow's account.
+ */
+data class DestRule(val regex: Regex, val target: DestTarget, val inflowNarrow: Regex? = null)
 
 /** Extra evidence for one account's wording (4.3.4). With [counterpartAccount] it only counts against that account. */
 data class Hint(val account: Int, val regex: Regex, val counterpartAccount: Int? = null)

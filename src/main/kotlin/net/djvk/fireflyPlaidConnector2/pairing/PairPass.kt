@@ -40,7 +40,7 @@ class PairSettings(
     @Value("\${fireflyPlaidConnector2.pair.useWatermark:false}") val useWatermark: Boolean = false,
     /** Run a pass after every batch run and poll. Off until the first dry run has been read. */
     @Value("\${fireflyPlaidConnector2.pair.afterRun:false}") val afterRun: Boolean = false,
-    /** Optional JSON file: externalPayees, hints, scheduled, p2p, income (see [PairConfigLoader]). */
+    /** Optional JSON file: externalPayees, hints, scheduled, destinations (added before the defaults), p2p, income (see [PairConfigLoader]). */
     @Value("\${fireflyPlaidConnector2.pair.configFile:}") val configFile: String = "",
     @Value("\${fireflyPlaidConnector2.pendingTag:}") val pendingTag: String = "",
     @Value("\${fireflyPlaidConnector2.polled.cursorFileDirectoryPath:persistence}") val directory: String = "persistence",
@@ -63,6 +63,17 @@ object PairConfigLoader {
             scheduled = n["scheduled"]?.map {
                 ScheduledFlow(it["from"].asInt(), it["to"].asInt(), Math.round(it["amount"].asDouble() * 100), it["day"]?.takeIf { v -> !v.isNull }?.asInt(), it["tolerance"]?.asInt() ?: 3)
             } ?: base.scheduled,
+            destinations = n["destinations"]?.map {
+                val v = it["value"]?.asText().orEmpty()
+                val target = when (it["kind"].asText()) {
+                    "institution" -> DestTarget.Institution(v)
+                    "mask" -> DestTarget.Mask(v, it["group"]?.asInt() ?: 1)
+                    "role" -> DestTarget.Role(v)
+                    "unlinked" -> DestTarget.Unlinked
+                    else -> error("pair config: unknown destination kind ${it["kind"]}")
+                }
+                DestRule(Regex(it["regex"].asText()), target, it["inflowNarrow"]?.takeIf { x -> !x.isNull }?.let { x -> Regex(x.asText()) })
+            }?.let { custom -> custom + base.destinations } ?: base.destinations,
             p2p = n["p2p"]?.let { Regex(it.asText()) } ?: base.p2p,
             income = n["income"]?.let { Regex(it.asText()) } ?: base.income,
         )
