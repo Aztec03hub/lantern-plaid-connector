@@ -108,6 +108,10 @@ internal class PairAcceptanceGateTest {
         val truth = inUniverse.filterNot(::routed)
         val routedBy9 = truthRows.size - truth.size
         val traps = oracle.filter { it["label"].asText() == "FALSE" }.map { it["out"].asText() to it["inn"].asText() }
+        // a FALSE row with the signature of a TRUE pair is the crossed twin of a same-day duplicate transfer (4.5, "Twins"):
+        // either assignment gives the same ledger, so it is not a trap and does not count in max-trap
+        val trueSigs = inUniverse.map { (o, i) -> sig(legById.getValue(o), legById.getValue(i)) }.toSet()
+        val (twinCrossings, realTraps) = traps.partition { (o, i) -> o in legById && i in legById && sig(legById.getValue(o), legById.getValue(i)) in trueSigs }
 
         // every proposal is explained by a TRUE signature (consumed up to its count), else it is a trap or a false positive
         val remaining = truth.groupingBy { sig(legById.getValue(it.first), legById.getValue(it.second)) }.eachCount().toMutableMap()
@@ -136,8 +140,8 @@ internal class PairAcceptanceGateTest {
             if ((stillWanted[s] ?: 0) > 0) { stillWanted[s] = stillWanted.getValue(s) - 1; missed.add(o to i) }
         }
         val minTrue = truth.mapNotNull { (o, i) -> engine.evaluate(legById.getValue(o), legById.getValue(i))?.takeIf { it.veto == null }?.score }.minOrNull()
-        val maxTrapAny = traps.filter { it !in truth }.mapNotNull { (o, i) -> engine.evaluate(legById.getValue(o), legById.getValue(i))?.score }.maxOrNull()
-        val maxTrap = traps.filter { it !in truth }.mapNotNull { (o, i) -> engine.evaluate(legById.getValue(o), legById.getValue(i))?.takeIf { it.veto == null }?.score }.maxOrNull()
+        val maxTrapAny = realTraps.filter { it !in truth }.mapNotNull { (o, i) -> engine.evaluate(legById.getValue(o), legById.getValue(i))?.score }.maxOrNull()
+        val maxTrap = realTraps.filter { it !in truth }.mapNotNull { (o, i) -> engine.evaluate(legById.getValue(o), legById.getValue(i))?.takeIf { it.veto == null }?.score }.maxOrNull()
         val trapVetoed = traps.count { (o, i) -> engine.evaluate(legById.getValue(o), legById.getValue(i))?.veto != null }
 
         println("=== ACCEPTANCE GATE ===")
@@ -145,13 +149,14 @@ internal class PairAcceptanceGateTest {
         println("TRUE pairs found: ${foundAuto + foundReview}/${truth.size}  (auto ${foundAuto}, review band $foundReview); routed by 9: pending ($routedBy9 pairs: ${truthRows.size - inUniverse.size} with a leg outside the universe, ${inUniverse.size - truth.size} destination-vetoed)")
         println("false positives: auto $falseAuto, review band $falseReview")
         println("traps rejected: ${traps.size - trapsAccepted.size}/${traps.size}  (of which hard-vetoed: $trapVetoed)")
+        println("twin crossings (FALSE rows with a TRUE signature, excluded from traps and max-trap): ${twinCrossings.size}; real traps: ${realTraps.size}")
         println("min TRUE score: $minTrue   max trap score (non-vetoed): $maxTrap  (including vetoed, meaningless: $maxTrapAny)   autoMin=${PairingConfig().autoMin} reviewMin=${PairingConfig().reviewMin}")
         println("ambiguous components: ${result.ambiguous.size}; waiting: ${result.waiting.size}")
         // every non-vetoed trap that scored at least reviewMin: its rules and the rules of the pair(s) that took its legs
         val proposalOfLeg = result.proposals.flatMap { p -> listOf(p.edge.out.id to p.edge, p.edge.inn.id to p.edge) }.toMap()
         fun rp(e: Edge?) = e?.points?.joinToString(" ") { "${it.rule}:${it.points}" } ?: "none"
         println("traps scoring >= reviewMin (not vetoed), with the pair that beat each:")
-        traps.filter { it !in truth }.forEach { (o, i) ->
+        realTraps.filter { it !in truth }.forEach { (o, i) ->
             val e = engine.evaluate(legById.getValue(o), legById.getValue(i))
             if (e != null && e.veto == null && e.score >= PairingConfig().reviewMin) {
                 println("  TRAP score=${e.score} gap=${e.gap} [${rp(e)}]")
@@ -159,6 +164,12 @@ internal class PairAcceptanceGateTest {
                 println("     beaten on in leg  by gap=${proposalOfLeg[i]?.gap} [${rp(proposalOfLeg[i])}]")
             }
         }
+        // distribution of TRUE pair scores; every pair below autoMin + 2 is listed by rule:points only (never descriptions)
+        val trueEvals = truth.mapNotNull { (o, i) -> engine.evaluate(legById.getValue(o), legById.getValue(i))?.takeIf { it.veto == null } }
+        println("TRUE pair score histogram:")
+        trueEvals.groupingBy { it.score }.eachCount().toSortedMap().forEach { (score, n) -> println("  score $score: $n") }
+        println("TRUE pairs below autoMin + 2 (${PairingConfig().autoMin + 2}), rule:points:")
+        trueEvals.filter { it.score < PairingConfig().autoMin + 2 }.forEach { println("  score=${it.score} [${rp(it)}]") }
         println("review-band TRUE pairs by rule set (rule:points only):")
         reviewHistogram.forEach { (k, n) -> println("  $n x $k") }
         missed.forEach { (o, i) ->
