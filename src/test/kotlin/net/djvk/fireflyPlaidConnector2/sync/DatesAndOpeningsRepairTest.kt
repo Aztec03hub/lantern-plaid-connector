@@ -161,12 +161,22 @@ internal class DatesAndOpeningsRepairTest {
     }
 
     @Test
-    fun statementJournalsAreLeftAlone() {
+    fun journalsCreatedFromStatementsAreLeftAlone() {
         val p = plan(
-            listOf(journal("g1", midnight(LocalDate.of(2024, 12, 5)).minusHours(1), "w1", tags = listOf(STATEMENT_TAG))),
+            listOf(journal("g1", midnight(LocalDate.of(2024, 12, 5)).minusHours(1), "w1", tags = listOf(STATEMENT_TAG), externalId = "dcu-stmt:2024-12:interest")),
             listOf(plaid("w1", LocalDate.of(2024, 12, 6))),
         )
         assertThat(p.redates).isEmpty()
+    }
+
+    @Test
+    fun aPlaidLinkedJournalIsRedatedEvenWhenItWasTaggedAsStatement() {
+        // an O2 leg that the loan import re-pointed to a loan and tagged: still a Plaid journal, still at 23:00 the day before
+        val p = plan(
+            listOf(journal("g1", midnight(LocalDate.of(2024, 12, 5)).minusHours(1), "w1", tags = listOf(STATEMENT_TAG))),
+            listOf(plaid("w1", LocalDate.of(2024, 12, 5))),
+        )
+        assertThat(p.redates.single().newDate).isEqualTo(midnight(LocalDate.of(2024, 12, 5)))
     }
 
     @Test

@@ -36,6 +36,8 @@ import net.djvk.fireflyPlaidConnector2.api.plaid.models.Transaction as PlaidTran
  */
 const val OPENING_BALANCE_DESCRIPTION = "Plaid Connector Initial Balance"
 const val STATEMENT_TAG = "lantern-dcu-statement"
+/** Journals created from statements carry this external id prefix; the repair never touches them. */
+const val STATEMENT_EXTERNAL_ID_PREFIX = "dcu-stmt:"
 private const val LEGACY_DCU_OPENING = "DCU statement opening balance"
 
 /** Whether [s] is an opening-balance journal of an older build or of the DCU statement import. */
@@ -123,7 +125,8 @@ class RepairPlanner(
         var unmatched = 0
         for (group in input.journals) {
             val split = group.attributes.transactions.singleOrNull() ?: continue
-            if (split.tags.orEmpty().contains(STATEMENT_TAG) || isLegacyOpening(split)) continue
+            // created from a statement: leave alone. A Plaid journal that was only re-pointed and tagged is still re-dated
+            if (split.externalId?.startsWith(STATEMENT_EXTERNAL_ID_PREFIX) == true || isLegacyOpening(split)) continue
             if (split.type == TransactionTypeProperty.openingBalance) continue
             val links = split.plaidLinks.orEmpty()
             if (links.isEmpty()) continue
@@ -266,13 +269,13 @@ class RepairPlanner(
 /**
  * `syncMode: repair-dates`: repairs data imported by older builds, from Plaid alone (no statements needed).
  *  1. re-dates every Plaid-sourced journal to Plaid's posted date (date and process_date; the authorized date goes to
- *     book_date). Journals tagged [STATEMENT_TAG] (statement interest, fee and payment journals) are left alone, and a
+ *     book_date). Journals created from statements (external id starting [STATEMENT_EXTERNAL_ID_PREFIX]) are left alone; a Plaid journal that carries [STATEMENT_TAG] is re-dated like any other, and a
  *     journal Plaid has no record of is reported, never moved;
  *  2. replaces every "Initial Balance" expense-account opening journal with the account's own opening balance
  *     (PUT /accounts/{id}), re-anchored to Plaid's balance and dated the day before the account's first transaction;
  *     a loan kept from statements keeps its amount and date. This includes a statement opening journal even when it
  *     carries [STATEMENT_TAG]: replacing that one is intended;
- *  3. deletes the "Initial Balance" expense account if nothing is left in it;
+ *  3. deletes the "Initial Balance" account, expense or revenue, if nothing is left in it;
  *  4. prints Firefly's balance against Plaid's posted balance per account, so any remaining gap is visible.
  * It prints the whole plan and changes nothing unless `fireflyPlaidConnector2.repair.apply=true`. Idempotent.
  */
@@ -462,27 +465,32 @@ class RepairDatesRunner(
         deleteOrphanInitialBalanceAccount()
     }
 
-    private suspend fun findInitialBalanceExpenseAccount(): AccountRead? {
-        var page = 1
-        while (true) {
-            val response = fireflyAccountsApi.listAccount(page++, null, AccountTypeFilter.expense).body()
-            response.data.firstOrNull { it.attributes.name == "Initial Balance" }?.let { return it }
-            if (response.meta.pagination?.let { it.currentPage < it.totalPages } != true) return null
+    private suspend fun findInitialBalanceAccounts(): List<AccountRead> =
+        listOf(AccountTypeFilter.expense, AccountTypeFilter.revenue).mapNotNull { type ->
+            var page = 1
+            var found: AccountRead? = null
+            while (found == null) {
+                val response = fireflyAccountsApi.listAccount(page++, null, type).body()
+                found = response.data.firstOrNull { it.attributes.name == "Initial Balance" }
+                if (found == null && response.meta.pagination?.let { it.currentPage < it.totalPages } != true) break
+            }
+            found
         }
-    }
 
     internal suspend fun deleteOrphanInitialBalanceAccount() {
-        val expense = findInitialBalanceExpenseAccount() ?: return
-        val left = fireflyAccountsApi.listTransactionByAccount(expense.id, 1, 1, null, null, TransactionTypeFilter.all).body().data
-        if (left.isNotEmpty()) {
-            println("The expense account \"Initial Balance\" still has journals; not deleted.")
-            return
-        }
-        try {
-            fireflyAccountsApi.deleteAccount(expense.id)
-            println("Deleted the empty expense account \"Initial Balance\".")
-        } catch (e: ClientRequestException) {
-            logger.error("Could not delete the Initial Balance expense account (HTTP {})", e.response.status.value)
+        for (account in findInitialBalanceAccounts()) {
+            val kind = account.attributes.type.value
+            val left = fireflyAccountsApi.listTransactionByAccount(account.id, 1, 1, null, null, TransactionTypeFilter.all).body().data
+            if (left.isNotEmpty()) {
+                println("The $kind account \"Initial Balance\" still has journals; not deleted.")
+                continue
+            }
+            try {
+                fireflyAccountsApi.deleteAccount(account.id)
+                println("Deleted the empty $kind account \"Initial Balance\".")
+            } catch (e: ClientRequestException) {
+                logger.error("Could not delete the Initial Balance {} account (HTTP {})", kind, e.response.status.value)
+            }
         }
     }
 }

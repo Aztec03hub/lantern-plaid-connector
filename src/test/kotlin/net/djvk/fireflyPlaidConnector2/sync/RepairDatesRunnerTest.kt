@@ -88,6 +88,7 @@ internal class RepairDatesRunnerTest {
     private fun noExpenseAccounts() = runBlocking {
         val none = createFireflyResponse(AccountArray(listOf(), Meta()))
         whenever(accountsApi.listAccount(anyOrNull(), anyOrNull(), eq(AccountTypeFilter.expense))).thenReturn(none)
+        whenever(accountsApi.listAccount(anyOrNull(), anyOrNull(), eq(AccountTypeFilter.revenue))).thenReturn(none)
     }
 
     @Test
@@ -117,6 +118,8 @@ internal class RepairDatesRunnerTest {
         val expense = AccountRead("accounts", "77", Account("Initial Balance", ShortAccountTypeProperty.expense), ObjectLink())
         val list = createFireflyResponse(AccountArray(listOf(expense), Meta()))
         whenever(accountsApi.listAccount(anyOrNull(), anyOrNull(), eq(AccountTypeFilter.expense))).thenReturn(list)
+        val noRevenue = createFireflyResponse(AccountArray(listOf(), Meta()))
+        whenever(accountsApi.listAccount(anyOrNull(), anyOrNull(), eq(AccountTypeFilter.revenue))).thenReturn(noRevenue)
         val empty = createFireflyResponse(TransactionArray(listOf(), Meta(), PageLink()))
         whenever(accountsApi.listTransactionByAccount(eq("77"), anyOrNull(), anyOrNull(), anyOrNull(), anyOrNull(), eq(TransactionTypeFilter.all))).thenReturn(empty)
         runner().deleteOrphanInitialBalanceAccount()
@@ -129,6 +132,19 @@ internal class RepairDatesRunnerTest {
         org.mockito.kotlin.clearInvocations(accountsApi)
         runner().deleteOrphanInitialBalanceAccount()
         verify(accountsApi, never()).deleteAccount(any())
+    }
+
+    @Test
+    fun anEmptyInitialBalanceRevenueAccountIsDeletedToo() = runBlocking<Unit> {
+        val revenue = AccountRead("accounts", "372", Account("Initial Balance", ShortAccountTypeProperty.revenue), ObjectLink())
+        val noExpense = createFireflyResponse(AccountArray(listOf(), Meta()))
+        val revenues = createFireflyResponse(AccountArray(listOf(revenue), Meta()))
+        whenever(accountsApi.listAccount(anyOrNull(), anyOrNull(), eq(AccountTypeFilter.expense))).thenReturn(noExpense)
+        whenever(accountsApi.listAccount(anyOrNull(), anyOrNull(), eq(AccountTypeFilter.revenue))).thenReturn(revenues)
+        val empty = createFireflyResponse(TransactionArray(listOf(), Meta(), PageLink()))
+        whenever(accountsApi.listTransactionByAccount(eq("372"), anyOrNull(), anyOrNull(), anyOrNull(), anyOrNull(), eq(TransactionTypeFilter.all))).thenReturn(empty)
+        runner().deleteOrphanInitialBalanceAccount()
+        verify(accountsApi).deleteAccount("372")
     }
 
     // endregion
