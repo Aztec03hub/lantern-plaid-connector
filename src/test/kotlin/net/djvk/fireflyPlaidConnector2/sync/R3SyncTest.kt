@@ -76,7 +76,7 @@ internal class R3SyncTest {
     private val txApi: TransactionsApi = mock()
     private val helper: SyncHelper = mock { onBlocking { optimisticInsertBatchIntoFirefly(any()) } doReturn 1 }
     private val plaidLinksApi: PlaidLinksApi = mock()
-    private val syncHelper: SyncHelper = mock()
+    private val syncHelper: SyncHelper = mock { onBlocking { fetchAccountKinds() } doReturn emptyMap() }
     private val cursorManager: CursorManager = mock()
     private val plaidSyncService: PlaidSyncService = mock()
 

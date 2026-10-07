@@ -2,7 +2,12 @@ package net.djvk.fireflyPlaidConnector2.sync
 
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.Account
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.AccountArray
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.AccountRead
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.AccountTypeFilter
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.ObjectLink
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.ShortAccountTypeProperty
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.Meta
 import net.djvk.fireflyPlaidConnector2.api.plaid.models.TransactionsGetRequest
 import net.djvk.fireflyPlaidConnector2.api.plaid.models.TransactionsGetResponse
@@ -18,6 +23,7 @@ import org.mockito.kotlin.any
 import org.mockito.kotlin.anyOrNull
 import org.mockito.kotlin.doReturn
 import org.mockito.kotlin.doSuspendableAnswer
+import org.mockito.kotlin.eq
 import org.mockito.kotlin.mock
 import org.mockito.kotlin.whenever
 import java.util.concurrent.ConcurrentHashMap
@@ -37,8 +43,10 @@ internal class BatchParallelFetchTest {
 
     @Test
     fun theItemsAreFetchedAtOnceAndEachItemsPagesInOrder() = runBlocking<Unit> {
+        val assets = createFireflyResponse(AccountArray((1..4).map { AccountRead("accounts", "$it", Account("a$it", ShortAccountTypeProperty.asset), ObjectLink()) }, Meta()))
         val noLiabilities = createFireflyResponse(AccountArray(listOf(), Meta()))
-        whenever(firefly.accountsApi.listAccount(anyOrNull(), anyOrNull(), anyOrNull())).thenReturn(noLiabilities)
+        whenever(firefly.accountsApi.listAccount(anyOrNull(), anyOrNull(), eq(AccountTypeFilter.asset))).thenReturn(assets)
+        whenever(firefly.accountsApi.listAccount(anyOrNull(), anyOrNull(), eq(AccountTypeFilter.liabilities))).thenReturn(noLiabilities)
         val page = mock<TransactionsGetResponse> { on { transactions } doReturn listOf() }
         whenever(plaid.api.transactionsGet(any<TransactionsGetRequest>())).doSuspendableAnswer {
             val request = it.getArgument<TransactionsGetRequest>(0)

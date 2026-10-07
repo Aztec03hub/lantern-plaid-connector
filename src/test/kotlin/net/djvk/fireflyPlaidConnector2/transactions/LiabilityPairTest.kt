@@ -30,7 +30,7 @@ internal class LiabilityPairTest {
         timeZoneString = "America/New_York",
         transferMatchWindowDays = 3L,
         txStyle = TransactionStyleConfig(null),
-    ).also { it.liabilityAccountIds = liabilities }
+    ).also { c -> c.accountKinds = liabilities.associateWith { AccountKind.LIABILITY } }
 
     private fun plaid(account: String, id: String, amount: Double) =
         PlaidFixtures.getPaymentTransaction(accountId = account, transactionId = id, pendingTransactionId = null, amount = amount, name = "Plaid $id")
@@ -126,5 +126,95 @@ internal class LiabilityPairTest {
         val update = result.updates.single()
         assertThat(update.tx.type).isEqualTo(TransactionTypeProperty.withdrawal)
         assertThat(update.tx.plaidLinks).containsExactly(srcLink.copy(leg = PlaidLinkLeg.single))
+    }
+
+    /** Both banks flip the direction of a payment pair: the withdrawal becomes a deposit, the type is sent, legs swap. */
+    @Test
+    fun aSwappedWithdrawalPairBecomesADepositAndSendsTheType() = runBlocking<Unit> {
+        val result = converter(setOf("2")).convertPollSync(
+            accountMap, listOf(), listOf(plaid(accountA, "wd", -50.0), plaid(accountB, "dep", 50.0)), listOf(), listOf(paidLiability)
+        )
+        // one update per leg, both computed from the same stored state, so identical and idempotent
+        val update = result.updates.first()
+        assertThat(update.tx.type).isEqualTo(TransactionTypeProperty.deposit)
+        assertThat(update.changesType).isTrue()
+        assertThat(update.toTransactionUpdate().transactions!!.single().type).isNotNull
+        assertThat(update.tx.sourceId).isEqualTo("2")
+        assertThat(update.tx.destinationId).isEqualTo("1")
+        assertThat(update.tx.plaidLinks).containsExactlyInAnyOrder(
+            srcLink.copy(leg = PlaidLinkLeg.destination), dstLink.copy(leg = PlaidLinkLeg.source))
+    }
+
+    private fun manual(type: TransactionTypeProperty) = TransactionRead(
+        "transactions", "ff9",
+        FireflyFixtures.getTransaction(
+            type = type, amount = "50.0",
+            // a withdrawal is entered on account 1 (the Plaid leg is the payee side), a deposit on account 2
+            sourceId = if (type == TransactionTypeProperty.withdrawal) "1" else null,
+            destinationId = if (type == TransactionTypeProperty.deposit) "2" else null,
+            sourceName = if (type == TransactionTypeProperty.deposit) "Payer" else null,
+            destinationName = if (type == TransactionTypeProperty.withdrawal) "Payee" else null,
+            plaidLinks = listOf(
+                if (type == TransactionTypeProperty.withdrawal) PlaidLink("wd", PlaidLinkLeg.single, accountA)
+                else PlaidLink("dep", PlaidLinkLeg.single, accountB)
+            ),
+            description = "x", currencyId = "5", currencyCode = "USD",
+        ), ObjectLink()
+    )
+
+    private suspend fun pairedWith(existing: TransactionRead, plaidLeg: net.djvk.fireflyPlaidConnector2.api.plaid.models.Transaction, liabilities: Set<String>) =
+        converter(liabilities).convertPollSync(accountMap, listOf(plaidLeg), listOf(), listOf(), listOf(existing)).updates.single()
+
+    /** convertDoubleFirefly, existing withdrawal on account 1 + Plaid inflow on account 2: one case per row of Firefly's table. */
+    @Test
+    fun anExistingWithdrawalBecomesThePairTypeFireflyAcceptsForItsTwoAccounts() = runBlocking<Unit> {
+        val leg = plaid(accountB, "dep", -50.0)
+        val expected = mapOf(
+            setOf<String>() to Pair(TransactionTypeProperty.transfer, false), // asset -> asset
+            setOf("2") to Pair(TransactionTypeProperty.withdrawal, false),     // asset -> liability
+            setOf("1") to Pair(TransactionTypeProperty.deposit, true),         // liability -> asset
+            setOf("1", "2") to Pair(TransactionTypeProperty.transfer, false),  // liability -> liability
+        )
+        for ((liabilities, want) in expected) {
+            val update = pairedWith(manual(TransactionTypeProperty.withdrawal), leg, liabilities)
+            assertThat(update.tx.type).describedAs("liabilities $liabilities").isEqualTo(want.first)
+            assertThat(update.changesType).describedAs("type sent when it changes, liabilities $liabilities")
+                .isEqualTo(want.second)
+            assertThat(update.tx.plaidLinks!!.map { it.leg }).containsExactlyInAnyOrder(PlaidLinkLeg.source, PlaidLinkLeg.destination)
+        }
+    }
+
+    /** convertDoubleFirefly, existing deposit on account 2 + Plaid outflow on account 1 (the source leg). */
+    @Test
+    fun anExistingDepositBecomesThePairTypeFireflyAcceptsForItsTwoAccounts() = runBlocking<Unit> {
+        val leg = plaid(accountA, "wd", 50.0)
+        val expected = mapOf(
+            setOf<String>() to TransactionTypeProperty.transfer,
+            setOf("2") to TransactionTypeProperty.withdrawal,
+            setOf("1") to TransactionTypeProperty.deposit,
+            setOf("1", "2") to TransactionTypeProperty.transfer,
+        )
+        for ((liabilities, want) in expected) {
+            val update = pairedWith(manual(TransactionTypeProperty.deposit), leg, liabilities)
+            assertThat(update.tx.type).describedAs("liabilities $liabilities").isEqualTo(want)
+            assertThat(update.tx.sourceId).isEqualTo("1")
+            assertThat(update.tx.destinationId).isEqualTo("2")
+            assertThat(update.changesType).describedAs("type sent when it changes, liabilities $liabilities")
+                .isEqualTo(want == TransactionTypeProperty.withdrawal)
+            assertThat(update.tx.plaidLinks!!.map { it.leg }).containsExactlyInAnyOrder(PlaidLinkLeg.source, PlaidLinkLeg.destination)
+        }
+    }
+
+    /** A paired withdrawal or deposit is never a single: each is skipped as a candidate however the Plaid ids are looked up. */
+    @Test
+    fun pairedDepositsAndWithdrawalsAreNeverCandidatesForAnotherPairing() {
+        val depositPair = TransactionRead(
+            "transactions", "ff2",
+            FireflyFixtures.getTransaction(
+                type = TransactionTypeProperty.deposit, amount = "50.0", sourceId = "2", destinationId = "1",
+                plaidLinks = listOf(srcLink.copy(plaidAccountId = accountB), dstLink.copy(plaidAccountId = accountA)),
+            ), ObjectLink()
+        )
+        assertThat(converter(setOf("2")).filterFireflyCandidateTransferTxs(listOf(paidLiability, depositPair))).isEmpty()
     }
 }

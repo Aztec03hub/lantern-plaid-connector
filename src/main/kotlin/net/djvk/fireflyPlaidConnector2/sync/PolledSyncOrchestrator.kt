@@ -244,6 +244,8 @@ class PolledSyncOrchestrator(
         // Firefly still keeps Plaid links (it may have been swapped for a stock one since startup); checked before the
         //  first write, because a stock Firefly would store every create of this poll, and of every poll after, unlinked
         syncHelper.validatePlaidLinksEndpoint()
+        // A liability account added to Firefly since startup is typed correctly from this poll on
+        converter.accountKinds = syncHelper.fetchAccountKinds()
 
         // Writes Firefly rejected in earlier polls are retried first, so a newer write for the same transaction
         //  (below) always lands after the stale one
@@ -504,7 +506,7 @@ class PolledSyncOrchestrator(
             mainJob = launch {
                 val (accountMap, accountAccessTokenSequence, cursorMap) = retryWhileNetworkDown("startup") {
                     syncHelper.setApiCreds()
-                    converter.liabilityAccountIds = syncHelper.fetchLiabilityAccountIds()
+                    converter.accountKinds = syncHelper.fetchAccountKinds()
 
                     // Initialize cursors
                     initializeCursors()

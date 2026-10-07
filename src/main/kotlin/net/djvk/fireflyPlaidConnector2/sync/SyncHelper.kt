@@ -16,6 +16,7 @@ import net.djvk.fireflyPlaidConnector2.transactions.TransactionConverter
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.TransactionsApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.FireflyApiError
 import net.djvk.fireflyPlaidConnector2.config.properties.AccountConfigs
+import net.djvk.fireflyPlaidConnector2.transactions.AccountKind
 import net.djvk.fireflyPlaidConnector2.transactions.FireflyAccountId
 import net.djvk.fireflyPlaidConnector2.transactions.FireflyTransactionDto
 import net.djvk.fireflyPlaidConnector2.util.Utilities.forEachBounded
@@ -66,20 +67,33 @@ class SyncHelper(
     }
 
     /**
-     * The ids of Firefly's liability accounts (credit cards, loans, mortgages), which cannot be an end of a transfer.
-     * Read once at startup; a liability account created later is picked up on the next start.
+     * The kind of every asset and liability account in Firefly (liabilities of any type: debt, loan, mortgage), which
+     * decides the type of a paired transaction. Every configured account must be one of the two, or the connector would
+     * type its transfers wrongly: that stops the start instead. Read at startup, and again each poll.
      */
-    suspend fun fetchLiabilityAccountIds(): Set<String> {
-        val ids = mutableSetOf<String>()
+    suspend fun fetchAccountKinds(): Map<String, AccountKind> {
+        val kinds = mutableMapOf<String, AccountKind>()
+        listAccountIds(AccountTypeFilter.asset).forEach { kinds[it] = AccountKind.ASSET }
+        listAccountIds(AccountTypeFilter.liabilities).forEach { kinds[it] = AccountKind.LIABILITY }
+        val unusable = plaidAccountsConfig.accounts.map { it.fireflyAccountId.toString() }.distinct().filter { it !in kinds }
+        check(unusable.isEmpty()) {
+            "Configured Firefly account(s) ${unusable.joinToString()} are neither an asset nor a liability account " +
+                    "(missing, or another type such as expense or cash). Fix fireflyPlaidConnector2.accounts."
+        }
+        logger.debug("Firefly account kinds: {}", kinds)
+        return kinds
+    }
+
+    private suspend fun listAccountIds(type: AccountTypeFilter): List<String> {
+        val ids = mutableListOf<String>()
         var page = 1
         do {
-            val response = fireflyAccountsApi.listAccount(page, null, AccountTypeFilter.liabilities).body()
-            response.data.forEach { ids.add(it.id) }
+            val response = fireflyAccountsApi.listAccount(page, null, type).body()
+            response.data.mapTo(ids) { it.id }
             val pagination = response.meta.pagination
             val more = pagination != null && pagination.currentPage < pagination.totalPages
             page++
         } while (more)
-        logger.debug("Firefly has {} liability accounts: {}", ids.size, ids)
         return ids
     }
 

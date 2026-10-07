@@ -33,6 +33,19 @@ val fireflyTxTypesEligibleForConversion = hashSetOf(
     TransactionTypeProperty.withdrawal,
 )
 
+/** What Firefly's account_to_transaction table calls an account for typing a transaction: debt, loan and mortgage are all LIABILITY. */
+enum class AccountKind { ASSET, LIABILITY }
+
+/**
+ * The type Firefly gives a transaction between two accounts (core/config/firefly.php, 'account_to_transaction'), for
+ * the pairs this connector creates. Firefly 6.7.7 rejects a transfer typed any other way (422 "Could not find a valid
+ * destination account").
+ */
+fun pairedTransactionType(source: AccountKind, destination: AccountKind): TransactionTypeProperty = when (source) {
+    AccountKind.ASSET -> if (destination == AccountKind.ASSET) TransactionTypeProperty.transfer else TransactionTypeProperty.withdrawal
+    AccountKind.LIABILITY -> if (destination == AccountKind.ASSET) TransactionTypeProperty.deposit else TransactionTypeProperty.transfer
+}
+
 /**
  * True for a Firefly transaction that records both Plaid legs of one movement of money (or one Plaid leg paired with a
  * manually entered transaction): a transfer, or, when one side is a liability, the withdrawal (payment) or deposit
@@ -91,12 +104,11 @@ class TransactionConverter(
     private val logger = LoggerFactory.getLogger(this::class.java)
 
     /**
-     * Firefly ids (as strings) of the liability accounts (credit cards, loans, mortgages). Firefly rejects a transfer
-     * that has one as an end, so a pair involving one is a withdrawal or deposit instead (see
-     * [getFireflyTransactionDtoType]). Loaded once at startup by the runners, see SyncHelper.fetchLiabilityAccountIds.
+     * Firefly account id (as a string) to its kind, which decides the type of a paired transaction (see
+     * [pairedTransactionType]). Loaded by the runners, see SyncHelper.fetchAccountKinds; an id not in it counts as an asset.
      */
     @Volatile
-    var liabilityAccountIds: Set<String> = emptySet()
+    var accountKinds: Map<String, AccountKind> = emptyMap()
 
     private val timeZone = TimeZone.getTimeZone(timeZoneString)
     private val zoneId = timeZone.toZoneId()
@@ -133,6 +145,8 @@ class TransactionConverter(
                     plaidLinks = survivors,
                 )
 
+                // Verified live on Firefly 6.7.7: a deposit from a named unknown source INTO a debt liability is accepted
+                //  (Firefly creates a revenue account for the source), so a liability pair needs no other fallback.
                 PlaidLinkLeg.source -> transfer.copy(
                     type = TransactionTypeProperty.deposit,
                     sourceId = null,
@@ -1104,13 +1118,10 @@ class TransactionConverter(
             // Firefly 6.7.7 refuses a transfer between an asset and a liability account (422 "Could not find a valid
             //  destination account"). Money into a liability is a payment (withdrawal); money out of one is a cash
             //  advance or disbursement (deposit). Two liabilities, or two assets, stay a transfer.
-            val sourceIsLiability = sourceId in liabilityAccountIds
-            val destinationIsLiability = destinationId in liabilityAccountIds
-            return when {
-                destinationIsLiability && !sourceIsLiability -> TransactionTypeProperty.withdrawal
-                sourceIsLiability && !destinationIsLiability -> TransactionTypeProperty.deposit
-                else -> TransactionTypeProperty.transfer
-            }
+            return pairedTransactionType(
+                accountKinds[sourceId] ?: AccountKind.ASSET,
+                accountKinds[destinationId] ?: AccountKind.ASSET,
+            )
         }
 
         /**

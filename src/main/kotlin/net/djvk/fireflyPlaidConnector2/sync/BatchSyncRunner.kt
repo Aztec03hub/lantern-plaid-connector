@@ -61,7 +61,7 @@ class BatchSyncRunner(
 
         runBlocking {
             syncHelper.setApiCreds()
-            converter.liabilityAccountIds = syncHelper.fetchLiabilityAccountIds()
+            converter.accountKinds = syncHelper.fetchAccountKinds()
             val (accountMap, accountAccessTokenSequence) = syncHelper.getAllPlaidAccessTokenAccountIdSets()
             // Each Plaid Item is fetched on its own, all of them at once (a few Items, each a run of sequential pages)
             val fetched = coroutineScope {
