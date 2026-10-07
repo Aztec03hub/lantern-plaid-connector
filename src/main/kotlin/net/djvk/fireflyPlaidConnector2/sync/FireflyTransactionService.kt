@@ -105,8 +105,8 @@ class FireflyTransactionService(
      * post, and a transfer's second leg can arrive long after its first, so the Firefly transactions a poll refers to
      * may be older than the pull window.
      *
-     * This resolves the ones for [plaidTransactionIds] that aren't already in [alreadyFetched]: one link lookup per 500
-     * ids (`GET /plaid-links`), then one read per Firefly transaction found. A failed lookup propagates: swallowing it
+     * This resolves the ones for [plaidTransactionIds] that aren't already in [alreadyFetched]: one link lookup per
+     * [PlaidLinksApi.MAX_IDS] ids (`GET /plaid-links`), then one read per Firefly transaction found. A failed lookup propagates: swallowing it
      * would let the caller commit its Plaid cursor over a change that was never applied.
      */
     suspend fun fetchMissingByPlaidId(
@@ -161,14 +161,16 @@ class FireflyTransactionService(
         for (update in updates) {
             // An update that adds a Plaid leg to a transaction Firefly no longer has (404) creates that leg on its own
             //  instead, so its money is not hidden behind a failed update. A pairing (the update makes a transfer) does
-            //  that on a 422 too: the existing transaction stays as it was and the new leg is recorded nowhere else. A
-            //  pending to posted update does NOT: after a 422 the pending transaction still holds that money, and this
-            //  sync's removal of the pending id was shielded, so a posted create beside it would count it twice.
+            //  that on ANY permanent rejection: the existing transaction stays as it was and the new leg is recorded
+            //  nowhere else, and as a group-keyed update letter the new leg would be invisible to Plaid's later events
+            //  and lost when a retry finds the group deleted. A pending to posted update does NOT: after a 422 the
+            //  pending transaction still holds that money, and this sync's removal of the pending id was shielded, so a
+            //  posted create beside it would count it twice.
             val fallback = update.fallbackCreate
             guarded(
                 DeadLetter("update", update.transactionId, update.id, update.tx, update.changesType),
                 instead = fallback?.let { { createGuarded(it) } },
-                insteadOn = if (update.tx.type == TransactionTypeProperty.transfer) setOf(404, 422) else setOf(404),
+                insteadOn = if (update.tx.type == TransactionTypeProperty.transfer) permanent4xx else setOf(404),
             ) {
                 syncHelper.updateBatchInFirefly(listOf(update))
             }
@@ -191,6 +193,12 @@ class FireflyTransactionService(
     }
 
     companion object {
+        /** 401/403 mean the Firefly credentials are wrong for every transaction; 408/429 are transient. */
+        private val notPermanent4xx = setOf(401, 403, 408, 429)
+
+        /** The 4xx answers that reject one write for good (409 is handled before these, as "already recorded"). */
+        private val permanent4xx = (400..499).toSet() - notPermanent4xx - 409
+
         /** What identifies a create in the dead letter file: its first Plaid id, so a later Plaid event for it finds it. */
         fun letterKey(split: net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionSplit): String =
             split.plaidLinks?.firstOrNull()?.plaidTransactionId ?: ""
@@ -272,8 +280,7 @@ class FireflyTransactionService(
                 instead()
                 return false
             }
-            // 401/403 mean the Firefly credentials are wrong for every transaction; 408/429 are transient
-            if (store == null || status !in 400..499 || status in setOf(401, 403, 408, 429)) throw cre
+            if (store == null || status !in permanent4xx) throw cre
             if (status == 404 && letter.operation != "create") {
                 logger.warn(
                     "Firefly transaction ${letter.fireflyId} no longer exists; dropping the ${letter.operation} of ${letter.key}"

@@ -205,6 +205,36 @@ class FireflyTransactionServiceTest {
     }
 
     @Test
+    fun aPairingUpdateRejectedWithAnyOtherPermanent4xxAlsoCreatesTheFallbackAndKeepsNoLetter() = runBlocking<Unit> {
+        // Review r2 (F6): kept as a group-keyed update letter, the new leg was hidden from reviseDeadLetteredCreates and
+        //  lost for good when a later retry got 404 (the letter is dropped and has no fallback)
+        for (status in listOf(HttpStatusCode.BadRequest, HttpStatusCode.PayloadTooLarge)) {
+            val (store, service) = serviceWithStore()
+            val fallback = linked("leg2")
+            val pairing = linked("leg1").tx.copy(type = TransactionTypeProperty.transfer)
+            whenever(syncHelper.updateBatchInFirefly(any())).doSuspendableAnswer { throw statusError(status) }
+
+            service.processFireflyTransactionUpdates(listOf(), listOf(FireflyTransactionDto("ff1", pairing, fallbackCreate = fallback)), listOf())
+
+            verify(syncHelper, atLeastOnce()).optimisticInsertBatchIntoFirefly(eq(listOf(fallback)))
+            assertThat(store.read()).describedAs("HTTP $status").isEmpty()
+            clearInvocations(syncHelper)
+        }
+    }
+
+    @Test
+    fun aPairingUpdateRejectedWithATransientStatusIsNotReplacedByTheFallback() = runBlocking<Unit> {
+        val (_, service) = serviceWithStore()
+        val pairing = linked("leg1").tx.copy(type = TransactionTypeProperty.transfer)
+        whenever(syncHelper.updateBatchInFirefly(any())).doSuspendableAnswer { throw statusError(HttpStatusCode.TooManyRequests) }
+
+        org.junit.jupiter.api.assertThrows<ClientRequestException> {
+            runBlocking { service.processFireflyTransactionUpdates(listOf(), listOf(FireflyTransactionDto("ff1", pairing, fallbackCreate = linked("leg2"))), listOf()) }
+        }
+        verify(syncHelper, never()).optimisticInsertBatchIntoFirefly(any())
+    }
+
+    @Test
     fun aPendingToPostedUpdateThatGets422IsDeadLetteredAndTheFallbackIsNotCreated() = runBlocking<Unit> {
         // The pending transaction still holds the money and this sync's removal of the pending id was shielded:
         //  creating the posted one beside it would count the same money twice

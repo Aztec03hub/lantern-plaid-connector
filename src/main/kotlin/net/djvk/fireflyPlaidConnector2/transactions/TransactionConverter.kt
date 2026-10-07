@@ -337,7 +337,10 @@ class TransactionConverter(
         existingFireflyTxs: List<TransactionRead>,
     ): ConvertPollSyncResult {
         logger.trace("Starting ${::convertPollSync.name}")
+        val deletedPlaidIds = plaidDeletedTxs.toSet()
+        // A transaction Plaid removes in this sync is deleted below: a new leg paired onto it would be deleted with it
         val transferCandidateExistingFireflyTxs = filterFireflyCandidateTransferTxs(existingFireflyTxs)
+            .filter { candidate -> candidate.tx.plaidLinks.orEmpty().none { it.plaidTransactionId in deletedPlaidIds } }
 
         val creates = mutableListOf<FireflyTransactionDto>()
         val updates = mutableListOf<FireflyTransactionDto>()
@@ -511,7 +514,6 @@ class TransactionConverter(
         /**
          * Handle Plaid deletes
          */
-        val deletedPlaidIds = plaidDeletedTxs.toSet()
         val handledRemovals = mutableSetOf<FireflyTransactionId>()
         for (plaidDeleteId in plaidDeletedTxs) {
             val target = indexer.find(plaidDeleteId)

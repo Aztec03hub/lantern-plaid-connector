@@ -25,7 +25,8 @@ data class FireflyTransactionDto(
     val changesType: Boolean = false,
     /**
      * For an update that adds a Plaid leg to an existing transaction (pairing, or pending to posted): what to create
-     * instead if the transaction is gone (404), or, for a pairing only, if Firefly rejects the update (422), so the new
+     * instead if the transaction is gone (404), or, for a pairing only, if Firefly rejects the update for good (any 4xx
+     * but 401/403/408/409/429), so the new
      * leg's money is never hidden behind a rejected update (see FireflyTransactionService.processFireflyTransactionUpdates).
      */
     val fallbackCreate: FireflyTransactionDto? = null,

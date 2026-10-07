@@ -169,4 +169,21 @@ internal class R3ConverterTest {
         val update = result.updates.single()
         assertThat(update.tx.plaidLinks).containsExactly(wdLink, depLink)
     }
+
+    /**
+     * Review r2: Plaid removes the existing withdrawal in the same sync in which the other bank's deposit arrives. The
+     * deposit used to be paired onto it (PUT to a transfer) and the removal then DELETED that transfer, the deposit's money
+     * with it. A transaction removed in this sync is no pairing candidate: the deposit is created on its own.
+     */
+    @Test
+    fun aNewLegIsNotPairedOntoATransactionPlaidRemovesInTheSameSync() = runBlocking<Unit> {
+        val result = converter().convertPollSync(
+            accountMap, listOf(plaid(accountB, "dep", -50.0)), listOf(), listOf("wd"),
+            listOf(existing("ff1", TransactionTypeProperty.withdrawal, listOf(PlaidLink("wd", PlaidLinkLeg.single, accountA))))
+        )
+
+        assertThat(result.deletes).containsExactly("ff1")
+        assertThat(result.updates).isEmpty()
+        assertThat(result.creates.single().tx.plaidLinks).containsExactly(PlaidLink("dep", PlaidLinkLeg.single, accountB))
+    }
 }
