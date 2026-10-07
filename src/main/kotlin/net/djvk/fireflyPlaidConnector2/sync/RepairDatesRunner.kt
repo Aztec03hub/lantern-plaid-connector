@@ -82,9 +82,8 @@ data class OpeningFix(
     val changes: Boolean get() {
         if (skipReason != null) return false
         val newAmount = newOpening ?: BigDecimal.ZERO
-        // A liability's sign is Firefly's to decide (direction), so only the amount owed is compared
-        val amountDiffers = (oldOpening ?: BigDecimal.ZERO).let { if (liabilityDirection != null) it.abs() else it }
-            .compareTo(if (liabilityDirection != null) newAmount.abs() else newAmount) != 0
+        // Signed: a debit liability is negative and a credit one positive, in what is sent and in what Firefly echoes
+        val amountDiffers = (oldOpening ?: BigDecimal.ZERO).compareTo(newAmount) != 0
         // The date of an opening of zero means nothing
         return legacyGroupIds.isNotEmpty() || amountDiffers || (newAmount.signum() != 0 && oldOpeningDate != newOpeningDate)
     }
@@ -451,9 +450,9 @@ class RepairDatesRunner(
             // A 2xx does not prove Firefly stored it: read the account back before the legacy journals go
             val stored = fireflyAccountsApi.getAccount(o.fireflyAccountId.toString(), null).body().data.attributes
             val storedAmount = stored.openingBalance?.toBigDecimalOrNull() ?: BigDecimal.ZERO
-            // The sign of a liability opening is Firefly's (its direction decides), so only the amount is compared there
-            val sameAmount = if (o.liabilityDirection != null) storedAmount.abs().compareTo(amount.abs()) == 0 else storedAmount.compareTo(amount) == 0
-            check(sameAmount && (amount.signum() == 0 || stored.openingBalanceDate?.toLocalDate() == date)) {
+            // Signed on purpose: what was sent carries the direction's sign (debit negative, credit positive), and Firefly
+            //  must echo exactly that. A wrong sign would put the ledger off by twice the debt, so it stops before any delete.
+            check(storedAmount.compareTo(amount) == 0 && (amount.signum() == 0 || stored.openingBalanceDate?.toLocalDate() == date)) {
                 "Firefly did not store the opening balance of account ${o.fireflyAccountId} (sent $amount on $date, it holds " +
                         "$storedAmount on ${stored.openingBalanceDate}); the legacy opening journals were NOT deleted"
             }

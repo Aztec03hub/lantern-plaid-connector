@@ -520,5 +520,20 @@ internal class DatesAndOpeningsRepairTest {
         assertThat(b.newOpeningDate).isEqualTo(a.newOpeningDate)
     }
 
+    @Test
+    fun aDebitLoanIsOnlyUnchangedWhenFireflyEchoesTheNegativeSign() {
+        val legacyDate = LocalDate.of(2025, 4, 1)
+        fun withOpening(echo: String) = plan(
+            listOf(), listOf(),
+            accounts = mapOf(2 to account(ShortAccountTypeProperty.liabilities, "Loan", LiabilityDirection.debit, opening = echo, openingDate = midnight(legacyDate))),
+        ).openings
+        // no legacy journal and no Plaid balance: nothing to repair, whatever the sign
+        assertThat(withOpening("-100.00")).isEmpty()
+        // with a legacy journal still present the account is always replaced; the signed compare is the OpeningFix's own
+        val fix = OpeningFix(2, "Loan", java.math.BigDecimal("100.00"), legacyDate, java.math.BigDecimal.ZERO, listOf(), java.math.BigDecimal("-100.00"), legacyDate, "debit")
+        assertThat(fix.changes).isTrue() // an echoed +100 against the expected -100 is a difference, not a match
+        assertThat(fix.copy(oldOpening = java.math.BigDecimal("-100.00")).changes).isFalse()
+    }
+
     // endregion
 }

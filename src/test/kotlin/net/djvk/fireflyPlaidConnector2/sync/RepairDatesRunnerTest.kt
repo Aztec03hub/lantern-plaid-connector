@@ -290,9 +290,20 @@ internal class RepairDatesRunnerTest {
     }
 
     @Test
-    fun aLiabilityOpeningIsAcceptedWhateverSignFireflyEchoesBack() = runBlocking<Unit> {
+    fun aWrongSignEchoedForALiabilityStopsBeforeAnyDelete() = runBlocking<Unit> {
         noExpenseAccounts()
-        storedOpening("33051.60", LocalDate.of(2025, 3, 31)) // sent -33051.60 for a debit loan; the amount owed is what matters
+        storedOpening("33051.60", LocalDate.of(2025, 3, 31)) // sent -33051.60 for a debit loan, Firefly holds the opposite sign
+        val failure = runCatching {
+            runner().applyPlan(RepairPlan(listOf(), 0, listOf(fix(null, "-33051.60", listOf("g9"), "debit"))))
+        }.exceptionOrNull()
+        assertThat(failure).hasMessageContaining("did not store")
+        verify(syncHelper, never()).deleteBatchInFirefly(any())
+    }
+
+    @Test
+    fun theSignFireflyEchoesForADebitLoanIsAcceptedWhenItMatches() = runBlocking<Unit> {
+        noExpenseAccounts()
+        storedOpening("-33051.60", LocalDate.of(2025, 3, 31))
         runner().applyPlan(RepairPlan(listOf(), 0, listOf(fix(null, "-33051.60", listOf("g9"), "debit"))))
         verify(syncHelper).deleteBatchInFirefly(listOf("g9"))
     }
