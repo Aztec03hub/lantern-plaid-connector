@@ -66,7 +66,8 @@ data class ScheduledFlow(val from: Int, val to: Int, val cents: Long, val dayOfM
 data class PairingConfig(
     val markerDays: Int = 5,
     val fallbackDays: Int = 10,
-    val autoMin: Int = 6,
+    // Calibrated 2026-10-07 on Phil's real fixtures: TRUE pairs score 6..10, real traps at most 2 (twin crossings excluded).
+    val autoMin: Int = 4,
     val reviewMin: Int = 3,
     val outMarkers: List<Marker> = PairDefaults.outMarkers,
     val inMarkers: List<Marker> = PairDefaults.inMarkers,

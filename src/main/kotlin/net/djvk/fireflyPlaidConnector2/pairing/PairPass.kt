@@ -34,7 +34,7 @@ class PairSettings(
     @Value("\${fireflyPlaidConnector2.pair.lookbackDays:3650}") val lookbackDays: Long = 3650,
     @Value("\${fireflyPlaidConnector2.pair.markerDays:5}") val markerDays: Int = 5,
     @Value("\${fireflyPlaidConnector2.pair.fallbackDays:10}") val fallbackDays: Int = 10,
-    @Value("\${fireflyPlaidConnector2.pair.autoMin:6}") val autoMin: Int = 6,
+    @Value("\${fireflyPlaidConnector2.pair.autoMin:4}") val autoMin: Int = 4,
     @Value("\${fireflyPlaidConnector2.pair.reviewMin:3}") val reviewMin: Int = 3,
     /** Settle by the per-bank watermark (4.4). Off for the repair mode, which decides everything already read. */
     @Value("\${fireflyPlaidConnector2.pair.useWatermark:false}") val useWatermark: Boolean = false,
