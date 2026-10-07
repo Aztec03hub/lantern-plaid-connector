@@ -61,6 +61,8 @@ data class OpeningFix(
     val missing: List<PlaidTransaction> = listOf(),
     /** Set when the new opening moves by more than the account's listed pending total plus 1.00; shown, still applied. */
     val sanityNote: String? = null,
+    /** Set when the amount was kept because the balance moved by more than Plaid's transactions explain. */
+    val keptAmount: String? = null,
 ) {
     val changes: Boolean get() = skipReason == null && (legacyGroupIds.isNotEmpty() ||
             oldOpening?.compareTo(newOpening ?: BigDecimal.ZERO) != 0 || oldOpeningDate != newOpeningDate)
@@ -86,7 +88,12 @@ data class RepairInput(
 )
 
 /** The pure decisions of the repair: no I/O, so they are tested on their own. */
-class RepairPlanner(private val converter: TransactionConverter, private val zoneId: ZoneId) {
+class RepairPlanner(
+    private val converter: TransactionConverter,
+    private val zoneId: ZoneId,
+    /** Firefly account ids whose opening amount may move even when the anchor sanity check fails (gap confirmed by a person). */
+    private val reanchor: Set<Int> = setOf(),
+) {
     private fun isLegacyOpening(s: net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionSplit) =
         s.description == OPENING_BALANCE_DESCRIPTION || s.description == LEGACY_DCU_OPENING ||
                 s.externalId?.startsWith("dcu-stmt:opening") == true
@@ -213,6 +220,11 @@ class RepairPlanner(private val converter: TransactionConverter, private val zon
         val sanity = if (current != null && moved > pendingTotal + BigDecimal.ONE)
             "opening moves ${previous.toPlainString()} -> ${opening.toPlainString()} (${moved.setScale(2, RoundingMode.HALF_UP)}), more than the listed pending " +
                     "total ${pendingTotal.setScale(2, RoundingMode.HALF_UP)} + 1.00: check it" else null
+        // Plaid's balance can include money its transaction list has not caught up with yet (a deposit that posted
+        //  today). A move the pending items do not explain keeps the old amount; the date still moves.
+        val keep = sanity != null && id !in reanchor && (oldOpening != null || legacy.isNotEmpty()) &&
+                !(isLiability && direction != "credit" && opening.signum() > 0)
+        val finalOpening = if (keep) previous else opening
         val skip = when {
             legacy.isEmpty() && current == null -> "nothing to repair"
             missing.isNotEmpty() && current != null -> "SKIPPED: ${missing.size} Plaid transactions missing from Firefly (run a sync first)"
@@ -221,7 +233,9 @@ class RepairPlanner(private val converter: TransactionConverter, private val zon
                 "a debit liability needs a positive opening (${opening.toPlainString()}), which Firefly forces to negative; set it by hand"
             else -> null
         }
-        return OpeningFix(id, name, oldOpening, oldDate, legacySum, legacyIds, opening, date, direction, skip, missing, sanity)
+        val kept = if (keep) "KEPT AMOUNT ${previous.toPlainString()}: balance moved by ${moved.setScale(2, RoundingMode.HALF_UP)} " +
+                "that Plaid's transactions don't explain yet; re-run after the next sync (or list the account in repair.reanchor)" else null
+        return OpeningFix(id, name, oldOpening, oldDate, legacySum, legacyIds, finalOpening, date, direction, skip, missing, sanity, kept)
     }
 }
 
@@ -254,10 +268,13 @@ class RepairDatesRunner(
     /** How far back Plaid is asked for transactions (Plaid keeps at most about 24 months). */
     @Value("\${fireflyPlaidConnector2.repair.days:800}")
     private val repairDays: Int = 800,
+    /** Comma separated Firefly account ids that may be re-anchored although the balance moved unexplained. */
+    @Value("\${fireflyPlaidConnector2.repair.reanchor:}")
+    reanchorIds: String = "",
 ) : Runner {
     private val logger = LoggerFactory.getLogger(this::class.java)
     private val zoneId = ZoneId.of(timeZoneString)
-    private val planner = RepairPlanner(converter, zoneId)
+    private val planner = RepairPlanner(converter, zoneId, reanchorIds.split(",").mapNotNull { it.trim().toIntOrNull() }.toSet())
 
     override fun run() = runBlocking<Unit> {
         syncHelper.setApiCreds()
@@ -332,6 +349,7 @@ class RepairDatesRunner(
                 println("      missing from Firefly: ${it.date} ${it.transactionId} ${it.amount} ${it.name.take(40)}")
             }
             o.sanityNote?.let { println("      ANCHOR SANITY: $it") }
+            o.keptAmount?.let { println("      $it") }
         }
         println("== Firefly balance vs Plaid posted balance (Plaid current with its listed pending items backed out)")
         for ((id, current) in input.plaidCurrent.toSortedMap()) {

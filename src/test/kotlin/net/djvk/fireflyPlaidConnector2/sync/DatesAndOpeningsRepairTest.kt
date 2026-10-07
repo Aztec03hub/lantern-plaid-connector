@@ -130,6 +130,10 @@ internal class DatesAndOpeningsRepairTest {
 
     private val planner = RepairPlanner(converter(), zone)
 
+    private fun plan(reanchor: Set<Int>, journals: List<TransactionRead>, plaidTxs: List<PlaidTransaction>, current: Map<Int, Double>,
+                     accounts: Map<Int, AccountRead>) =
+        RepairPlanner(converter(), zone, reanchor).plan(RepairInput(journals, plaidTxs.associateBy { it.transactionId }, current, accounts, mapOf(plaidAccount to 1)))
+
     private fun plan(journals: List<TransactionRead>, plaidTxs: List<PlaidTransaction>, current: Map<Int, Double> = mapOf(),
                      accounts: Map<Int, AccountRead> = mapOf()) =
         planner.plan(RepairInput(journals, plaidTxs.associateBy { it.transactionId }, current, accounts, mapOf(plaidAccount to 1)))
@@ -207,9 +211,10 @@ internal class DatesAndOpeningsRepairTest {
             source = null, destination = "1", description = OPENING_BALANCE_DESCRIPTION,
         )
         // account 1 spent 10.00 (withdrawal from account 1); Plaid says it holds 500.00 now
+        // 390 away from the old opening: only a confirmed re-anchor moves the amount (otherwise it is kept, see below)
         val p = plan(
-            listOf(legacy, journal("g1", midnight(day), "w1")), listOf(plaid("w1", day)),
-            current = mapOf(1 to 500.0), accounts = mapOf(1 to account(ShortAccountTypeProperty.asset, "Checking")),
+            setOf(1), listOf(legacy, journal("g1", midnight(day), "w1")), listOf(plaid("w1", day)),
+            mapOf(1 to 500.0), mapOf(1 to account(ShortAccountTypeProperty.asset, "Checking")),
         )
         val o = p.openings.single()
         assertThat(o.newOpening!!.toPlainString()).isEqualTo("510.00") // 500 + the 10 it spent
@@ -281,6 +286,31 @@ internal class DatesAndOpeningsRepairTest {
         assertThat(p.openings.single().sanityNote).isNull()
     }
 
+    private fun unlisted(reanchor: Set<Int>): OpeningFix {
+        val day = LocalDate.of(2024, 12, 6)
+        // Plaid's balance (3160) includes a 3,745 payroll that its transaction list does not have yet
+        return plan(
+            reanchor, listOf(journal("g1", midnight(day), "w1")), listOf(plaid("w1", day)), mapOf(1 to 3160.30),
+            mapOf(1 to account(ShortAccountTypeProperty.asset, "Checking", opening = "2729.09", openingDate = midnight(day.minusDays(10)))),
+        ).openings.single()
+    }
+
+    @Test
+    fun aBalanceThatMovedByMoreThanTheTransactionsExplainKeepsTheAmountAndMovesTheDate() {
+        val o = unlisted(setOf())
+        assertThat(o.newOpening!!.toPlainString()).isEqualTo("2729.09")
+        assertThat(o.newOpeningDate).isEqualTo(LocalDate.of(2024, 12, 5))
+        assertThat(o.keptAmount).startsWith("KEPT AMOUNT 2729.09")
+        assertThat(o.changes).isTrue() // the date moved
+    }
+
+    @Test
+    fun aListedAccountIsReAnchoredEvenWhenTheBalanceMovedUnexplained() {
+        val o = unlisted(setOf(1))
+        assertThat(o.newOpening!!.toPlainString()).isEqualTo("3170.30")
+        assertThat(o.keptAmount).isNull()
+    }
+
     @Test
     fun anOpeningThatMovesByMoreThanThePendingTotalIsFlagged() {
         val day = LocalDate.of(2024, 12, 6)
@@ -290,7 +320,7 @@ internal class DatesAndOpeningsRepairTest {
             accounts = mapOf(1 to account(ShortAccountTypeProperty.asset, "Checking", opening = "100.00", openingDate = midnight(day.minusDays(1)))),
         )
         assertThat(p.openings.single().sanityNote).contains("510.00")
-        assertThat(p.openings.single().changes).isTrue() // flagged, still applied
+        assertThat(p.openings.single().newOpening!!.toPlainString()).isEqualTo("100.00") // kept: the move is unexplained
     }
 
     @Test
