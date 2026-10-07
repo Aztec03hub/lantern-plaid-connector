@@ -76,6 +76,12 @@ class LoanInterestRunner(
     tolerance: Double = 0.05,
     @Value("\${fireflyPlaidConnector2.repair.apply:false}")
     private val apply: Boolean = false,
+    /**
+     * Write nothing for a loan whose gap the payments don't explain, and retry next run (the nightly job sets this).
+     * A routed payment imported before Plaid's loan balance moves looks exactly like that, and fixes itself a day later.
+     */
+    @Value("\${fireflyPlaidConnector2.loan.holdUnexplained:false}")
+    private val holdUnexplained: Boolean = false,
 ) : Runner {
     private val zone = ZoneId.of(timeZoneString)
     private val tolerance = BigDecimal.valueOf(tolerance)
@@ -168,6 +174,7 @@ class LoanInterestRunner(
         val off = gap - sum
         val explained = off.abs() <= BigDecimal.valueOf(max(tolerance.toDouble(), sum.toDouble() * 0.005))
         if (lines.isEmpty() || !explained) {
+            if (holdUnexplained) return done("HELD: payments explain $sum of the gap $gap; nothing written, retried next run")
             return done("UNEXPLAINED: payments explain $sum of the gap $gap; ${money(off)} goes to \"$UNEXPLAINED\"", lines, off)
         }
         // the last line takes the cents so that the total is exactly the gap

@@ -73,7 +73,7 @@ internal class LoanInterestRunnerTest {
     private fun interest(id: String, amount: String, payAmount: String, date: LocalDate) =
         journal(id, amount, date, "Interest on $name payment of $$payAmount", interest = true)
 
-    private fun runner(plaidOwed: String, rows: List<TransactionRead>, apply: Boolean = true): LoanInterestRunner {
+    private fun runner(plaidOwed: String, rows: List<TransactionRead>, apply: Boolean = true, hold: Boolean = false): LoanInterestRunner {
         val cfg = File(dir, "pair.json").also {
             it.writeText("""{"loans":[{"account":2,"apr":7.59,"interestAccount":"Interest: DCU Lexus NX loan"}]}""")
         }
@@ -103,7 +103,7 @@ internal class LoanInterestRunnerTest {
                 createFireflyResponse(TransactionSingle(rows.first()))
             }
         }
-        return LoanInterestRunner(syncHelper, plaid.wrapper, accountsApi, txApi, "America/Chicago", cfg.path, 0.05, apply)
+        return LoanInterestRunner(syncHelper, plaid.wrapper, accountsApi, txApi, "America/Chicago", cfg.path, 0.05, apply, hold)
     }
 
     private fun stored(): List<TransactionStore> = runBlocking {
@@ -167,6 +167,14 @@ internal class LoanInterestRunnerTest {
         assertThat(all[1].destinationName).isEqualTo("Unexplained loan change")
         assertThat(all[1].sourceId).isEqualTo("2")
         assertThat(all[1].tags).containsExactly("lantern-unexplained")
+    }
+
+    @Test
+    fun holdUnexplainedWritesNothingForAGapThePaymentsDoNotExplain() = runBlocking<Unit> {
+        owedBefore[d(8, 31)] = "23817.37"
+        val plan = runner("23717.37", chargedThenNew, hold = true).runOnce().single()
+        assertThat(plan.action).startsWith("HELD")
+        assertThat(stored()).isEmpty()
     }
 
     @Test
