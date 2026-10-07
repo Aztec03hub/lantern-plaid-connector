@@ -154,16 +154,17 @@ internal class SyncCorrectnessTest {
     }
 
     @Test
-    fun moreThanOneHundredMissingIdsAreAllLookedUpInOneBatch() = runBlocking<Unit> {
+    fun manyMissingIdsAreLookedUpInChunksNotOneSearchEach() = runBlocking<Unit> {
         val empty = lookup()
         whenever(plaidLinksApi.lookupPlaidLinks(any())).thenReturn(empty)
 
         service.fetchMissingByPlaidId((1..250).map { "id$it" }, listOf())
 
-        // one request per 500 ids, no per-id searches (the old scheme made two searches per id)
+        // one request per chunk of ids, no per-id searches (the old scheme made two searches per id)
         val ids = argumentCaptor<List<String>>()
-        verify(plaidLinksApi, times(1)).lookupPlaidLinks(ids.capture())
-        assertThat(ids.firstValue).hasSize(250)
+        verify(plaidLinksApi, times(5)).lookupPlaidLinks(ids.capture())
+        assertThat(ids.allValues.map { it.size }).containsOnly(PlaidLinksApi.MAX_IDS)
+        assertThat(ids.allValues.flatten()).hasSize(250)
     }
 
     @Test

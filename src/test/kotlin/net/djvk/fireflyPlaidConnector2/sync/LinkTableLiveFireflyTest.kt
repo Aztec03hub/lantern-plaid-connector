@@ -387,6 +387,55 @@ internal class LinkTableLiveFireflyTest {
         cleanup(listOf(after))
     }
 
+    /** A sign flip changes the type and both accounts, keeps the link, and repeating it changes nothing. */
+    @Test
+    fun aSignFlipChangesTheTypeAndTheAccountsInBothDirectionsAndKeepsTheLink() = runBlocking<Unit> {
+        creds()
+        val store = DeadLetterStore(dir.toString())
+        val orchestrator = orchestrator(store)
+
+        poll(orchestrator, created = listOf(plaid(plaidA, "flipw$run", 20.0)))
+        poll(orchestrator, updated = listOf(plaid(plaidA, "flipw$run", -20.0)))
+        val w = mine("flipw$run").single().attributes.transactions.single()
+        println("LINKLIVE flip w->d: ${w.type} ${w.sourceId}/${w.sourceName} -> ${w.destinationId}")
+        assertThat(w.type).isEqualTo(TransactionTypeProperty.deposit)
+        assertThat(w.destinationId).isEqualTo(accountA)
+        assertThat(w.sourceId).isNotEqualTo(accountA)
+        assertThat(w.plaidLinks).containsExactly(PlaidLink("flipw$run", PlaidLinkLeg.single, plaidA))
+
+        poll(orchestrator, created = listOf(plaid(plaidA, "flipd$run", -45.0)))
+        poll(orchestrator, updated = listOf(plaid(plaidA, "flipd$run", 45.0)))
+        poll(orchestrator, updated = listOf(plaid(plaidA, "flipd$run", 45.0)))
+        val d = mine("flipd$run").single().attributes.transactions.single()
+        assertThat(d.type).isEqualTo(TransactionTypeProperty.withdrawal)
+        assertThat(d.sourceId).isEqualTo(accountA)
+        assertThat(d.destinationId).isNotEqualTo(accountA)
+        cleanup(mine("flipw$run"), mine("flipd$run"))
+    }
+
+    /** What the user edited in Firefly (description, reconciled flag, own tags, category) survives a Plaid update. */
+    @Test
+    fun aPlaidUpdateKeepsTheUsersEdits() = runBlocking<Unit> {
+        creds()
+        val store = DeadLetterStore(dir.toString())
+        val orchestrator = orchestrator(store)
+        poll(orchestrator, created = listOf(plaid(plaidA, "edit$run", 15.0)))
+        val group = mine("edit$run").single().id
+        api("PUT", "transactions/$group", """{"apply_rules":false,"transactions":[{"transaction_journal_id":"${mine("edit$run").single().attributes.transactions.single().transactionJournalId}","description":"my words","category_name":"Mine $run","tags":["user-tag"],"reconciled":true}]}""")
+
+        poll(orchestrator, updated = listOf(plaid(plaidA, "edit$run", 16.0)))
+
+        val s = mine("edit$run").single().attributes.transactions.single()
+        println("LINKLIVE edits kept: ${s.description} ${s.categoryName} ${s.tags} reconciled=${s.reconciled} amount=${s.amount}")
+        assertThat(s.amount.toDouble()).isEqualTo(16.0)
+        assertThat(s.description).isEqualTo("my words")
+        assertThat(s.categoryName).isEqualTo("Mine $run")
+        assertThat(s.tags).contains("user-tag")
+        assertThat(s.reconciled).isTrue()
+        assertThat(s.plaidLinks).containsExactly(PlaidLink("edit$run", PlaidLinkLeg.single, plaidA))
+        cleanup(mine("edit$run"))
+    }
+
     /** A write Firefly really rejects (422) is still dead-lettered; a 409 never is. */
     @Test
     fun aRejectedWriteIsDeadLetteredByItsPlaidId() = runBlocking<Unit> {
@@ -444,7 +493,7 @@ internal class LinkTableLiveFireflyTest {
         assertThat(store.read()).isEmpty()
     }
 
-    /** A lookup of more than 500 ids is refused by Firefly; the connector chunks. */
+    /** 500 ids in one lookup is a 414 from Firefly's server; the connector chunks smaller, and a bigger call is refused locally. */
     @Test
     fun aLookupOfMoreThanFiveHundredIdsIsChunked() = runBlocking<Unit> {
         creds()
@@ -452,6 +501,7 @@ internal class LinkTableLiveFireflyTest {
         val ids = (1..1203).map { "nope$run$it" }
         assertThat(service.heldPlaidIds(ids)).isEmpty()
         assertThatThrownBy { runBlocking { linksApi.lookupPlaidLinks(ids) } }.isInstanceOf(IllegalArgumentException::class.java)
+        assertThat(linksApi.lookupPlaidLinks(ids.take(PlaidLinksApi.MAX_IDS)).body().data).isEmpty()
     }
 
     /** The stock Firefly (no link table) must stop the connector at startup. Needs LANTERN_LIVE_STOCK_FIREFLY_URL and _TOKEN. */

@@ -219,13 +219,16 @@ class FireflyTransactionServiceTest {
     // region link lookups
 
     @Test
-    fun fetchMissingByPlaidIdMakesOneLookupPer500IdsAndOneReadPerDistinctGroup() = runBlocking<Unit> {
-        val ids = (1..1200).map { "id$it" }
-        // id1 and id2 are the two legs of one transfer (group g1); id501 is group g2; id1001 is group g3
+    fun fetchMissingByPlaidIdMakesOneLookupPerChunkOfIdsAndOneReadPerDistinctGroup() = runBlocking<Unit> {
+        val max = PlaidLinksApi.MAX_IDS
+        val ids = (1..max * 2 + max / 2).map { "id$it" }
+        // id1 and id2 are the two legs of one transfer (group g1); the first id of the second chunk is group g2; of the third g3
+        val second = "id${max + 1}"
+        val third = "id${2 * max + 1}"
         val rowsByFirst = mapOf(
             "id1" to listOf(row("id1", "g1"), row("id2", "g1")),
-            "id501" to listOf(row("id501", "g2")),
-            "id1001" to listOf(row("id1001", "g3")),
+            second to listOf(row(second, "g2")),
+            third to listOf(row(third, "g3")),
         )
         whenever(plaidLinksApi.lookupPlaidLinks(any())).doSuspendableAnswer { call ->
             @Suppress("UNCHECKED_CAST")
@@ -241,7 +244,7 @@ class FireflyTransactionServiceTest {
         assertEquals(listOf("g1", "g2", "g3"), found.map { it.id })
         val chunks = argumentCaptor<List<String>>()
         verify(plaidLinksApi, times(3)).lookupPlaidLinks(chunks.capture())
-        assertEquals(listOf(500, 500, 200), chunks.allValues.map { it.size })
+        assertEquals(listOf(max, max, max / 2), chunks.allValues.map { it.size })
         verify(fireflyTxApi, times(3)).getTransaction(any())
         verify(fireflyTxApi, times(1)).getTransaction("g1")
     }
@@ -276,8 +279,9 @@ class FireflyTransactionServiceTest {
     }
 
     @Test
-    fun heldPlaidIdsChunksAt500AndReturnsOnlyTheHeldOnes() = runBlocking<Unit> {
-        val ids = (1..1001).map { "id$it" } + "id1" // one duplicate
+    fun heldPlaidIdsChunksAtTheLookupLimitAndReturnsOnlyTheHeldOnes() = runBlocking<Unit> {
+        val max = PlaidLinksApi.MAX_IDS
+        val ids = (1..2 * max + 1).map { "id$it" } + "id1" // one duplicate
         whenever(plaidLinksApi.lookupPlaidLinks(any())).doSuspendableAnswer { call ->
             @Suppress("UNCHECKED_CAST")
             val chunk = call.arguments[0] as List<String>
@@ -289,7 +293,7 @@ class FireflyTransactionServiceTest {
         assertEquals(ids.distinct().filter { it.endsWith("7") }.toSet(), held)
         val chunks = argumentCaptor<List<String>>()
         verify(plaidLinksApi, times(3)).lookupPlaidLinks(chunks.capture())
-        assertEquals(listOf(500, 500, 1), chunks.allValues.map { it.size })
+        assertEquals(listOf(max, max, 1), chunks.allValues.map { it.size })
         verifyNoInteractions(fireflyTxApi)
     }
 

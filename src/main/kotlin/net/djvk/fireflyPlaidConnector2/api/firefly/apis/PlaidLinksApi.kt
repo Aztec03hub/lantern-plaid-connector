@@ -23,7 +23,7 @@ open class PlaidLinksApi(
 ) : ApiClient(baseUrl, httpClientEngine, httpClientConfig, jsonBlock) {
 
     /**
-     * Where each of [plaidTransactionIds] is stored (1 to [MAX_IDS] ids). Ids Firefly does not hold are simply absent
+     * Where each of [plaidTransactionIds] is stored (1 to [MAX_IDS] ids per call; callers chunk). Ids Firefly does not hold are simply absent
      * from the result. A stock Firefly has no such route and answers 404.
      */
     @Suppress("UNCHECKED_CAST")
@@ -55,7 +55,10 @@ open class PlaidLinksApi(
     }
 
     companion object {
-        /** The most ids Firefly resolves in one lookup. */
-        const val MAX_IDS = 500
+        /**
+         * Ids per lookup. Firefly resolves up to 500, but they travel in the query string and Plaid ids are ~37 characters:
+         * measured 2026-10-07, 500 ids is a 414 (URI too long) from the PHP server, so lookups are sent in small chunks.
+         */
+        const val MAX_IDS = 50
     }
 }
