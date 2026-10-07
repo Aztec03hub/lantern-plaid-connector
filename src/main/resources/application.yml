@@ -107,6 +107,9 @@ fireflyPlaidConnector2:
 #    url: https://firefly.yourdomain.com
     # Can be created in Firefly in Options->Profile->Oauth->Personal Access Tokens
 #    personalAccessToken: TOKAAAAAN
+    # How many transactions are created in Firefly at once within one sync. Firefly takes 0.2-1.5 s per create, so the
+    #  writes are the slow part of a big import. Set 1 to write one at a time. Updates and deletes are always sequential.
+    writeConcurrency: 8
   plaid:
 #    url: https://production.plaid.com
 #    clientId: HI I'M A CLIENT ID

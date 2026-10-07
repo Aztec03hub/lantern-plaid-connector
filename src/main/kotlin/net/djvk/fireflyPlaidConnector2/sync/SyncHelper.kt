@@ -18,7 +18,9 @@ import net.djvk.fireflyPlaidConnector2.api.firefly.models.FireflyApiError
 import net.djvk.fireflyPlaidConnector2.config.properties.AccountConfigs
 import net.djvk.fireflyPlaidConnector2.transactions.FireflyAccountId
 import net.djvk.fireflyPlaidConnector2.transactions.FireflyTransactionDto
+import net.djvk.fireflyPlaidConnector2.util.Utilities.forEachBounded
 import net.djvk.fireflyPlaidConnector2.versionManagement.VersionComparison
+import java.util.concurrent.atomic.AtomicInteger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.stereotype.Component
@@ -45,6 +47,10 @@ class SyncHelper(
     private val fireflyTxApi: TransactionsApi,
     private val fireflyAccountsApi: AccountsApi,
     private val fireflyPlaidLinksApi: PlaidLinksApi,
+
+    /** How many creates run at once, see [forEachBounded]; 1 writes one at a time. */
+    @Value("\${fireflyPlaidConnector2.firefly.writeConcurrency:8}")
+    val writeConcurrency: Int = 8,
 ) {
     private val logger = LoggerFactory.getLogger(this::class.java)
 
@@ -151,21 +157,23 @@ class SyncHelper(
         if (fireflyTxs.isNotEmpty()) {
             logger.debug("Optimistic insert of ${fireflyTxs.size} txs into Firefly")
         }
-        var created = 0
-        var timedOut = 0
-        var firstTimeout: ConnectTimeoutException? = null
-        for (fireflyTx in fireflyTxs) {
+        // The creates are independent (each carries its own Plaid ids, and a pair is one create), so they run up to
+        //  [writeConcurrency] at a time; the link table's 409 is what makes any overlap safe.
+        val created = AtomicInteger(0)
+        val timedOut = AtomicInteger(0)
+        val firstTimeout = java.util.concurrent.atomic.AtomicReference<ConnectTimeoutException?>(null)
+        fireflyTxs.forEachBounded(writeConcurrency) { fireflyTx ->
             val plaidIds = fireflyTx.tx.plaidLinks.orEmpty().map { it.plaidTransactionId }
             try {
                 if (insertIntoFirefly(fireflyTx)) {
-                    created++
-                    if (created % 100 == 0) {
-                        logger.debug("Insert of tx index $created successful")
+                    val n = created.incrementAndGet()
+                    if (n % 100 == 0) {
+                        logger.debug("Insert of tx index $n successful")
                     }
                 }
             } catch (cre: ClientRequestException) {
                 when (cre.response.status) {
-                    HttpStatusCode.Conflict -> created += insertUnconflictedLegs(fireflyTx, plaidIds, cre)
+                    HttpStatusCode.Conflict -> created.addAndGet(insertUnconflictedLegs(fireflyTx, plaidIds, cre))
                     HttpStatusCode.UnprocessableEntity -> {
                         val error = cre.response.body<FireflyApiError>()
                         // A transaction with no Plaid link (the batch opening balance) is deduped by Firefly's content hash
@@ -183,17 +191,16 @@ class SyncHelper(
                 // Keep going so one timeout doesn't block the rest, but remember it: silently skipping would lose
                 //  the transaction for good once the caller commits its Plaid cursor.
                 logger.error("Timeout inserting firefly tx $plaidIds; will fail this batch", e)
-                firstTimeout = firstTimeout ?: e
-                timedOut++
+                firstTimeout.compareAndSet(null, e)
+                timedOut.incrementAndGet()
             }
         }
-        if (firstTimeout != null) {
+        firstTimeout.get()?.let {
             throw java.io.IOException(
-                "$timedOut of ${fireflyTxs.size} Firefly inserts timed out; the caller must retry this batch",
-                firstTimeout
+                "${timedOut.get()} of ${fireflyTxs.size} Firefly inserts timed out; the caller must retry this batch", it
             )
         }
-        return created
+        return created.get()
     }
 
     /**

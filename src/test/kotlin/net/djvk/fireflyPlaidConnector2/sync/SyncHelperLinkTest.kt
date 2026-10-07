@@ -55,8 +55,9 @@ internal class SyncHelperLinkTest {
         }
     }
 
-    private fun helper() = SyncHelper(
+    private fun helper(writeConcurrency: Int = 8) = SyncHelper(
         AccountConfigs(emptyList()), "token", firefly.aboutApi, firefly.transactionsApi, firefly.accountsApi, firefly.plaidLinksApi,
+        writeConcurrency,
     )
 
     private fun statusError(status: HttpStatusCode, body: String = "{}"): ClientRequestException = runBlocking {
@@ -192,8 +193,10 @@ internal class SyncHelperLinkTest {
             throw statusError(HttpStatusCode.UnprocessableEntity, """{"message":"duplicate of transaction #5","exception":"x","errors":{}}""")
         }
 
-        val e = runCatching { helper().optimisticInsertBatchIntoFirefly(listOf(dto("a"), dto("b"))) }.exceptionOrNull()
+        val e = runCatching { helper(writeConcurrency = 1).optimisticInsertBatchIntoFirefly(listOf(dto("a"), dto("b"))) }.exceptionOrNull()
 
+        // One at a time, nothing after the rejected create is sent; with concurrency N, up to N-1 neighbours are already
+        //  in flight, which is safe because every create is guarded by the link table
         assertThat(e).describedAs("a linked transaction is never skipped on a 422").isInstanceOf(ClientRequestException::class.java)
         verify(firefly.transactionsApi, times(1)).storeTransaction(any())
     }

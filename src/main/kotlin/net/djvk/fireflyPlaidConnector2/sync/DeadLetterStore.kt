@@ -13,6 +13,7 @@ import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.nio.file.attribute.PosixFilePermissions
+import kotlinx.coroutines.sync.withLock
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.io.path.Path
 
@@ -57,6 +58,9 @@ class DeadLetterStore(
 
     private val unreadable = AtomicInteger(0)
 
+    /** [add] and [remove] read, change and rewrite the whole file, so concurrent creates must not interleave them. */
+    private val writeLock = kotlinx.coroutines.sync.Mutex()
+
     /**
      * How many times the file was found unreadable (and moved aside) since this was last asked; resets to 0. The poll
      * reports it in the result callback, so a lost dead letter file is never silent.
@@ -87,14 +91,16 @@ class DeadLetterStore(
 
     /** Adds [letter], replacing any earlier one with the same operation and key. */
     suspend fun add(letter: DeadLetter) {
-        write(read().filterNot { it.operation == letter.operation && it.key == letter.key } + letter)
+        writeLock.withLock {
+            write(read().filterNot { it.operation == letter.operation && it.key == letter.key } + letter)
+        }
     }
 
     /**
      * Drops the letters for [operation] and [key] (the write finally went through). A delete also drops every other
      * letter for the same Firefly transaction: an update of something that no longer exists can never succeed.
      */
-    suspend fun remove(operation: String, key: String) {
+    suspend fun remove(operation: String, key: String) = writeLock.withLock {
         val all = read()
         val remaining = all.filterNot {
             (it.operation == operation && it.key == key) || (operation == "delete" && it.fireflyId == key)

@@ -10,6 +10,7 @@ import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionTypePropert
 import net.djvk.fireflyPlaidConnector2.transactions.FireflyTransactionDto
 import net.djvk.fireflyPlaidConnector2.transactions.PlaidLinkIndexer
 import net.djvk.fireflyPlaidConnector2.transactions.isPaired
+import net.djvk.fireflyPlaidConnector2.util.Utilities.forEachBounded
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.stereotype.Component
@@ -151,10 +152,11 @@ class FireflyTransactionService(
         updates: List<FireflyTransactionDto>,
         deletes: List<String>
     ): Int {
-        var notCreated = 0
-        // Insert new transactions
-        for (create in creates) {
-            if (!createGuarded(create)) notCreated++
+        // Insert new transactions, a few at a time (see SyncHelper.writeConcurrency). Updates and deletes follow
+        //  sequentially: an update may target what a create just made, and its fallback is itself a create.
+        val notCreated = java.util.concurrent.atomic.AtomicInteger(0)
+        creates.forEachBounded(syncHelper.writeConcurrency) { create ->
+            if (!createGuarded(create)) notCreated.incrementAndGet()
         }
 
         // Process updates. This includes converting an existing deposit/withdrawal into a transfer, which is an in-place
@@ -181,7 +183,7 @@ class FireflyTransactionService(
         for (id in deletes) {
             guarded(DeadLetter("delete", id, id)) { syncHelper.deleteBatchInFirefly(listOf(id)) }
         }
-        return notCreated
+        return notCreated.get()
     }
 
     /** @return true if [create] made a new Firefly transaction (false: dead-lettered, or already imported) */
