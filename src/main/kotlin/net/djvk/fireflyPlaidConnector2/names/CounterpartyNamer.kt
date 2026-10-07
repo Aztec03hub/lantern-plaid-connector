@@ -32,6 +32,8 @@ class CounterpartyNamer(private val aliases: Map<String, String> = mapOf()) {
         s = s.substringBefore(": ").takeIf { raw.contains(": ") && !Regex("(?i)\\b(type|id|co):").containsMatchIn(raw) } ?: s
         s = s.replace(Regex("(?i)\\b(type|id|co|ind id|ind name|trace|orig id):.*$"), "")
         s = s.replace(Regex("^(?i)((ac|ach|ppd|web|ccd|pos|sq \\*|tst\\* |paypal \\*|debit card purchase|purchase authorized on \\d{2}/\\d{2})\\s+)+"), "")
+        // a masked account number ("XXXX0373W") and whatever follows it
+        s = s.replace(Regex("\\s+[Xx*]{2,}\\d+\\w*.*$"), "")
         // from the first long digit run (trace and id numbers) on, drop everything
         s = s.replace(Regex("\\s*[Xx*#]*\\d{5,}.*$"), "")
         // store numbers, locations and terminal words: "TARGET T-1234 CHICAGO IL"

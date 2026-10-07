@@ -436,7 +436,7 @@ internal class R2ConverterTest {
         val tx = result.updates.single().tx
         assertThat(tx.description).isEqualTo("FINAL MERCHANT NAME")
         assertThat(tx.plaidLinks).containsExactly(PlaidLink("posted", PlaidLinkLeg.single, accountA))
-        assertThat(tx.destinationName).isEqualTo("FINAL MERCHANT NAME")
+        assertThat(tx.destinationName).isEqualTo("Final Merchant Name")
         assertThat(result.deletes).isEmpty()
     }
 

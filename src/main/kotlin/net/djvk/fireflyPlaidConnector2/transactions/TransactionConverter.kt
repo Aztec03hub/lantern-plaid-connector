@@ -10,6 +10,7 @@ import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionTypePropert
 import net.djvk.fireflyPlaidConnector2.api.plaid.PlaidTransactionId
 import net.djvk.fireflyPlaidConnector2.config.properties.TransactionStyleConfig
 import net.djvk.fireflyPlaidConnector2.constants.Direction
+import net.djvk.fireflyPlaidConnector2.names.CounterpartyNamer
 import net.djvk.fireflyPlaidConnector2.transactions.PersonalFinanceCategoryEnum.Primary.*
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Value
@@ -100,8 +101,15 @@ class TransactionConverter(
      */
     @Value("\${fireflyPlaidConnector2.pendingTag:}")
     private val pendingTag: String = "",
+
+    /** Optional JSON file of payee display names (`{"RAW OR KEY": "Display"}`); blank or missing means no aliases. */
+    @Value("\${fireflyPlaidConnector2.names.aliasFile:}")
+    aliasFile: String = "",
 ) {
     private val logger = LoggerFactory.getLogger(this::class.java)
+
+    /** One name per payee: every spelling Plaid sends for the same payee lands in one Firefly account. */
+    val namer: CounterpartyNamer = CounterpartyNamer.fromFile(aliasFile)
 
     /**
      * Firefly account id (as a string) to its kind, which decides the type of a paired transaction (see
@@ -280,10 +288,11 @@ class TransactionConverter(
         tx: PlaidTransaction,
         isSource: Boolean,
     ): String {
+        if (useNameForDestination) {
+            return namer.canonical(tx.counterparties?.firstOrNull()?.name ?: tx.merchantName, tx.name).take(255)
+        }
         return tx.merchantName
-            ?: if (useNameForDestination) {
-                tx.name.take(255)
-            } else {
+            ?: run {
                 if (tx.personalFinanceCategory == null) {
                     return "Unknown"
                 }
