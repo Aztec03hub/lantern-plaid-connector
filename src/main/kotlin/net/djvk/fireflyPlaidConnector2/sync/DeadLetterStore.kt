@@ -111,6 +111,9 @@ class DeadLetterStore(
     companion object {
         /** A letter Firefly keeps rejecting is retried this many times, then abandoned (reported, not retried). */
         const val maxAttempts = 10
+
+        /** The message of a letter that a pairing pass wrote before deleting a leg; see TransferReconciler. */
+        const val PAIRING_IN_PROGRESS = "pairing in progress"
     }
 
     private suspend fun write(letters: List<DeadLetter>) = withContext(Dispatchers.IO) {

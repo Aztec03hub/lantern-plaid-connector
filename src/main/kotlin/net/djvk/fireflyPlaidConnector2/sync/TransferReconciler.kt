@@ -35,8 +35,8 @@ import kotlin.math.abs
  *
  * A merge is two writes: (a) the deposit-side journal is deleted, which frees its Plaid link; (b) the withdrawal-side
  * journal is updated to the pair type with both accounts and both links. A dead letter that re-creates the deleted leg
- * is written first and removed after (b), so a crash between the two leaves the leg to be re-created by the next poll's
- * dead letter retry (or the next import) and paired again by the next pass.
+ * is written first and removed after (b), so a crash between the two leaves the leg to be re-created at the start of
+ * the next pairing pass (only a pass retries these letters, see retryDeadLetters) and paired again by that pass.
  *
  * Passes run one at a time: an OS file lock in the persistence directory (shared by every process that uses that
  * directory, which is where importers coordinate; a Firefly-side advisory lock would also cover importers on other
@@ -80,7 +80,7 @@ class TransferReconciler(
         if (!enabled && !force) return 0
         return withPairingLock {
             // A leg whose pairing was cut short comes back first, so this pass pairs it again
-            fireflyTransactionService.retryDeadLetters()
+            fireflyTransactionService.retryDeadLetters(pairing = true)
             val existing = fireflyTransactionService.fetchFireflyTransactionsBetween(start, end, MAX_PAGES)
             val configured = syncHelper.getAllPlaidAccessTokenAccountIdSets().first.values.toSet()
             val merges = plan(existing, configured)
@@ -151,7 +151,7 @@ class TransferReconciler(
         val recreate = converter.recreateOf(drop.tx)
         val update = converter.mergeSingles(keep, drop)
 
-        deadLetterStore.add(DeadLetter("create", dropPlaidId, null, recreate, false, "pairing in progress"))
+        deadLetterStore.add(DeadLetter("create", dropPlaidId, null, recreate, false, DeadLetterStore.PAIRING_IN_PROGRESS))
         syncHelper.deleteBatchInFirefly(listOf(drop.transactionId))
         try {
             syncHelper.updateBatchInFirefly(listOf(update))

@@ -213,10 +213,14 @@ class FireflyTransactionService(
      * retries have failed, after which they are abandoned: no longer retried, but still in the file and still reported.
      * A create whose Plaid id is already in Firefly answers 409 and is dropped rather than inserted again.
      */
-    suspend fun retryDeadLetters() {
+    suspend fun retryDeadLetters(pairing: Boolean = false) {
         val store = deadLetters ?: return
         for (letter in store.read()) {
             if (letter.abandoned) continue
+            // A pairing letter is owned by the pairing pass (it holds the pairing lock): sent from anywhere else it could
+            //  meet the leg it protects still in Firefly (409, letter dropped) just before the pass deletes that leg.
+            //  The pass in turn retries nothing else, so it cannot send a create a poll is about to revise.
+            if ((letter.message == DeadLetterStore.PAIRING_IN_PROGRESS) != pairing) continue
             if (letter.operation == "create" && letter.split?.plaidLinks.isNullOrEmpty()) {
                 // Written by a build from before the link table: sent now it would be unprotected against duplicates
                 logger.error(

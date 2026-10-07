@@ -301,6 +301,37 @@ internal class TransferReconcilerTest {
     }
 
     @Test
+    fun aPollsRetryLeavesAPairingLetterAloneWhileItsLegIsStillInFirefly() = runBlocking<Unit> {
+        // the pass has written the letter and not yet deleted the leg; a poll's retry (no pairing lock) must not 409-drop it
+        val setup = Setup()
+        setup.helper.optimisticInsertBatchIntoFirefly(setup.converter.convertBatchSync(allTxs.filter { it.accountId == plaidAccount('b') }, accountMap))
+        val leg = setup.firefly.journals.values.single { s -> s.plaidLinks.orEmpty().any { it.plaidTransactionId == "t1b" } }
+        setup.store.add(DeadLetter("create", "t1b", null, setup.converter.recreateOf(leg), false, "pairing in progress"))
+        setup.service.retryDeadLetters()
+        assertThat(setup.store.read().map { it.key }).containsExactly("t1b")
+    }
+
+    @Test
+    fun theReconcilePassRetriesNothingButItsOwnLetters() = runBlocking<Unit> {
+        // a create Firefly rejected earlier: the poll revises it after the writes, so the pass must not send it first
+        val setup = Setup()
+        val rejected = setup.converter.convertBatchSync(allTxs.filter { it.transactionId == "s1" }, accountMap).single()
+        setup.store.add(DeadLetter("create", "s1", null, rejected.tx, false, "HTTP 422: x"))
+        setup.reconciler.reconcile(LocalDate.now().minusDays(30), LocalDate.now().plusDays(1))
+        assertThat(setup.firefly.journals).isEmpty()
+        assertThat(setup.store.read().map { it.key }).containsExactly("s1")
+    }
+
+    @Test
+    fun aRecreatedLegNamesNoJournal() {
+        val tx = TransactionSplit(
+            type = TransactionTypeProperty.deposit, date = java.time.OffsetDateTime.now(), amount = "5", description = "d",
+            sourceId = "1", destinationId = "2", transactionJournalId = "77",
+        )
+        assertThat(Setup().converter.recreateOf(tx).transactionJournalId).isNull()
+    }
+
+    @Test
     fun theUsersEditsOnTheKeptJournalSurvive() = runBlocking<Unit> {
         val setup = Setup()
         setup.run('a')

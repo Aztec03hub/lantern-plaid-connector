@@ -797,6 +797,7 @@ class TransactionConverter(
         plaidLinks = tx.plaidLinks,
         reconciled = false,
         order = 0,
+        transactionJournalId = null, // the journal it named is deleted; a create must not name one
     )
 
     /** See the companion's [survivingLeg]. */
