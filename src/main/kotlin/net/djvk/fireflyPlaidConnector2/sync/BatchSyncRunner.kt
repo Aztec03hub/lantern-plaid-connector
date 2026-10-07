@@ -1,6 +1,9 @@
 package net.djvk.fireflyPlaidConnector2.sync
 
 import io.ktor.client.plugins.*
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.runBlocking
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.AccountsApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.AccountRead
@@ -60,70 +63,15 @@ class BatchSyncRunner(
             syncHelper.setApiCreds()
             converter.liabilityAccountIds = syncHelper.fetchLiabilityAccountIds()
             val (accountMap, accountAccessTokenSequence) = syncHelper.getAllPlaidAccessTokenAccountIdSets()
-            for ((accessToken, accountIds) in accountAccessTokenSequence) {
-                logger.debug("Fetching Plaid data for access token ${redactAccessToken(accessToken)} and account ids ${accountIds.joinToString()}")
-                var offset = 0
-                do {
-                    /**
-                     * Iterate through batches of Plaid transactions
-                     *
-                     * We're storing all this data in memory so we can try to match up offsetting transfers before inserting
-                     *  into Firefly.
-                     * Note that the heap size may need to be increased if you're handling a ton of transactions.
-                     */
-                    /**
-                     * Iterate through batches of Plaid transactions
-                     *
-                     * We're storing all this data in memory so we can try to match up offsetting transfers before inserting
-                     *  into Firefly.
-                     * We don't use fireflyPlaidConnector2.transferMatchWindowDays here because if we did we'd have to
-                     *  do some complex rolling window shenanigans that I have no interest in implementing, and it's
-                     *  easy to run batch mode once on a high-spec machine.
-                     * Note that the heap size may need to be increased if you're handling a ton of transactions.
-                     */
-                    val request = TransactionsGetRequest(
-                        accessToken,
-                        startDate,
-                        endDate,
-                        null,
-                        TransactionsGetRequestOptions(
-                            accountIds,
-                            plaidBatchSize,
-                            offset,
-                            includeOriginalDescription = true,
-                            includePersonalFinanceCategoryBeta = false,
-                            includePersonalFinanceCategory = true,
-                        )
-                    )
-                    val plaidTxs: List<Transaction>
-                    try {
-                        plaidTxs = plaidApiWrapper.executeRequest(
-                            { plaidApi -> plaidApi.transactionsGet(request) },
-                            "transaction get request"
-                        ).body().transactions
-                        logger.debug("\tReceived a batch of ${plaidTxs.size} Plaid transactions")
-                    } catch (cre: ClientRequestException) {
-                        // The request object holds the access token, so don't log it
-                        logger.error(
-                            "Error requesting Plaid transactions for access token ${redactAccessToken(accessToken)} " +
-                                    "at offset $offset"
-                        )
-                        throw cre
-                    }
-                    allPlaidTxs
-                        .getOrPut(accessToken) { mutableListOf() }
-                        .addAll(plaidTxs)
-
-                    /**
-                     * No dupe lookup here: every create carries its Plaid links, and Firefly's link table refuses
-                     *  (409) one that is already imported, which the insert treats as "already imported".
-                     */
-
-                    offset += plaidTxs.size
-
-                    // Keep going until we get all the transactions
-                } while (plaidTxs.size == plaidBatchSize)
-                logger.debug("Done fetching Plaid data for access token ${redactAccessToken(accessToken)} and account ids ${accountIds.joinToString()}")
+            // Each Plaid Item is fetched on its own, all of them at once (a few Items, each a run of sequential pages)
+            val fetched = coroutineScope {
+                accountAccessTokenSequence.toList()
+                    .map { (accessToken, accountIds) -> async { accessToken to fetchTransactions(accessToken, accountIds, startDate, endDate) } }
+                    .awaitAll()
+            }
+            // Joined in the order of the configured Items, so the conversion sees the same list as a serial fetch would give
+            for ((accessToken, txs) in fetched) {
+                allPlaidTxs.getOrPut(accessToken) { mutableListOf() }.addAll(txs)
             }
 
             // Map Plaid transactions to Firefly transactions
@@ -138,6 +86,79 @@ class BatchSyncRunner(
             }
         }
     }
+
+    /** All of one Plaid Item's transactions between [startDate] and [endDate], page after page. */
+    private suspend fun fetchTransactions(
+        accessToken: PlaidAccessToken,
+        accountIds: List<PlaidAccountId>,
+        startDate: LocalDate,
+        endDate: LocalDate,
+    ): List<Transaction> {
+        val result = mutableListOf<Transaction>()
+        logger.debug("Fetching Plaid data for access token ${redactAccessToken(accessToken)} and account ids ${accountIds.joinToString()}")
+        var offset = 0
+        do {
+            /**
+             * Iterate through batches of Plaid transactions
+             *
+             * We're storing all this data in memory so we can try to match up offsetting transfers before inserting
+             *  into Firefly.
+             * Note that the heap size may need to be increased if you're handling a ton of transactions.
+             */
+            /**
+             * Iterate through batches of Plaid transactions
+             *
+             * We're storing all this data in memory so we can try to match up offsetting transfers before inserting
+             *  into Firefly.
+             * We don't use fireflyPlaidConnector2.transferMatchWindowDays here because if we did we'd have to
+             *  do some complex rolling window shenanigans that I have no interest in implementing, and it's
+             *  easy to run batch mode once on a high-spec machine.
+             * Note that the heap size may need to be increased if you're handling a ton of transactions.
+             */
+            val request = TransactionsGetRequest(
+                accessToken,
+                startDate,
+                endDate,
+                null,
+                TransactionsGetRequestOptions(
+                    accountIds,
+                    plaidBatchSize,
+                    offset,
+                    includeOriginalDescription = true,
+                    includePersonalFinanceCategoryBeta = false,
+                    includePersonalFinanceCategory = true,
+                )
+            )
+            val plaidTxs: List<Transaction>
+            try {
+                plaidTxs = plaidApiWrapper.executeRequest(
+                    { plaidApi -> plaidApi.transactionsGet(request) },
+                    "transaction get request"
+                ).body().transactions
+                logger.debug("\tReceived a batch of ${plaidTxs.size} Plaid transactions")
+            } catch (cre: ClientRequestException) {
+                // The request object holds the access token, so don't log it
+                logger.error(
+                    "Error requesting Plaid transactions for access token ${redactAccessToken(accessToken)} " +
+                            "at offset $offset"
+                )
+                throw cre
+            }
+            result.addAll(plaidTxs)
+
+            /**
+             * No dupe lookup here: every create carries its Plaid links, and Firefly's link table refuses
+             *  (409) one that is already imported, which the insert treats as "already imported".
+             */
+
+            offset += plaidTxs.size
+
+            // Keep going until we get all the transactions
+        } while (plaidTxs.size == plaidBatchSize)
+        logger.debug("Done fetching Plaid data for access token ${redactAccessToken(accessToken)} and account ids ${accountIds.joinToString()}")
+        return result
+    }
+
 
     suspend fun setInitialBalances(
         allPlaidTxs: Map<PlaidAccessToken, List<Transaction>>,
