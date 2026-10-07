@@ -58,6 +58,7 @@ class BatchSyncRunner(
 
         runBlocking {
             syncHelper.setApiCreds()
+            converter.liabilityAccountIds = syncHelper.fetchLiabilityAccountIds()
             val (accountMap, accountAccessTokenSequence) = syncHelper.getAllPlaidAccessTokenAccountIdSets()
             for ((accessToken, accountIds) in accountAccessTokenSequence) {
                 logger.debug("Fetching Plaid data for access token ${redactAccessToken(accessToken)} and account ids ${accountIds.joinToString()}")

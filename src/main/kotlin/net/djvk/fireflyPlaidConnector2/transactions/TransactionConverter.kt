@@ -33,6 +33,15 @@ val fireflyTxTypesEligibleForConversion = hashSetOf(
     TransactionTypeProperty.withdrawal,
 )
 
+/**
+ * True for a Firefly transaction that records both Plaid legs of one movement of money (or one Plaid leg paired with a
+ * manually entered transaction): a transfer, or, when one side is a liability, the withdrawal (payment) or deposit
+ * (cash advance, disbursement) Firefly accepts there. Firefly 6.7.7 refuses a `transfer` to or from a liability.
+ * The links tell them apart from a plain withdrawal/deposit, whose one link has the `single` leg.
+ */
+fun TransactionSplit.isPaired(): Boolean =
+    type == TransactionTypeProperty.transfer || plaidLinks.orEmpty().any { it.leg != PlaidLinkLeg.single }
+
 @Component
 class TransactionConverter(
     @Value("\${fireflyPlaidConnector2.useNameForDestination:true}")
@@ -80,6 +89,15 @@ class TransactionConverter(
     private val pendingTag: String = "",
 ) {
     private val logger = LoggerFactory.getLogger(this::class.java)
+
+    /**
+     * Firefly ids (as strings) of the liability accounts (credit cards, loans, mortgages). Firefly rejects a transfer
+     * that has one as an end, so a pair involving one is a withdrawal or deposit instead (see
+     * [getFireflyTransactionDtoType]). Loaded once at startup by the runners, see SyncHelper.fetchLiabilityAccountIds.
+     */
+    @Volatile
+    var liabilityAccountIds: Set<String> = emptySet()
+
     private val timeZone = TimeZone.getTimeZone(timeZoneString)
     private val zoneId = timeZone.toZoneId()
 
@@ -104,7 +122,7 @@ class TransactionConverter(
          */
         fun survivingLeg(transfer: TransactionSplit, removedPlaidId: String): TransactionSplit? {
             val links = transfer.plaidLinks.orEmpty()
-            if (transfer.type != TransactionTypeProperty.transfer || links.size !in 1..2) return null
+            if (!transfer.isPaired() || links.size !in 1..2) return null
             val removed = links.firstOrNull { it.plaidTransactionId == removedPlaidId } ?: return null
             val survivors = links.filter { it !== removed }.map { it.copy(leg = PlaidLinkLeg.single) }
             return when (removed.leg) {
@@ -428,7 +446,7 @@ class TransactionConverter(
                         if (target == null) converted.copy(fallbackCreate = fallback)
                         else FireflyTransactionDto(
                             converted.id, preserveUserFields(converted.tx, target, keepCounterparty = false),
-                            fallbackCreate = fallback,
+                            changesType = converted.changesType, fallbackCreate = fallback,
                         )
                     } else {
                         convertDoublePlaid(
@@ -483,11 +501,13 @@ class TransactionConverter(
             val existingSplit = target.attributes.transactions.singleOrNull()
             updates.add(
                 when {
-                    existingSplit?.type == TransactionTypeProperty.transfer -> {
+                    existingSplit != null && existingSplit.isPaired() -> {
                         val swap = shouldSwapTransfer(plaidUpdate, existingSplit, accountMap, plaidUpdatedTxs, target.id, needsReview)
+                        val leg = transferLegUpdate(convertedUpdate.tx, plaidUpdate, existingSplit, swap)
                         FireflyTransactionDto(
                             target.id,
-                            preserveUserFields(transferLegUpdate(convertedUpdate.tx, plaidUpdate, existingSplit, swap), target),
+                            preserveUserFields(leg, target),
+                            changesType = typeChange(leg, existingSplit),
                         )
                     }
 
@@ -532,7 +552,7 @@ class TransactionConverter(
             val split = target.attributes.transactions.singleOrNull()
             val legIds = split?.plaidLinks.orEmpty().map { it.plaidTransactionId }
             // A transfer with one link was paired with a manually entered transaction: the user's own side is never deleted
-            if (split?.type == TransactionTypeProperty.transfer && legIds.isNotEmpty() &&
+            if (split != null && split.isPaired() && legIds.isNotEmpty() &&
                 (legIds.size == 1 || !deletedPlaidIds.containsAll(legIds))
             ) {
                 // Plaid removed ONE leg of a transfer made from two Plaid transactions. The other leg's money is still
@@ -598,7 +618,7 @@ class TransactionConverter(
         val relinked = existingSplit.plaidLinks.orEmpty().map {
             if (it.plaidTransactionId == pendingId) it.copy(plaidTransactionId = posted.transactionId, plaidAccountId = posted.accountId) else it
         }
-        if (existingSplit.type == TransactionTypeProperty.transfer) {
+        if (existingSplit.isPaired()) {
             // The pending transaction became one leg of a transfer; that transfer is the posted one's record too.
             //  Creating a single for it would record the same money twice.
             val swap = shouldSwapTransfer(posted, existingSplit, accountMap, listOf(), target.id, needsReview)
@@ -606,6 +626,7 @@ class TransactionConverter(
             return FireflyTransactionDto(
                 target.id,
                 preserveUserFields(leg.copy(plaidLinks = if (swap) swapLegs(relinked) else relinked), target),
+                changesType = typeChange(leg, existingSplit),
             )
         }
         if (existingSplit.type != getFireflyTransactionDtoType(posted, false)) {
@@ -686,6 +707,14 @@ class TransactionConverter(
             logger.info("Plaid transaction {} reversed the direction of its transfer; swapping source and destination", plaidTx.transactionId)
         }
         return converted.copy(
+            // A transfer's update does not send its type. A pair with a liability end is a withdrawal or deposit that
+            //  keeps its type, except that a swap flips it (see [typeChange])
+            type = when {
+                existingSplit.type == TransactionTypeProperty.transfer -> converted.type
+                !swap -> existingSplit.type
+                existingSplit.type == TransactionTypeProperty.withdrawal -> TransactionTypeProperty.deposit
+                else -> TransactionTypeProperty.withdrawal
+            },
             sourceId = if (swap) existingSplit.destinationId else existingSplit.sourceId,
             sourceName = null,
             destinationId = if (swap) existingSplit.sourceId else existingSplit.destinationId,
@@ -694,6 +723,10 @@ class TransactionConverter(
             plaidLinks = if (swap) swapLegs(existingSplit.plaidLinks.orEmpty()) else null,
         )
     }
+
+    /** True when [leg] flips a paired withdrawal/deposit to the other (a transfer's type is never changed or needed). */
+    private fun typeChange(leg: TransactionSplit, existing: TransactionSplit): Boolean =
+        existing.type != TransactionTypeProperty.transfer && leg.type != existing.type
 
     /** The same links with `source` and `destination` traded, for a transfer whose direction flipped. */
     private fun swapLegs(links: List<PlaidLink>): List<PlaidLink> = links.map {
@@ -734,7 +767,7 @@ class TransactionConverter(
         accountMap: Map<PlaidAccountId, FireflyAccountId>,
     ): TransactionSplit {
         val converted = convertSingle(plaidTx, accountMap, currentImportTag(), link = true).tx
-        if (unsent.type != TransactionTypeProperty.transfer) return converted
+        if (!unsent.isPaired()) return converted
         // A transfer keeps its accounts and ids; only what Plaid owns is refreshed
         return unsent.copy(
             date = converted.date,
@@ -802,6 +835,11 @@ class TransactionConverter(
             .filter { fireflyTxTypesEligibleForConversion.contains(
                 it.attributes.transactions.first().type
             ) }
+            /**
+             * Filter out a withdrawal/deposit that already is one side of a pair (a payment to a liability): its links
+             *  have a source or destination leg
+             */
+            .filter { !it.attributes.transactions.first().isPaired() }
             /**
              * Filter out transactions imported while pending: they're provisional (Plaid may remove them, or post them
              *  with another amount), so they are not paired into a transfer until they post. (Needs [pendingTag];
@@ -936,7 +974,7 @@ class TransactionConverter(
         } else {
             Pair(PlaidLinkLeg.destination, PlaidLinkLeg.source)
         }
-        return convert(
+        val converted = convert(
             tx = plaidTx,
             isPair = true,
             sourceId = sourceId,
@@ -947,6 +985,10 @@ class TransactionConverter(
             importTag = importTag,
             plaidLinks = fireflyTx.tx.plaidLinks.orEmpty().map { it.copy(leg = existingLeg) } +
                     PlaidLink(plaidTx.transactionId, newLeg, plaidTx.accountId),
+        )
+        // A liability end can turn the existing withdrawal into a deposit (or the reverse), which is sent as a type change
+        return converted.copy(
+            changesType = converted.tx.type != TransactionTypeProperty.transfer && converted.tx.type != fireflyTx.tx.type
         )
     }
 
@@ -977,7 +1019,7 @@ class TransactionConverter(
             null
         }
         val split = TransactionSplit(
-            getFireflyTransactionDtoType(tx, isPair),
+            getFireflyTransactionDtoType(tx, isPair, sourceId, destinationId),
             // Plaid's guidance on using authorized date vs posted date:
             // The authorized_date, when available, is generally preferable to use over the date field for posted
             // transactions, as it will generally represent the date the user actually made the transaction.
@@ -1042,8 +1084,14 @@ class TransactionConverter(
      * See [getPlaidAmount] for sort of the inverse of this.
      *
      * @param isPair True if [t] is part of a pair of offsetting Plaid transactions, false otherwise.
+     * @param sourceId @param destinationId the Firefly account ids of the pair; they decide whether it is a transfer
      */
-    suspend fun getFireflyTransactionDtoType(t: PlaidTransaction, isPair: Boolean): TransactionTypeProperty {
+    suspend fun getFireflyTransactionDtoType(
+        t: PlaidTransaction,
+        isPair: Boolean,
+        sourceId: String? = null,
+        destinationId: String? = null,
+    ): TransactionTypeProperty {
 
         /**
          * Per Firefly docs:
@@ -1053,7 +1101,16 @@ class TransactionConverter(
          * Transfers can be linked to piggy banks, to automatically add or remove money from the piggy bank you select.
          */
         if (isPair) {
-            return TransactionTypeProperty.transfer
+            // Firefly 6.7.7 refuses a transfer between an asset and a liability account (422 "Could not find a valid
+            //  destination account"). Money into a liability is a payment (withdrawal); money out of one is a cash
+            //  advance or disbursement (deposit). Two liabilities, or two assets, stay a transfer.
+            val sourceIsLiability = sourceId in liabilityAccountIds
+            val destinationIsLiability = destinationId in liabilityAccountIds
+            return when {
+                destinationIsLiability && !sourceIsLiability -> TransactionTypeProperty.withdrawal
+                sourceIsLiability && !destinationIsLiability -> TransactionTypeProperty.deposit
+                else -> TransactionTypeProperty.transfer
+            }
         }
 
         /**

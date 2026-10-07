@@ -8,6 +8,7 @@ import net.djvk.fireflyPlaidConnector2.api.firefly.apis.AboutApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.AccountsApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.FireflyTransactionId
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.PlaidLinksApi
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.AccountTypeFilter
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.PlaidLink
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.PlaidLinkConflictError
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionRead
@@ -56,6 +57,24 @@ class SyncHelper(
         fireflyPlaidLinksApi.setAccessToken(fireflyAccessToken)
         validateFireflyApiVersion()
         validatePlaidLinksEndpoint()
+    }
+
+    /**
+     * The ids of Firefly's liability accounts (credit cards, loans, mortgages), which cannot be an end of a transfer.
+     * Read once at startup; a liability account created later is picked up on the next start.
+     */
+    suspend fun fetchLiabilityAccountIds(): Set<String> {
+        val ids = mutableSetOf<String>()
+        var page = 1
+        do {
+            val response = fireflyAccountsApi.listAccount(page, null, AccountTypeFilter.liabilities).body()
+            response.data.forEach { ids.add(it.id) }
+            val pagination = response.meta.pagination
+            val more = pagination != null && pagination.currentPage < pagination.totalPages
+            page++
+        } while (more)
+        logger.debug("Firefly has {} liability accounts: {}", ids.size, ids)
+        return ids
     }
 
     /**

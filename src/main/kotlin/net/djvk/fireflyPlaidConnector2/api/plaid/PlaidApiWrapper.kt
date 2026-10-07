@@ -1,5 +1,6 @@
 package net.djvk.fireflyPlaidConnector2.api.plaid
 
+import com.fasterxml.jackson.annotation.JsonInclude
 import com.fasterxml.jackson.databind.DeserializationFeature
 import com.fasterxml.jackson.databind.SerializationFeature
 import io.ktor.client.HttpClientConfig
@@ -45,6 +46,9 @@ class PlaidApiWrapper(
     private val plaidApi = PlaidApi(baseUrl, httpClientEngine, httpClientConfig) {
         ApiClient.JSON_DEFAULT.invoke(this)
         configure(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS, false)
+        // Plaid answers 400 UNKNOWN_FIELDS to a field an endpoint does not know, even when it is null (the generated
+        //  models carry fields of other products, such as payment_details on /accounts/balance/get). Send only what is set.
+        setSerializationInclusion(JsonInclude.Include.NON_NULL)
         configure(DeserializationFeature.READ_UNKNOWN_ENUM_VALUES_AS_NULL, true)
     }
     private val logger = LoggerFactory.getLogger(this::class.java)

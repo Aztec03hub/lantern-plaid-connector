@@ -504,6 +504,7 @@ class PolledSyncOrchestrator(
             mainJob = launch {
                 val (accountMap, accountAccessTokenSequence, cursorMap) = retryWhileNetworkDown("startup") {
                     syncHelper.setApiCreds()
+                    converter.liabilityAccountIds = syncHelper.fetchLiabilityAccountIds()
 
                     // Initialize cursors
                     initializeCursors()

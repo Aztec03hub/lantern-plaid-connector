@@ -9,6 +9,7 @@ import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionTypeFilter
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionTypeProperty
 import net.djvk.fireflyPlaidConnector2.transactions.FireflyTransactionDto
 import net.djvk.fireflyPlaidConnector2.transactions.PlaidLinkIndexer
+import net.djvk.fireflyPlaidConnector2.transactions.isPaired
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.stereotype.Component
@@ -170,7 +171,7 @@ class FireflyTransactionService(
             guarded(
                 DeadLetter("update", update.transactionId, update.id, update.tx, update.changesType),
                 instead = fallback?.let { { createGuarded(it) } },
-                insteadOn = if (update.tx.type == TransactionTypeProperty.transfer) permanent4xx else setOf(404),
+                insteadOn = if (update.tx.isPaired()) permanent4xx else setOf(404),
             ) {
                 syncHelper.updateBatchInFirefly(listOf(update))
             }

@@ -89,7 +89,6 @@ internal class PlaidApiWrapperTest {
                       "access_token" : "${testAccessToken}",
                       "start_date" : "2024-05-25",
                       "end_date" : "2024-06-24",
-                      "client_id" : null,
                       "options" : {
                         "account_ids" : [ "${testAccount1}", "${testAccount2}" ],
                         "count" : 100,
@@ -99,8 +98,7 @@ internal class PlaidApiWrapperTest {
                         "include_personal_finance_category" : true,
                         "include_logo_and_counterparty_beta" : false,
                         "days_requested" : 90
-                      },
-                      "secret" : null
+                      }
                     }
                 """.trimIndent(), request.body.toByteArray().toString(Charsets.UTF_8))
 
@@ -204,8 +202,6 @@ internal class PlaidApiWrapperTest {
                 assertEquals("""
                     {
                       "access_token" : "${testAccessToken}",
-                      "client_id" : null,
-                      "secret" : null,
                       "cursor" : "${testCursor}",
                       "count" : 100,
                       "options" : {
@@ -280,15 +276,13 @@ internal class PlaidApiWrapperTest {
                 assertEquals("""
                     {
                       "access_token" : "${testAccessToken}",
-                      "secret" : null,
-                      "client_id" : null,
                       "options" : {
-                        "account_ids" : [ "${testAccount1}", "${testAccount2}" ],
-                        "min_last_updated_datetime" : null
-                      },
-                      "payment_details" : null
+                        "account_ids" : [ "${testAccount1}", "${testAccount2}" ]
+                      }
                     }
                 """.trimIndent(), request.body.toByteArray().toString(Charsets.UTF_8))
+                // Plaid answers 400 UNKNOWN_FIELDS to payment_details on this endpoint, even as null
+                assertFalse(request.body.toByteArray().toString(Charsets.UTF_8).contains("payment_details"))
 
                 respond(
                     content = ByteReadChannel(getBalanceResponseStr),
