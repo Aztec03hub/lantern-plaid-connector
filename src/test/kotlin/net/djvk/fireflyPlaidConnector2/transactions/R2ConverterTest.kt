@@ -3,6 +3,8 @@ package net.djvk.fireflyPlaidConnector2.transactions
 import com.fasterxml.jackson.databind.ObjectMapper
 import kotlinx.coroutines.runBlocking
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.ObjectLink
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.PlaidLink
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.PlaidLinkLeg
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionRead
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionTypeProperty
 import net.djvk.fireflyPlaidConnector2.config.properties.TransactionStyleConfig
@@ -33,11 +35,17 @@ internal class R2ConverterTest {
         pendingTag = pendingTag,
     )
 
+    private val wdLink = PlaidLink("wd", PlaidLinkLeg.source, accountA)
+    private val depLink = PlaidLink("dep", PlaidLinkLeg.destination, accountB)
+    private val transferLinks = listOf(wdLink, depLink)
+
+    private fun single(plaidId: String, account: String = accountA) =
+        listOf(PlaidLink(plaidId, PlaidLinkLeg.single, account))
+
     private fun existing(
         id: String,
-        externalId: String,
         type: TransactionTypeProperty,
-        internalReference: String? = null,
+        links: List<PlaidLink>?,
         sourceId: String? = "1",
         destinationId: String? = if (type == TransactionTypeProperty.transfer) "2" else null,
         tags: List<String> = listOf(),
@@ -45,7 +53,7 @@ internal class R2ConverterTest {
         "transactions", id,
         FireflyFixtures.getTransaction(
             type = type, amount = "50.0", sourceId = sourceId, destinationId = destinationId,
-            externalId = externalId, internalReference = internalReference, tags = tags,
+            plaidLinks = links, tags = tags,
             description = "User words", currencyId = "5", currencyCode = "USD",
             sourceName = if (sourceId == null) "Employer" else null,
             destinationName = if (destinationId == null) "Shop" else null,
@@ -63,35 +71,35 @@ internal class R2ConverterTest {
     // region H1-R2
 
     @Test
-    fun aTransferBuiltFromTwoPlaidLegsKeepsBothIds() = runBlocking<Unit> {
+    fun aTransferBuiltFromTwoPlaidLegsLinksBothIds() = runBlocking<Unit> {
         val result = converter().convertPollSync(
             accountMap, listOf(plaid(accountA, "wd", 50.0), plaid(accountB, "dep", -50.0)), listOf(), listOf(), listOf()
         )
 
         val tx = result.creates.single().tx
-        assertThat(tx.externalId).isEqualTo("plaid-dep")
-        assertThat(tx.internalReference).isEqualTo("plaid-wd")
+        assertThat(tx.externalId).describedAs("the connector no longer writes external_id").isNull()
+        assertThat(tx.internalReference).isNull()
+        assertThat(tx.plaidLinks).containsExactly(wdLink, depLink)
     }
 
     @Test
-    fun convertingAnExistingLegToATransferKeepsItsOldIdAsTheOtherLegsId() = runBlocking<Unit> {
+    fun convertingAnExistingLegToATransferKeepsItsLinkAsTheOtherLeg() = runBlocking<Unit> {
         val result = converter().convertPollSync(
             accountMap, listOf(plaid(accountB, "dep", -50.0)), listOf(), listOf(),
-            listOf(existing("ff1", "plaid-wd", TransactionTypeProperty.withdrawal))
+            listOf(existing("ff1", TransactionTypeProperty.withdrawal, single("wd")))
         )
 
         val update = result.updates.single()
         assertThat(update.id).isEqualTo("ff1")
-        assertThat(update.tx.externalId).isEqualTo("plaid-dep")
-        assertThat(update.tx.internalReference).isEqualTo("plaid-wd")
+        assertThat(update.tx.plaidLinks).containsExactly(wdLink, depLink)
     }
 
     /** Live finding: step 2 of the double transfer. The withdrawal leg alone must not be created again. */
     @Test
-    fun aLoneLegWhoseIdIsTheOtherIdOfAnExistingTransferIsNotCreatedAgain() = runBlocking<Unit> {
+    fun aLoneLegWhoseIdIsOneOfTheLinksOfAnExistingTransferIsNotCreatedAgain() = runBlocking<Unit> {
         val result = converter().convertPollSync(
             accountMap, listOf(plaid(accountA, "wd", 50.0)), listOf(), listOf(),
-            listOf(existing("ff1", "plaid-dep", TransactionTypeProperty.transfer, internalReference = "plaid-wd"))
+            listOf(existing("ff1", TransactionTypeProperty.transfer, transferLinks))
         )
 
         assertThat(result.creates).isEmpty()
@@ -101,7 +109,7 @@ internal class R2ConverterTest {
     /** Live finding: step 3. The destination leg arriving after the transfer must not convert anything else. */
     @Test
     fun theOtherLegArrivingLaterIsRecognisedWhateverOrderTheLegsArriveIn() = runBlocking<Unit> {
-        val transfer = existing("ff1", "plaid-wd", TransactionTypeProperty.transfer, internalReference = "plaid-dep")
+        val transfer = existing("ff1", TransactionTypeProperty.transfer, transferLinks)
 
         val result = converter().convertPollSync(
             accountMap, listOf(plaid(accountB, "dep", -50.0)), listOf(), listOf(), listOf(transfer)
@@ -114,8 +122,8 @@ internal class R2ConverterTest {
     /** The old fix only looked at creates; a conversion of a different transaction must be skipped too. */
     @Test
     fun aConversionIsSkippedWhenAnotherTransactionAlreadyRecordsTheLeg() = runBlocking<Unit> {
-        val transfer = existing("ff1", "plaid-dep", TransactionTypeProperty.transfer, internalReference = "plaid-wd")
-        val strayWithdrawal = existing("ff2", "plaid-stray", TransactionTypeProperty.withdrawal)
+        val transfer = existing("ff1", TransactionTypeProperty.transfer, transferLinks)
+        val strayWithdrawal = existing("ff2", TransactionTypeProperty.withdrawal, single("stray"))
 
         val result = converter().convertPollSync(
             accountMap, listOf(plaid(accountB, "dep", -50.0)), listOf(), listOf(), listOf(transfer, strayWithdrawal)
@@ -126,24 +134,24 @@ internal class R2ConverterTest {
     }
 
     /**
-     * A transfer recorded by an older build has only one leg's id. Re-pairing the same two legs makes a transfer whose
-     * external id is the OTHER leg, found only through the internal reference of the new one.
+     * A retried pair whose transfer already holds both legs is NOT skipped here: a two-link create is left to Firefly's
+     * 409 (the whole write conflicts, nothing is written), so the converter still emits it with both links.
      */
     @Test
-    fun aRetriedPairIsSkippedWhenAnOlderTransferHasOnlyTheOtherLegsId() = runBlocking<Unit> {
-        val older = existing("ff1", "plaid-wd", TransactionTypeProperty.transfer)
+    fun aTwoLinkCreateIsNotSkippedEvenWhenATransferAlreadyHoldsBothLegs() = runBlocking<Unit> {
+        val older = existing("ff1", TransactionTypeProperty.transfer, transferLinks)
 
         val result = converter().convertPollSync(
             accountMap, listOf(plaid(accountA, "wd", 50.0), plaid(accountB, "dep", -50.0)), listOf(), listOf(), listOf(older)
         )
 
-        assertThat(result.creates).isEmpty()
         assertThat(result.updates).isEmpty()
+        assertThat(result.creates.single().tx.plaidLinks).containsExactly(wdLink, depLink)
     }
 
     @Test
-    fun aPlaidUpdateOfTheLegStoredAsInternalReferenceFindsTheTransfer() = runBlocking<Unit> {
-        val transfer = existing("ff1", "plaid-dep", TransactionTypeProperty.transfer, internalReference = "plaid-wd")
+    fun aPlaidUpdateOfTheSourceLegFindsTheTransfer() = runBlocking<Unit> {
+        val transfer = existing("ff1", TransactionTypeProperty.transfer, transferLinks)
 
         val result = converter().convertPollSync(
             accountMap, listOf(), listOf(plaid(accountA, "wd", 60.0)), listOf(), listOf(transfer)
@@ -152,7 +160,7 @@ internal class R2ConverterTest {
         val update = result.updates.single()
         assertThat(update.id).isEqualTo("ff1")
         assertThat(update.tx.amount).isEqualTo("60.0")
-        assertThat(update.tx.externalId).describedAs("the transfer keeps its own external id").isEqualTo("plaid-dep")
+        assertThat(update.tx.plaidLinks).describedAs("an ordinary modify sends no links").isNull()
         assertThat(update.tx.sourceId).isEqualTo("1")
         assertThat(update.tx.destinationId).isEqualTo("2")
     }
@@ -163,7 +171,7 @@ internal class R2ConverterTest {
      */
     @Test
     fun theRemovalOfTheSourceLegTurnsTheTransferIntoADepositForTheOtherLeg() = runBlocking<Unit> {
-        val transfer = existing("ff1", "plaid-dep", TransactionTypeProperty.transfer, internalReference = "plaid-wd")
+        val transfer = existing("ff1", TransactionTypeProperty.transfer, transferLinks)
 
         val result = converter().convertPollSync(accountMap, listOf(), listOf(), listOf("wd"), listOf(transfer))
 
@@ -175,25 +183,27 @@ internal class R2ConverterTest {
         assertThat(update.tx.destinationId).isEqualTo("2")
         assertThat(update.tx.sourceId).isNull()
         assertThat(update.tx.sourceName).isEqualTo("Unknown Transfer Source")
-        assertThat(update.tx.externalId).isEqualTo("plaid-dep")
+        assertThat(update.tx.plaidLinks).containsExactly(depLink.copy(leg = PlaidLinkLeg.single))
         assertThat(typeSent(update)).isEqualTo("deposit")
     }
 
     @Test
-    fun theRemovalOfTheLegThatIsTheExternalIdStillDeletesASimpleTransaction() = runBlocking<Unit> {
+    fun theRemovalOfTheLegOfASingleLinkStillDeletesASimpleTransaction() = runBlocking<Unit> {
         val result = converter().convertPollSync(
-            accountMap, listOf(), listOf(), listOf("x"), listOf(existing("ff1", "plaid-x", TransactionTypeProperty.withdrawal))
+            accountMap, listOf(), listOf(), listOf("x"), listOf(existing("ff1", TransactionTypeProperty.withdrawal, single("x")))
         )
 
         assertThat(result.deletes).containsExactly("ff1")
     }
 
     @Test
-    fun onlyATransfersInternalReferenceIsIndexedBecauseTheUserCanEditItOnAnyTransaction() {
-        val notATransfer = existing("ff1", "plaid-a", TransactionTypeProperty.withdrawal, internalReference = "plaid-b")
+    fun aTransferIsFoundByEitherOfItsLinksAndAnUnknownIdIsNotFound() {
+        val transfer = existing("ff1", TransactionTypeProperty.transfer, transferLinks)
+        val indexer = PlaidLinkIndexer(listOf(transfer))
 
-        assertThat(FireflyTransactionExternalIdIndexer(listOf(notATransfer)).findExistingFireflyTx("b")).isNull()
-        assertThat(FireflyTransactionExternalIdIndexer(listOf(notATransfer)).findExistingFireflyTx("a")).isNotNull
+        assertThat(indexer.find("wd")?.id).isEqualTo("ff1")
+        assertThat(indexer.find("dep")?.id).isEqualTo("ff1")
+        assertThat(indexer.find("plaid-wd")).describedAs("ids are raw, with no prefix").isNull()
     }
 
     // endregion
@@ -204,13 +214,14 @@ internal class R2ConverterTest {
     fun aWithdrawalWhoseSignFlipsBecomesADepositIntoTheSameAccount() = runBlocking<Unit> {
         val result = converter().convertPollSync(
             accountMap, listOf(), listOf(plaid(accountA, "x", -20.0)), listOf(),
-            listOf(existing("ff1", "plaid-x", TransactionTypeProperty.withdrawal))
+            listOf(existing("ff1", TransactionTypeProperty.withdrawal, single("x")))
         )
 
         val update = result.updates.single()
         assertThat(update.changesType).isTrue()
         assertThat(update.tx.type).isEqualTo(TransactionTypeProperty.deposit)
         assertThat(update.tx.destinationId).isEqualTo("1")
+        assertThat(update.tx.plaidLinks).describedAs("a sign flip of a single sends no links").isNull()
         assertThat(update.tx.sourceId).describedAs("the old destination (an expense account) is not the source").isNull()
         assertThat(update.tx.sourceName).isNotBlank()
         assertThat(typeSent(update)).isEqualTo("deposit")
@@ -221,7 +232,7 @@ internal class R2ConverterTest {
     fun aDepositWhoseSignFlipsBecomesAWithdrawalFromTheSameAccount() = runBlocking<Unit> {
         val result = converter().convertPollSync(
             accountMap, listOf(), listOf(plaid(accountA, "x", 20.0)), listOf(),
-            listOf(existing("ff1", "plaid-x", TransactionTypeProperty.deposit, sourceId = null, destinationId = "1"))
+            listOf(existing("ff1", TransactionTypeProperty.deposit, single("x"), sourceId = null, destinationId = "1"))
         )
 
         val update = result.updates.single()
@@ -237,7 +248,7 @@ internal class R2ConverterTest {
     fun anUpdateThatKeepsItsSignNeverSendsAType() = runBlocking<Unit> {
         val result = converter().convertPollSync(
             accountMap, listOf(), listOf(plaid(accountA, "x", 25.0)), listOf(),
-            listOf(existing("ff1", "plaid-x", TransactionTypeProperty.withdrawal))
+            listOf(existing("ff1", TransactionTypeProperty.withdrawal, single("x")))
         )
 
         val update = result.updates.single()
@@ -250,7 +261,7 @@ internal class R2ConverterTest {
     fun anOrdinaryUpdateDoesNotResendTheCounterpartyName() = runBlocking<Unit> {
         val result = converter().convertPollSync(
             accountMap, listOf(), listOf(plaid(accountA, "x", 25.0)), listOf(),
-            listOf(existing("ff1", "plaid-x", TransactionTypeProperty.withdrawal))
+            listOf(existing("ff1", TransactionTypeProperty.withdrawal, single("x")))
         )
 
         val tx = result.updates.single().tx
@@ -264,7 +275,7 @@ internal class R2ConverterTest {
     fun anOrdinaryUpdateOfADepositDoesNotResendTheCounterpartyName() = runBlocking<Unit> {
         val result = converter().convertPollSync(
             accountMap, listOf(), listOf(plaid(accountA, "x", -25.0, name = "ACME PAYROLL")), listOf(),
-            listOf(existing("ff1", "plaid-x", TransactionTypeProperty.deposit, sourceId = null, destinationId = "1"))
+            listOf(existing("ff1", TransactionTypeProperty.deposit, single("x"), sourceId = null, destinationId = "1"))
         )
 
         val tx = result.updates.single().tx
@@ -272,11 +283,11 @@ internal class R2ConverterTest {
         assertThat(tx.destinationName).isNull()
     }
 
-    /** Both legs flip in one sync: the transfer's direction swaps once, and the two ids swap with the accounts. */
+    /** Both legs flip in one sync: the transfer's direction swaps once, and the two link legs swap with the accounts. */
     @Test
     fun aTransferWhoseTwoLegsBothFlipSwapsTheTransfersDirection() = runBlocking<Unit> {
         // account 1 (A) sent 50 to account 2 (B); Plaid now says A's leg is money IN and B's is money OUT
-        val transfer = existing("ff1", "plaid-dep", TransactionTypeProperty.transfer, internalReference = "plaid-wd")
+        val transfer = existing("ff1", TransactionTypeProperty.transfer, transferLinks)
 
         val result = converter().convertPollSync(
             accountMap, listOf(), listOf(plaid(accountA, "wd", -50.0), plaid(accountB, "dep", 50.0)), listOf(), listOf(transfer)
@@ -287,16 +298,18 @@ internal class R2ConverterTest {
         for (update in result.updates) {
             assertThat(update.tx.sourceId).isEqualTo("2")
             assertThat(update.tx.destinationId).isEqualTo("1")
-            // external id = the leg on the destination account, which is now A's leg
-            assertThat(update.tx.externalId).isEqualTo("plaid-wd")
-            assertThat(update.tx.internalReference).isEqualTo("plaid-dep")
+            // the legs swap with the accounts: A's leg is now the destination, B's the source
+            assertThat(update.tx.plaidLinks).containsExactlyInAnyOrder(
+                PlaidLink("wd", PlaidLinkLeg.destination, accountA),
+                PlaidLink("dep", PlaidLinkLeg.source, accountB),
+            )
         }
     }
 
     /** The OUT half of the reversal test (R3 mutation C4): a deposit leg of a transfer that flips to OUT. */
     @Test
     fun aTransferWhoseDepositLegFlipsToOutAndWhoseOtherLegAgreesSwaps() = runBlocking<Unit> {
-        val transfer = existing("ff1", "plaid-dep", TransactionTypeProperty.transfer, internalReference = "plaid-wd")
+        val transfer = existing("ff1", TransactionTypeProperty.transfer, transferLinks)
 
         // only the update of the deposit leg is processed first in list order
         val result = converter().convertPollSync(
@@ -313,7 +326,7 @@ internal class R2ConverterTest {
      */
     @Test
     fun aTransferWhoseLegsDisagreeOnDirectionIsLeftAloneAndReported() = runBlocking<Unit> {
-        val transfer = existing("ff1", "plaid-dep", TransactionTypeProperty.transfer, internalReference = "plaid-wd")
+        val transfer = existing("ff1", TransactionTypeProperty.transfer, transferLinks)
 
         val flipped = converter().convertPollSync(
             accountMap, listOf(), listOf(plaid(accountA, "wd", -50.0)), listOf(), listOf(transfer)
@@ -333,7 +346,7 @@ internal class R2ConverterTest {
     /** Both legs are updated in one sync but only one of them flipped: the banks disagree, so no swap, and it is reported. */
     @Test
     fun aTransferWhoseOtherLegIsUpdatedWithoutFlippingIsNotSwapped() = runBlocking<Unit> {
-        val transfer = existing("ff1", "plaid-dep", TransactionTypeProperty.transfer, internalReference = "plaid-wd")
+        val transfer = existing("ff1", TransactionTypeProperty.transfer, transferLinks)
 
         val result = converter().convertPollSync(
             accountMap, listOf(), listOf(plaid(accountA, "wd", -40.0), plaid(accountB, "dep", -41.0)), listOf(), listOf(transfer)
@@ -347,7 +360,7 @@ internal class R2ConverterTest {
     /** The deposit leg flipping alone (OUT) is reported too, not swapped. */
     @Test
     fun aDepositLegThatFlipsToOutAloneIsReportedNotSwapped() = runBlocking<Unit> {
-        val transfer = existing("ff1", "plaid-dep", TransactionTypeProperty.transfer, internalReference = "plaid-wd")
+        val transfer = existing("ff1", TransactionTypeProperty.transfer, transferLinks)
 
         val result = converter().convertPollSync(
             accountMap, listOf(), listOf(plaid(accountB, "dep", 50.0)), listOf(), listOf(transfer)
@@ -357,10 +370,10 @@ internal class R2ConverterTest {
         assertThat(result.transfersNeedingReview).containsExactly("ff1")
     }
 
-    /** A transfer with one known Plaid leg (no reference) has only that leg's word on direction. */
+    /** A transfer with one known Plaid link has only that leg's word on direction. */
     @Test
-    fun aLegacyTransferWithOneKnownLegSwapsOnThatLegsWord() = runBlocking<Unit> {
-        val transfer = existing("ff1", "plaid-dep", TransactionTypeProperty.transfer)
+    fun aTransferWithOneKnownLinkSwapsOnThatLegsWord() = runBlocking<Unit> {
+        val transfer = existing("ff1", TransactionTypeProperty.transfer, listOf(PlaidLink("dep", PlaidLinkLeg.destination, accountA)))
 
         val result = converter().convertPollSync(
             accountMap, listOf(), listOf(plaid(accountA, "dep", -50.0)), listOf(), listOf(transfer)
@@ -372,7 +385,7 @@ internal class R2ConverterTest {
 
     @Test
     fun aTransferLegThatKeepsItsDirectionKeepsItsAccounts() = runBlocking<Unit> {
-        val transfer = existing("ff1", "plaid-dep", TransactionTypeProperty.transfer, internalReference = "plaid-wd")
+        val transfer = existing("ff1", TransactionTypeProperty.transfer, transferLinks)
 
         val result = converter().convertPollSync(
             accountMap, listOf(), listOf(plaid(accountA, "wd", 55.0)), listOf(), listOf(transfer)
@@ -389,7 +402,7 @@ internal class R2ConverterTest {
 
     @Test
     fun aTransactionImportedWhilePendingIsNotConvertedIntoATransfer() = runBlocking<Unit> {
-        val pending = existing("ffP", "plaid-pend", TransactionTypeProperty.withdrawal, tags = listOf("pending"))
+        val pending = existing("ffP", TransactionTypeProperty.withdrawal, single("pend"), tags = listOf("pending"))
 
         val result = converter(pendingTag = "pending").convertPollSync(
             accountMap, listOf(plaid(accountB, "dep", -50.0)), listOf(), listOf(), listOf(pending)
@@ -401,7 +414,7 @@ internal class R2ConverterTest {
 
     @Test
     fun aSettledTransactionIsStillConvertedIntoATransfer() = runBlocking<Unit> {
-        val settled = existing("ffS", "plaid-wd", TransactionTypeProperty.withdrawal, tags = listOf("my-tag"))
+        val settled = existing("ffS", TransactionTypeProperty.withdrawal, single("wd"), tags = listOf("my-tag"))
 
         val result = converter(pendingTag = "pending").convertPollSync(
             accountMap, listOf(plaid(accountB, "dep", -50.0)), listOf(), listOf(), listOf(settled)
@@ -412,7 +425,7 @@ internal class R2ConverterTest {
 
     @Test
     fun aPostedTransactionReplacesThePendingDescriptionAndMerchant() = runBlocking<Unit> {
-        val pending = existing("ff1", "plaid-pend", TransactionTypeProperty.withdrawal)
+        val pending = existing("ff1", TransactionTypeProperty.withdrawal, single("pend"))
         val posted = PlaidFixtures.getPaymentTransaction(
             accountId = accountA, transactionId = "posted", pendingTransactionId = "pend", amount = 50.0,
             name = "FINAL MERCHANT NAME",
@@ -422,6 +435,7 @@ internal class R2ConverterTest {
 
         val tx = result.updates.single().tx
         assertThat(tx.description).isEqualTo("FINAL MERCHANT NAME")
+        assertThat(tx.plaidLinks).containsExactly(PlaidLink("posted", PlaidLinkLeg.single, accountA))
         assertThat(tx.destinationName).isEqualTo("FINAL MERCHANT NAME")
         assertThat(result.deletes).isEmpty()
     }

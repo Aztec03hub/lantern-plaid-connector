@@ -4,6 +4,8 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import kotlinx.coroutines.runBlocking
 import net.djvk.fireflyPlaidConnector2.api.firefly.infrastructure.ApiClient
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.ObjectLink
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.PlaidLink
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.PlaidLinkLeg
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionRead
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionTypeProperty
 import net.djvk.fireflyPlaidConnector2.config.properties.TransactionStyleConfig
@@ -35,10 +37,9 @@ internal class PendingTransactionTest {
 
     private fun existingFirefly(
         id: String,
-        externalId: String,
+        links: List<PlaidLink>,
         type: TransactionTypeProperty = TransactionTypeProperty.withdrawal,
         tags: List<String> = listOf("my-own-tag", "plaid-primary-cat-old"),
-        internalReference: String? = null,
     ) = TransactionRead(
         "transactions", id,
         FireflyFixtures.getTransaction(
@@ -46,14 +47,15 @@ internal class PendingTransactionTest {
             amount = "10.0",
             sourceId = "1",
             destinationId = if (type == TransactionTypeProperty.transfer) "2" else null,
-            externalId = externalId,
-            internalReference = internalReference,
+            plaidLinks = links,
             tags = tags,
             categoryName = "Groceries (set by user)",
             currencyId = "5",
             currencyCode = "USD",
         ), ObjectLink()
     )
+
+    private fun single(plaidId: String) = listOf(PlaidLink(plaidId, PlaidLinkLeg.single, plaidAccount))
 
     private fun posted(amount: Double = 12.5, pendingId: String? = "pendingId") = PlaidFixtures.getPaymentTransaction(
         accountId = plaidAccount,
@@ -67,7 +69,7 @@ internal class PendingTransactionTest {
 
     @Test
     fun postedTransactionUpdatesPendingFireflyTransactionInPlace() = runBlocking<Unit> {
-        val existing = existingFirefly("ff1", "plaid-pendingId")
+        val existing = existingFirefly("ff1", single("pendingId"))
 
         val result = converter().convertPollSync(
             accountMap, listOf(posted()), listOf(), listOf("pendingId"), listOf(existing)
@@ -77,7 +79,9 @@ internal class PendingTransactionTest {
         assertThat(result.deletes).describedAs("the pending Firefly transaction must not be deleted").isEmpty()
         val update = result.updates.single()
         assertThat(update.id).isEqualTo("ff1")
-        assertThat(update.tx.externalId).isEqualTo("plaid-postedId")
+        assertThat(update.tx.plaidLinks).describedAs("the pending id is replaced by the posted id")
+            .containsExactly(PlaidLink("postedId", PlaidLinkLeg.single, plaidAccount))
+        assertThat(update.tx.externalId).describedAs("the connector no longer writes external_id").isNull()
         assertThat(update.tx.amount).isEqualTo("12.5")
         assertThat(update.tx.currencyId).isEqualTo("5")
         // User's own tag kept, stale Plaid category tag replaced
@@ -117,7 +121,11 @@ internal class PendingTransactionTest {
     /** M2-R2: deleting and re-creating would drop the transfer's other leg and its user data. */
     @Test
     fun aPendingTransactionThatBecameATransferIsUpdatedInPlaceWhenItPosts() = runBlocking<Unit> {
-        val existing = existingFirefly("ff1", "plaid-pendingId", type = TransactionTypeProperty.transfer)
+        val existing = existingFirefly(
+            "ff1",
+            listOf(PlaidLink("pendingId", PlaidLinkLeg.source, plaidAccount), PlaidLink("otherLeg", PlaidLinkLeg.destination, "bbb")),
+            type = TransactionTypeProperty.transfer,
+        )
 
         val result = converter().convertPollSync(
             accountMap, listOf(posted()), listOf(), listOf("pendingId"), listOf(existing)
@@ -127,17 +135,23 @@ internal class PendingTransactionTest {
         assertThat(result.deletes).isEmpty()
         val update = result.updates.single()
         assertThat(update.id).isEqualTo("ff1")
-        assertThat(update.tx.externalId).isEqualTo("plaid-postedId")
+        assertThat(update.tx.plaidLinks).containsExactly(
+            PlaidLink("postedId", PlaidLinkLeg.source, plaidAccount), PlaidLink("otherLeg", PlaidLinkLeg.destination, "bbb"),
+        )
         // both accounts of the transfer are kept, and no type is sent (it stays a transfer)
         assertThat(update.tx.sourceId).isEqualTo("1")
         assertThat(update.tx.destinationId).isEqualTo("2")
         assertThat(update.toTransactionUpdate().transactions!!.single().type).isNull()
     }
 
-    /** The pending leg's id is the transfer's internal reference (the other leg is its external id). */
+    /** The pending id is the transfer's second link (the destination leg); its leg and position are kept. */
     @Test
-    fun aPendingIdKeptAsATransfersInternalReferenceIsMovedToThePostedId() = runBlocking<Unit> {
-        val existing = existingFirefly("ff1", "plaid-otherLeg", type = TransactionTypeProperty.transfer, internalReference = "plaid-pendingId")
+    fun aPendingIdOnATransfersDestinationLegIsMovedToThePostedId() = runBlocking<Unit> {
+        val existing = existingFirefly(
+            "ff1",
+            listOf(PlaidLink("otherLeg", PlaidLinkLeg.source, "bbb"), PlaidLink("pendingId", PlaidLinkLeg.destination, plaidAccount)),
+            type = TransactionTypeProperty.transfer,
+        )
 
         val result = converter().convertPollSync(
             accountMap, listOf(posted()), listOf(), listOf("pendingId"), listOf(existing)
@@ -146,13 +160,14 @@ internal class PendingTransactionTest {
         assertThat(result.creates).isEmpty()
         assertThat(result.deletes).isEmpty()
         val update = result.updates.single()
-        assertThat(update.tx.externalId).isEqualTo("plaid-otherLeg")
-        assertThat(update.tx.internalReference).isEqualTo("plaid-postedId")
+        assertThat(update.tx.plaidLinks).containsExactly(
+            PlaidLink("otherLeg", PlaidLinkLeg.source, "bbb"), PlaidLink("postedId", PlaidLinkLeg.destination, plaidAccount),
+        )
     }
 
     @Test
     fun fallsBackToDeleteAndCreateWhenAmountChangedSign() = runBlocking<Unit> {
-        val existing = existingFirefly("ff1", "plaid-pendingId", type = TransactionTypeProperty.withdrawal)
+        val existing = existingFirefly("ff1", single("pendingId"), type = TransactionTypeProperty.withdrawal)
 
         val result = converter().convertPollSync(
             accountMap, listOf(posted(amount = -12.5)), listOf(), listOf("pendingId"), listOf(existing)
@@ -203,18 +218,107 @@ internal class PendingTransactionTest {
         val created = conv.convertPollSync(accountMap, listOf(pendingTx), listOf(), listOf(), listOf())
         assertThat(created.creates.single().tx.tags).contains("pending")
 
-        val existing = existingFirefly("ff1", "plaid-pendingId", tags = listOf("pending", "my-own-tag"))
+        val existing = existingFirefly("ff1", single("pendingId"), tags = listOf("pending", "my-own-tag"))
         val promoted = conv.convertPollSync(accountMap, listOf(posted()), listOf(), listOf("pendingId"), listOf(existing))
         assertThat(promoted.updates.single().tx.tags).doesNotContain("pending").contains("my-own-tag")
     }
 
     @Test
     fun plaidModifiedUpdatePreservesUserTags() = runBlocking<Unit> {
-        val existing = existingFirefly("ff1", "plaid-modId", tags = listOf("my-own-tag"))
+        val existing = existingFirefly("ff1", single("modId"), tags = listOf("my-own-tag"))
         val modified = posted(pendingId = null).copy(transactionId = "modId")
 
         val result = converter().convertPollSync(accountMap, listOf(), listOf(modified), listOf(), listOf(existing))
 
         assertThat(result.updates.single().tx.tags).contains("my-own-tag", "plaid-primary-cat-food-and-drink")
+        assertThat(result.updates.single().tx.plaidLinks).describedAs("a modify sends no links").isNull()
+    }
+
+    @Test
+    fun aPendingTransactionIsNotPromotedWhenThePostedIdIsAlreadyIndexed() = runBlocking<Unit> {
+        val pending = existingFirefly("ff1", single("pendingId"))
+        val alreadyPosted = existingFirefly("ff2", single("postedId"))
+
+        val result = converter().convertPollSync(
+            accountMap, listOf(posted()), listOf(), listOf("pendingId"), listOf(pending, alreadyPosted)
+        )
+
+        assertThat(result.updates).describedAs("replacing the link would be refused (409), so no promotion").isEmpty()
+        assertThat(result.deletes).describedAs("the pending group goes with Plaid's removal").containsExactly("ff1")
+    }
+
+    @Test
+    fun aModifyOfATransactionWithSeveralSplitsIsSkippedAndReported() = runBlocking<Unit> {
+        val splits = existingFirefly("ff1", single("modId")).attributes.transactions +
+                FireflyFixtures.getTransaction(amount = "3.0", sourceId = "1").transactions
+        val multi = TransactionRead(
+            "transactions", "ff1", net.djvk.fireflyPlaidConnector2.api.firefly.models.Transaction(transactions = splits), ObjectLink()
+        )
+        val modified = posted(pendingId = null).copy(transactionId = "modId")
+
+        val result = converter().convertPollSync(accountMap, listOf(), listOf(modified), listOf(), listOf(multi))
+
+        assertThat(result.updates).isEmpty()
+        assertThat(result.transfersNeedingReview).containsExactly("ff1")
+    }
+
+    private val updateMapper = ObjectMapper().also { ApiClient.JSON_DEFAULT.invoke(it) }
+
+    private fun splitJson(dto: FireflyTransactionDto) =
+        updateMapper.readTree(updateMapper.writeValueAsString(dto.toTransactionUpdate()))["transactions"][0]
+
+    @Test
+    fun anUpdateCarriesTheTransactionJournalIdOfTheExistingSplit() = runBlocking<Unit> {
+        val existing = TransactionRead(
+            "transactions", "ff1",
+            FireflyFixtures.getTransaction(
+                amount = "10.0", sourceId = "1", currencyId = "5", currencyCode = "USD",
+                transactionJournalId = "j7", plaidLinks = single("modId"),
+            ), ObjectLink()
+        )
+        val modified = posted(pendingId = null).copy(transactionId = "modId")
+
+        val modify = converter().convertPollSync(accountMap, listOf(), listOf(modified), listOf(), listOf(existing))
+        assertThat(modify.updates.single().tx.transactionJournalId).isEqualTo("j7")
+        assertThat(splitJson(modify.updates.single())["transaction_journal_id"].asText()).isEqualTo("j7")
+
+        val promoted = converter().convertPollSync(
+            accountMap, listOf(posted().copy(transactionId = "postedId")), listOf(), listOf("pendingId"),
+            listOf(existing.copy(attributes = existing.attributes.copy(
+                transactions = listOf(existing.attributes.transactions.single().copy(plaidLinks = single("pendingId")))
+            )))
+        )
+        assertThat(promoted.updates.single().tx.transactionJournalId).isEqualTo("j7")
+    }
+
+    @Test
+    fun aModifyUpdateJsonHasNoPlaidLinksKey() = runBlocking<Unit> {
+        val existing = existingFirefly("ff1", single("modId"))
+        val modified = posted(pendingId = null).copy(transactionId = "modId")
+
+        val result = converter().convertPollSync(accountMap, listOf(), listOf(modified), listOf(), listOf(existing))
+
+        assertThat(splitJson(result.updates.single()).has("plaid_links")).isFalse()
+    }
+
+    @Test
+    fun anUpdateThatSendsLinksSerializesTheFullList() = runBlocking<Unit> {
+        val existing = existingFirefly(
+            "ff1",
+            listOf(PlaidLink("otherLeg", PlaidLinkLeg.source, "bbb"), PlaidLink("pendingId", PlaidLinkLeg.destination, plaidAccount)),
+            type = TransactionTypeProperty.transfer,
+        )
+
+        val result = converter().convertPollSync(
+            accountMap, listOf(posted()), listOf(), listOf("pendingId"), listOf(existing)
+        )
+
+        val links = splitJson(result.updates.single())["plaid_links"]
+        assertThat(links.size()).isEqualTo(2)
+        assertThat(links[0]["plaid_transaction_id"].asText()).isEqualTo("otherLeg")
+        assertThat(links[0]["leg"].asText()).isEqualTo("source")
+        assertThat(links[1]["plaid_transaction_id"].asText()).isEqualTo("postedId")
+        assertThat(links[1]["leg"].asText()).isEqualTo("destination")
+        assertThat(links[1]["plaid_account_id"].asText()).isEqualTo(plaidAccount)
     }
 }
