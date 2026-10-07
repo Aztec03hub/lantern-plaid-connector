@@ -69,18 +69,18 @@ internal class RetryIdempotencyTest {
     // region H2
 
     /**
-     * R1 probe 3, link-table version: the converter no longer filters a create whose id Firefly holds. It sends the
-     * create WITH its link, and the link table answers 409 (skipped, never dead-lettered, see SyncHelperLinkTest).
+     * R1 probe 3, link-table version: a single create whose id an existing transfer already holds is skipped without a
+     * request.
      */
     @Test
-    fun aCreateWhoseIdIsAlreadyLinkedToAFireflyTransferIsSentWithItsLinkForTheDatabaseToRefuse() = runBlocking<Unit> {
+    fun aCreateWhoseIdIsAlreadyLinkedToAFireflyTransferIsSkipped() = runBlocking<Unit> {
         val create = PlaidFixtures.getPaymentTransaction(accountId = accountA, transactionId = "legY", amount = -50.0)
 
         val result = converter.convertPollSync(
             accountMap, listOf(create), listOf(), listOf(), listOf(existing("ff1", listOf("legX", "legY"), TransactionTypeProperty.transfer))
         )
 
-        assertThat(result.creates.single().tx.plaidLinks?.map { it.plaidTransactionId }).containsExactly("legY")
+        assertThat(result.creates).isEmpty()
         assertThat(result.updates).isEmpty()
     }
 
