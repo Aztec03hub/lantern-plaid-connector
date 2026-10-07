@@ -100,6 +100,11 @@ class PolledSyncOrchestrator(
     }
 
     private val terminated = AtomicBoolean(false)
+
+    /** Stop after this many poll iterations (0: run forever). For a nightly job: `polled.maxIterations: 1`. */
+    @field:Value("\${fireflyPlaidConnector2.polled.maxIterations:0}")
+    var maxIterations: Int = 0
+    private var iterations = 0
     private lateinit var mainJob: Job
 
     /** When each Item (by access token) was last asked to refresh; in memory only, so every restart refreshes once. */
@@ -540,6 +545,11 @@ class PolledSyncOrchestrator(
                  */
                 do {
                     pollOnce(accountMap, accountAccessTokenSequence, cursorMap)
+                    if (maxIterations > 0 && ++iterations >= maxIterations) {
+                        logger.info("Stopping after $iterations poll iteration(s) (polled.maxIterations)")
+                        // ponytail: exits the JVM (shutdown hooks still run); a scheduler-friendly one-shot mode if this grows
+                        kotlin.system.exitProcess(0)
+                    }
 
                     // Trigger GC to try to reduce heap size
                     logger.trace("Calling System.gc()")
