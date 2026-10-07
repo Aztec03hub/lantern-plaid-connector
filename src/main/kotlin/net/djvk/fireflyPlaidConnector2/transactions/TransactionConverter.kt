@@ -766,6 +766,39 @@ class TransactionConverter(
         transactionJournalId = existing.transactionJournalId,
     )
 
+    /**
+     * The update that turns two single legs already in Firefly into one paired transaction, kept on [withdrawal]'s
+     * journal (the source leg): both accounts and both links, and the type Firefly's table gives that account pair.
+     * Everything the user edited on that journal (description, category, notes, ...) is not sent, so it stays.
+     */
+    fun mergeSingles(withdrawal: FireflyTransactionDto, deposit: FireflyTransactionDto): FireflyTransactionDto {
+        val w = withdrawal.tx
+        val d = deposit.tx
+        val type = pairedTransactionType(
+            accountKinds[w.sourceId] ?: AccountKind.ASSET,
+            accountKinds[d.destinationId] ?: AccountKind.ASSET,
+        )
+        val merged = plainUpdateOf(w).copy(
+            type = type,
+            destinationId = d.destinationId,
+            tags = mergeTags(w.tags, d.tags),
+            plaidLinks = listOf(
+                w.plaidLinks.orEmpty().single().copy(leg = PlaidLinkLeg.source),
+                d.plaidLinks.orEmpty().single().copy(leg = PlaidLinkLeg.destination),
+            ),
+        )
+        return FireflyTransactionDto(withdrawal.id, merged, changesType = type != TransactionTypeProperty.transfer && type != w.type)
+    }
+
+    /** A create that puts the single leg [tx] (read back from Firefly) in again, for a pairing that did not finish. */
+    fun recreateOf(tx: TransactionSplit): TransactionSplit = plainUpdateOf(tx).copy(
+        sourceName = tx.sourceName,
+        destinationName = tx.destinationName,
+        plaidLinks = tx.plaidLinks,
+        reconciled = false,
+        order = 0,
+    )
+
     /** See the companion's [survivingLeg]. */
     fun survivingLeg(transfer: TransactionSplit, removedPlaidId: String): TransactionSplit? =
         Companion.survivingLeg(transfer, removedPlaidId)

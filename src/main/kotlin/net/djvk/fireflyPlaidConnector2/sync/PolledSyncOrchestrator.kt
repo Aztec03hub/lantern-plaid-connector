@@ -77,6 +77,9 @@ class PolledSyncOrchestrator(
      */
     @Value("\${fireflyPlaidConnector2.pendingTag:}")
     pendingTag: String = "pending",
+
+    /** Pairs what is left unpaired in Firefly after each poll's writes; null (tests) skips it. */
+    private val reconciler: TransferReconciler? = null,
 ) : Runner, DisposableBean {
     private val logger = LoggerFactory.getLogger(this::class.java)
 
@@ -321,6 +324,16 @@ class PolledSyncOrchestrator(
             convertResult.updates,
             convertResult.deletes
         )
+
+        // What this poll could not pair in memory (a leg imported by another run) is paired from Firefly's state. A
+        //  failure is logged and retried by the next poll: it must not hold back the cursors of imported data.
+        try {
+            reconciler?.reconcileWindow()
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            logger.error("Transfer pairing failed; it is retried by the next poll", e)
+        }
 
         // A create waiting in the dead letter file is invisible to the conversion above (it only looks in Firefly), so
         //  Plaid's later word on that transaction is applied to the letter itself. After the writes, so a failed

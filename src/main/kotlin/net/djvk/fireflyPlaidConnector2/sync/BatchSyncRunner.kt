@@ -50,6 +50,8 @@ class BatchSyncRunner(
 
     private val converter: TransactionConverter,
 
+    /** Pairs what is left unpaired in Firefly after the run; null (tests) skips it. */
+    private val reconciler: TransferReconciler? = null,
     ) : Runner {
     private val logger = LoggerFactory.getLogger(this::class.java)
 
@@ -79,6 +81,10 @@ class BatchSyncRunner(
 
             // Insert into Firefly
             syncHelper.optimisticInsertBatchIntoFirefly(fireflyTxs)
+
+            // Whatever this run could not pair in memory (a leg imported by an earlier or parallel run) is paired
+            //  from what Firefly holds now
+            reconciler?.let { it.reconcile(startDate.minusDays(it.transferMatchWindowDays), endDate) }
 
             // Set initial balance transaction if configured
             if (setInitialBalance) {
