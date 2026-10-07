@@ -193,7 +193,7 @@ internal class TransferReconcilerTest {
             "t", FireflyMock().aboutApi, firefly, FireflyMock().accountsApi, mock<PlaidLinksApi>(), 8,
         )
         val service = FireflyTransactionService(firefly, helper, 30, "UTC", mock<PlaidLinksApi>(), store)
-        val reconciler = TransferReconciler(helper, service, converter, store, "America/New_York", 3)
+        val reconciler = TransferReconciler(helper, service, converter, store, "America/New_York", 3, enabled = true)
 
         /** One import run: the Plaid transactions of some accounts, converted and written, then the pairing pass. */
         suspend fun run(vararg accounts: Char) {
@@ -309,5 +309,23 @@ internal class TransferReconcilerTest {
         val paired = setup.firefly.journals.values.single { it.type == TransactionTypeProperty.transfer }
         assertThat(paired.description).isEqualTo("Nt1a")
         assertThat(paired.plaidLinks!!.map { it.leg }).containsExactlyInAnyOrder(PlaidLinkLeg.source, PlaidLinkLeg.destination)
+    }
+
+    @Test
+    fun theAutomaticPassIsOffByDefault() = runBlocking<Unit> {
+        val setup = Setup()
+        setup.run('a')
+        setup.run('b')   // the two legs of t1 are now singles in Firefly, and only an enabled pass would pair them
+        val off = TransferReconciler(setup.helper, setup.service, setup.converter, setup.store, "America/New_York", 3)
+        val before = setup.firefly.state()
+
+        assertThat(off.reconcile(LocalDate.now().minusDays(30), LocalDate.now().plusDays(1))).isZero()
+        assertThat(setup.firefly.state()).isEqualTo(before)
+
+        // and Spring's default for the property is false too
+        val annotation = TransferReconciler::class.java.declaredConstructors.flatMap { it.parameters.toList() }
+            .mapNotNull { it.getAnnotation(org.springframework.beans.factory.annotation.Value::class.java) }
+            .first { it.value.contains("reconcileTransfers") }
+        assertThat(annotation.value).endsWith(":false}")
     }
 }

@@ -53,9 +53,9 @@ class TransferReconciler(
     timeZoneString: String,
     @Value("\${fireflyPlaidConnector2.transferMatchWindowDays}")
     val transferMatchWindowDays: Long,
-    /** False skips the pass after batch and poll runs; syncMode=pair always runs it. */
-    @Value("\${fireflyPlaidConnector2.reconcileTransfers:true}")
-    private val enabled: Boolean = true,
+    /** Off unless asked for: skips the pass after batch and poll runs. syncMode=pair always runs it. */
+    @Value("\${fireflyPlaidConnector2.reconcileTransfers:false}")
+    private val enabled: Boolean = false,
     @Value("\${fireflyPlaidConnector2.pendingTag:}")
     private val pendingTag: String = "",
     /** How far back syncMode=pair looks for unpaired legs. */
