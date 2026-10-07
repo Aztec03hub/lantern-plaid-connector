@@ -127,4 +127,39 @@ internal class LiabilityPairTest {
         assertThat(update.tx.type).isEqualTo(TransactionTypeProperty.withdrawal)
         assertThat(update.tx.plaidLinks).containsExactly(srcLink.copy(leg = PlaidLinkLeg.single))
     }
+
+    /** Both banks flip the direction of a payment pair: the withdrawal becomes a deposit, the type is sent, legs swap. */
+    @Test
+    fun aSwappedWithdrawalPairBecomesADepositAndSendsTheType() = runBlocking<Unit> {
+        val result = converter(setOf("2")).convertPollSync(
+            accountMap, listOf(), listOf(plaid(accountA, "wd", -50.0), plaid(accountB, "dep", 50.0)), listOf(), listOf(paidLiability)
+        )
+        // one update per leg, both computed from the same stored state, so identical and idempotent
+        val update = result.updates.first()
+        assertThat(update.tx.type).isEqualTo(TransactionTypeProperty.deposit)
+        assertThat(update.changesType).isTrue()
+        assertThat(update.toTransactionUpdate().transactions!!.single().type).isNotNull
+        assertThat(update.tx.sourceId).isEqualTo("2")
+        assertThat(update.tx.destinationId).isEqualTo("1")
+        assertThat(update.tx.plaidLinks).containsExactlyInAnyOrder(
+            srcLink.copy(leg = PlaidLinkLeg.destination), dstLink.copy(leg = PlaidLinkLeg.source))
+    }
+
+    /** A manual deposit from a liability, paired with an asset leg, flips to a deposit-to-withdrawal type change. */
+    @Test
+    fun aManualWithdrawalPairedWithAnAssetLegOfALiabilitySourceBecomesADeposit() = runBlocking<Unit> {
+        val manual = TransactionRead(
+            "transactions", "ff8",
+            FireflyFixtures.getTransaction(
+                type = TransactionTypeProperty.withdrawal, amount = "50.0", sourceId = "2", destinationName = "Cash",
+                plaidLinks = listOf(PlaidLink("wd", PlaidLinkLeg.single, accountB)), description = "x",
+                currencyId = "5", currencyCode = "USD",
+            ), ObjectLink()
+        )
+        val update = converter(setOf("2")).convertPollSync(
+            accountMap, listOf(plaid(accountA, "dep", -50.0)), listOf(), listOf(), listOf(manual)
+        ).updates.single()
+        assertThat(update.tx.type).isEqualTo(TransactionTypeProperty.deposit)
+        assertThat(update.changesType).isTrue()
+    }
 }
