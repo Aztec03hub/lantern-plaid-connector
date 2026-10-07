@@ -132,7 +132,7 @@ internal class DatesAndOpeningsRepairTest {
 
     private fun plan(journals: List<TransactionRead>, plaidTxs: List<PlaidTransaction>, current: Map<Int, Double> = mapOf(),
                      accounts: Map<Int, AccountRead> = mapOf()) =
-        planner.plan(RepairInput(journals, plaidTxs.associateBy { it.transactionId }, current, accounts))
+        planner.plan(RepairInput(journals, plaidTxs.associateBy { it.transactionId }, current, accounts, mapOf(plaidAccount to 1)))
 
     @Test
     fun aJournalStoredAtElevenPmTheDayBeforeIsRedatedToPlaidsDate() {
@@ -249,6 +249,68 @@ internal class DatesAndOpeningsRepairTest {
         ).openings.single()
         assertThat(o.skipReason).isNotNull()
         assertThat(o.changes).isFalse()
+    }
+
+    @Test
+    fun aPostedPlaidTransactionMissingFromFireflyBlocksTheOpeningChange() {
+        val day = LocalDate.of(2024, 12, 6)
+        // Plaid holds the payroll that posted after the import; Firefly does not
+        val p = plan(
+            listOf(journal("g1", midnight(day), "w1")),
+            listOf(plaid("w1", day), plaid("payroll", day.plusDays(3), amount = -3745.47)),
+            current = mapOf(1 to 3160.30), accounts = mapOf(1 to account(ShortAccountTypeProperty.asset, "Checking")),
+        )
+        val o = p.openings.single()
+        assertThat(o.skipReason).startsWith("SKIPPED: 1 Plaid transactions missing from Firefly")
+        assertThat(o.missing.map { it.transactionId }).containsExactly("payroll")
+        assertThat(o.changes).isFalse()
+    }
+
+    @Test
+    fun aPendingJournalIsExcludedFromTheSumAndBackedOutOfTheAnchor() {
+        val day = LocalDate.of(2024, 12, 6)
+        val pendingTx = plaid("p1", day.plusDays(1), amount = 36.0, pending = true)
+        val p = plan(
+            listOf(journal("g1", midnight(day), "w1"), journal("g2", midnight(day.plusDays(1)), "p1", amount = "36.00")),
+            listOf(plaid("w1", day), pendingTx),
+            current = mapOf(1 to 500.0),
+            accounts = mapOf(1 to account(ShortAccountTypeProperty.asset, "Checking", opening = "540.00", openingDate = midnight(day.minusDays(1)))),
+        )
+        // anchor = 500 + 36 pending = 536; posted journals spent 10; opening 546; the pending journal does not count
+        assertThat(p.openings.single().newOpening!!.toPlainString()).isEqualTo("546.00")
+        assertThat(p.openings.single().sanityNote).isNull()
+    }
+
+    @Test
+    fun anOpeningThatMovesByMoreThanThePendingTotalIsFlagged() {
+        val day = LocalDate.of(2024, 12, 6)
+        val p = plan(
+            listOf(journal("g1", midnight(day), "w1")), listOf(plaid("w1", day)),
+            current = mapOf(1 to 500.0),
+            accounts = mapOf(1 to account(ShortAccountTypeProperty.asset, "Checking", opening = "100.00", openingDate = midnight(day.minusDays(1)))),
+        )
+        assertThat(p.openings.single().sanityNote).contains("510.00")
+        assertThat(p.openings.single().changes).isTrue() // flagged, still applied
+    }
+
+    @Test
+    fun anAccountWithNoTransactionsIsOpenedAtTheStartOfTheHistoryAndAZeroOneNotAtAll() {
+        val day = LocalDate.of(2024, 12, 6)
+        val p = plan(
+            listOf(journal("g1", midnight(day), "w1")), listOf(plaid("w1", day)),
+            current = mapOf(1 to 500.0, 5 to 0.39, 6 to 0.0),
+            accounts = mapOf(
+                1 to account(ShortAccountTypeProperty.asset, "Checking"),
+                5 to account(ShortAccountTypeProperty.asset, "Savings"),
+                6 to account(ShortAccountTypeProperty.asset, "Vault"),
+            ),
+        )
+        val savings = p.openings.single { it.fireflyAccountId == 5 }
+        assertThat(savings.newOpening!!.toPlainString()).isEqualTo("0.39")
+        assertThat(savings.newOpeningDate).isEqualTo(day.minusDays(1))
+        val vault = p.openings.single { it.fireflyAccountId == 6 }
+        assertThat(vault.skipReason).contains("no opening needed")
+        assertThat(vault.changes).isFalse()
     }
 
     // endregion

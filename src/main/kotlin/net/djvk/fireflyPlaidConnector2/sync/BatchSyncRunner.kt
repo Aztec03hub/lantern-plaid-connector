@@ -201,6 +201,7 @@ class BatchSyncRunner(
         startDate: LocalDate,
     ) {
         logger.info("Attempting to set initial balances")
+        val historyStart = allPlaidTxs.values.flatten().minOfOrNull { converter.getTxPostedTimestamp(it).toLocalDate() }
         val (accountMap, accountAccessTokenSequence) = syncHelper.getAllPlaidAccessTokenAccountIdSets()
         // Iterate over all Plaid items/access tokens we have configured
         for ((accessToken, accountIds) in accountAccessTokenSequence) {
@@ -266,7 +267,11 @@ class BatchSyncRunner(
                     continue
                 }
                 // Dated the day before the first imported transaction, so the account does not read 0 before it
-                val earliest = txs.minOfOrNull { converter.getTxPostedTimestamp(it).toLocalDate() } ?: LocalDate.now()
+                // An account with no transactions of its own opens when the imported history starts (any account), and
+                //  needs no opening at all when it holds nothing
+                if (txs.isEmpty() && opening.amount.signum() == 0) continue
+                val earliest = (if (txs.isEmpty()) historyStart else txs.minOf { converter.getTxPostedTimestamp(it).toLocalDate() })
+                    ?: LocalDate.now()
                 logger.debug("Setting opening balance {} on {} for Firefly account id {}", opening.amount, earliest.minusDays(1), fireflyAccountId)
                 fireflyAccountsApi.setOpeningBalance(
                     fireflyAccountId.toString(), opening.amount.toPlainString(), earliest.minusDays(1),

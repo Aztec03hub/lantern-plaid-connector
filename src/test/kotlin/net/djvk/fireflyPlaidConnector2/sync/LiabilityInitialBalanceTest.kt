@@ -44,11 +44,11 @@ internal class LiabilityInitialBalanceTest {
         AccountRead("accounts", "1", Account("acct", type, accountRole = role, liabilityDirection = direction), ObjectLink())
 
     /** Runs the batch initial-balance step for one account and returns the opening journal as a signed Firefly effect. */
-    private fun opening(account: AccountRead, extra: List<net.djvk.fireflyPlaidConnector2.api.plaid.models.Transaction> = listOf()): Pair<Double, java.time.LocalDate> = runBlocking {
+    private fun opening(account: AccountRead, extra: List<net.djvk.fireflyPlaidConnector2.api.plaid.models.Transaction> = listOf(), noOwnTransactions: Boolean = false, current: Double = owed): Pair<Double, java.time.LocalDate>? = runBlocking {
         val plaid = PlaidMock()
         val firefly = FireflyMock()
         val balance = mock<AccountBalance>()
-        whenever(balance.current).thenReturn(owed)
+        whenever(balance.current).thenReturn(current)
         val base = mock<AccountBase>()
         whenever(base.accountId).thenReturn(plaidAccount)
         whenever(base.balances).thenReturn(balance)
@@ -64,11 +64,15 @@ internal class LiabilityInitialBalanceTest {
         whenever(firefly.accountsApi.getAccount(any(), anyOrNull())).thenReturn(accountResponse)
         val runner = BatchSyncRunnerTest.createRunner(plaid, firefly, setInitialBalance = true, syncHelper = helper)
         val day = java.time.LocalDate.of(2025, 1, 10)
-        val txs = listOf(
+        val txs = (listOf(
             PlaidFixtures.getPaymentTransaction(accountId = plaidAccount, transactionId = "t1", amount = purchase, pendingTransactionId = null, date = day),
             PlaidFixtures.getPaymentTransaction(accountId = plaidAccount, transactionId = "t2", amount = payment, pendingTransactionId = null, date = day.plusDays(2)),
-        ) + extra
+        ) + extra).let { all -> if (noOwnTransactions) all.map { it.copy(accountId = "b".repeat(37)) } else all }
         runner.setInitialBalances(mapOf("token" to txs), helper, day.minusDays(30))
+        if (noOwnTransactions && current == 0.0) {
+            org.mockito.kotlin.verify(firefly.accountsApi, org.mockito.kotlin.never()).setOpeningBalance(any(), any(), any(), anyOrNull())
+            return@runBlocking null
+        }
 
         val amount = argumentCaptor<String>()
         val date = argumentCaptor<java.time.LocalDate>()
@@ -81,31 +85,31 @@ internal class LiabilityInitialBalanceTest {
 
     @Test
     fun aDebitLiabilityEndsAtMinusWhatIsOwed() {
-        val end = endBalance(opening(accountRead(ShortAccountTypeProperty.liabilities, LiabilityDirection.debit)).first)
+        val end = endBalance(opening(accountRead(ShortAccountTypeProperty.liabilities, LiabilityDirection.debit))!!.first)
         assertThat(end).isEqualTo(-owed)
     }
 
     @Test
     fun aCreditDirectionLiabilityEndsAtPlusWhatIsOwed() {
-        val end = endBalance(opening(accountRead(ShortAccountTypeProperty.liabilities, LiabilityDirection.credit)).first)
+        val end = endBalance(opening(accountRead(ShortAccountTypeProperty.liabilities, LiabilityDirection.credit))!!.first)
         assertThat(end).isEqualTo(owed)
     }
 
     @Test
     fun anAssetIsUnchanged() {
-        val end = endBalance(opening(accountRead(ShortAccountTypeProperty.asset)).first)
+        val end = endBalance(opening(accountRead(ShortAccountTypeProperty.asset))!!.first)
         assertThat(end).isEqualTo(owed)
     }
 
     @Test
     fun aCreditCardAssetStillEndsNegative() {
-        val end = endBalance(opening(accountRead(ShortAccountTypeProperty.asset, role = AccountRoleProperty.ccAsset)).first)
+        val end = endBalance(opening(accountRead(ShortAccountTypeProperty.asset, role = AccountRoleProperty.ccAsset))!!.first)
         assertThat(end).isEqualTo(-owed)
     }
 
     @Test
     fun theOpeningIsDatedTheDayBeforeTheFirstTransactionNotOnImportDay() {
-        val (_, date) = opening(accountRead(ShortAccountTypeProperty.asset))
+        val (_, date) = opening(accountRead(ShortAccountTypeProperty.asset))!!
         assertThat(date).isEqualTo(java.time.LocalDate.of(2025, 1, 9))
     }
 
@@ -125,5 +129,16 @@ internal class LiabilityInitialBalanceTest {
         assertThat(o.amount.toDouble()).isEqualTo(386.0)
         // and the account still ends at Plaid's current with the pending item imported: 386 - 136
         assertThat(o.amount.toDouble() - 136.0).isEqualTo(owed)
+    }
+
+    @Test
+    fun anAccountWithNoTransactionsOpensWhenTheImportedHistoryStarts() {
+        val (_, date) = opening(accountRead(ShortAccountTypeProperty.asset), noOwnTransactions = true)!!
+        assertThat(date).isEqualTo(java.time.LocalDate.of(2025, 1, 9))
+    }
+
+    @Test
+    fun aZeroBalanceAccountWithNoHistoryGetsNoOpening() {
+        assertThat(opening(accountRead(ShortAccountTypeProperty.asset), noOwnTransactions = true, current = 0.0)).isNull()
     }
 }

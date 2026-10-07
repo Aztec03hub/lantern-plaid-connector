@@ -57,6 +57,10 @@ data class OpeningFix(
     val liabilityDirection: String?,
     /** Why nothing is changed for this account, if so. */
     val skipReason: String? = null,
+    /** Posted Plaid transactions of this account that Firefly has no journal for (the opening is then left alone). */
+    val missing: List<PlaidTransaction> = listOf(),
+    /** Set when the new opening moves by more than the account's listed pending total plus 1.00; shown, still applied. */
+    val sanityNote: String? = null,
 ) {
     val changes: Boolean get() = skipReason == null && (legacyGroupIds.isNotEmpty() ||
             oldOpening?.compareTo(newOpening ?: BigDecimal.ZERO) != 0 || oldOpeningDate != newOpeningDate)
@@ -77,6 +81,8 @@ data class RepairInput(
     /** Plaid `current` balance by Firefly account id, for the accounts in the configuration. */
     val plaidCurrent: Map<Int, Double>,
     val accounts: Map<Int, AccountRead>,
+    /** Firefly account id of each configured Plaid account id. */
+    val fireflyAccountOfPlaid: Map<String, Int> = mapOf(),
 )
 
 /** The pure decisions of the repair: no I/O, so they are tested on their own. */
@@ -129,7 +135,19 @@ class RepairPlanner(private val converter: TransactionConverter, private val zon
             legacyByAccount.getOrPut(own ?: account) { mutableListOf() }.add(group.id to split)
         }
         val accountIds = (input.plaidCurrent.keys + legacyByAccount.keys).toSortedSet()
-        val openings = accountIds.map { id -> openingFix(id, input, legacyByAccount[id].orEmpty(), newDates) }
+        // The start of the imported history, across every configured account: an account with no transactions of its
+        //  own is opened then, so its chart does not read 0 until its first (or the importer's) day
+        val historyStart = input.journals.flatMap { g -> g.attributes.transactions.map { g.id to it } }
+            .filter { (_, t) -> !isLegacyOpening(t) && t.type != TransactionTypeProperty.openingBalance && t.plaidLinks.orEmpty().isNotEmpty() }
+            .minOfOrNull { (gid, t) -> (newDates[gid] ?: t.date).atZoneSameInstant(zoneId).toLocalDate() }
+        val posted = input.plaidTxs.values.filter { !it.pending }
+        val held = input.journals.flatMap { g -> g.attributes.transactions.flatMap { it.plaidLinks.orEmpty() } }
+            .map { it.plaidTransactionId }.toSet()
+        val missingByAccount = posted.filter { it.transactionId !in held }
+            .groupBy { input.fireflyAccountOfPlaid[it.accountId] }
+        val openings = accountIds.map { id ->
+            openingFix(id, input, legacyByAccount[id].orEmpty(), newDates, historyStart, missingByAccount[id].orEmpty())
+        }
 
         return RepairPlan(redates, unmatched, openings, null)
     }
@@ -139,6 +157,8 @@ class RepairPlanner(private val converter: TransactionConverter, private val zon
         input: RepairInput,
         legacy: List<Pair<String, net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionSplit>>,
         newDates: Map<String, OffsetDateTime>,
+        historyStart: LocalDate?,
+        missing: List<PlaidTransaction>,
     ): OpeningFix {
         val account = input.accounts[id]
         val name = account?.attributes?.name ?: "account $id"
@@ -158,30 +178,50 @@ class RepairPlanner(private val converter: TransactionConverter, private val zon
         val legacyIds = legacy.map { it.first }.distinct()
 
         val current = input.plaidCurrent[id]
+        var pendingTotal = BigDecimal.ZERO
+        var hasOwnJournals = true
         val (opening, date) = if (current != null) {
-            // Anchored to Plaid: the account must end at +-current with all its imported journals in it
+            // Anchored to Plaid: the posted balance (Plaid's current with its listed pending items backed out) must be
+            //  matched by the account's POSTED journals; pending journals are left out of that sum, the same way the
+            //  pending items are backed out of the anchor.
             val owedNegative = account?.let { BatchSyncRunner.carriesOwedAsNegative(it) } == true
             val target = BigDecimal.valueOf(current).let { if (owedNegative) it.negate() else it }
+            val pendingHere = input.plaidTxs.values.filter { it.pending && input.fireflyAccountOfPlaid[it.accountId] == id }
+            val pendingSigned = pendingHere.fold(BigDecimal.ZERO) { a, t -> a + BigDecimal.valueOf(t.amount) }
+            pendingTotal = pendingHere.fold(BigDecimal.ZERO) { a, t -> a + BigDecimal.valueOf(t.amount).abs() }
+            val anchor = target + pendingSigned
+            fun isPending(g: TransactionRead) = g.attributes.transactions.any { t ->
+                t.plaidLinks.orEmpty().any { input.plaidTxs[it.plaidTransactionId]?.pending == true }
+            }
             val own = input.journals.filter { g ->
                 val s = g.attributes.transactions.singleOrNull()
-                s != null && !isLegacyOpening(s) && s.type != TransactionTypeProperty.openingBalance
+                s != null && !isLegacyOpening(s) && s.type != TransactionTypeProperty.openingBalance && !isPending(g)
             }.flatMap { g -> g.attributes.transactions.map { g.id to it } }
             val sum = own.fold(BigDecimal.ZERO) { a, (_, s) -> a + effect(s) }
             val earliest = own.filter { effect(it.second).signum() != 0 }
                 .minOfOrNull { (gid, s) -> (newDates[gid] ?: s.date).atZoneSameInstant(zoneId).toLocalDate() }
-            (target - sum).setScale(2, RoundingMode.HALF_UP) to (earliest ?: LocalDate.now(zoneId)).minusDays(1)
+            hasOwnJournals = earliest != null
+            val day = earliest ?: historyStart ?: LocalDate.now(zoneId)
+            (anchor - sum).setScale(2, RoundingMode.HALF_UP) to day.minusDays(1)
         } else {
             // Not in Plaid (a loan kept from statements): keep the opening the legacy journal had, same amount and date
             val date = legacy.firstOrNull()?.second?.date?.atZoneSameInstant(zoneId)?.toLocalDate()
             (if (isLiability) legacySum.abs() else legacySum) to date
         }
+        val previous = oldOpening ?: legacySum
+        val moved = (opening - previous).abs()
+        val sanity = if (current != null && moved > pendingTotal + BigDecimal.ONE)
+            "opening moves ${previous.toPlainString()} -> ${opening.toPlainString()} (${moved.setScale(2, RoundingMode.HALF_UP)}), more than the listed pending " +
+                    "total ${pendingTotal.setScale(2, RoundingMode.HALF_UP)} + 1.00: check it" else null
         val skip = when {
             legacy.isEmpty() && current == null -> "nothing to repair"
+            missing.isNotEmpty() && current != null -> "SKIPPED: ${missing.size} Plaid transactions missing from Firefly (run a sync first)"
+            current != null && !hasOwnJournals && opening.signum() == 0 -> "no history and a zero balance: no opening needed"
             isLiability && direction != "credit" && opening.signum() > 0 && current != null ->
                 "a debit liability needs a positive opening (${opening.toPlainString()}), which Firefly forces to negative; set it by hand"
             else -> null
         }
-        return OpeningFix(id, name, oldOpening, oldDate, legacySum, legacyIds, opening, date, direction, skip)
+        return OpeningFix(id, name, oldOpening, oldDate, legacySum, legacyIds, opening, date, direction, skip, missing, sanity)
     }
 }
 
@@ -268,21 +308,30 @@ class RepairDatesRunner(
         val accounts = accountIds.mapNotNull { id ->
             runCatching { fireflyAccountsApi.getAccount(id.toString(), null).body().data }.getOrNull()?.let { id to it }
         }.toMap()
-        return RepairInput(journals, plaidTxs, plaidCurrent, accounts) to pending
+        return RepairInput(journals, plaidTxs, plaidCurrent, accounts, accountMap) to pending
     }
 
     private fun print(plan: RepairPlan, input: RepairInput, pending: Map<Int, BigDecimal>) {
         println("== Dates: ${plan.redates.size} journals to re-date (${plan.unmatchedJournals} not found in Plaid's history)")
         plan.redates.take(20).forEach { println("   ${it.groupId} ${it.description.take(40)}: ${it.oldDate} -> ${it.newDate}") }
         if (plan.redates.size > 20) println("   ... and ${plan.redates.size - 20} more")
-        println("== Opening balances")
+        val winter = plan.redates.filter { it.newDate.monthValue in listOf(12, 1, 2) }
+        println("   winter samples (Dec-Feb), ${winter.size} in total:")
+        listOf(winter.firstOrNull(), winter.getOrNull(winter.size / 2), winter.lastOrNull()).filterNotNull().distinct().forEach {
+            println("   ${it.groupId} ${it.description.take(40)}: ${it.oldDate} -> ${it.newDate}")
+        }
+        println("== Opening balances (anchor = Plaid current with its listed pending items backed out; pending journals are excluded from the sum of the account's other journals)")
         for (o in plan.openings) {
             println(
                 "   account ${o.fireflyAccountId} (${o.name}): opening ${o.oldOpening ?: "-"} on ${o.oldOpeningDate ?: "-"}" +
                         " + ${o.legacyGroupIds.size} legacy opening journals (${o.legacyJournalSum})" +
                         " -> ${o.newOpening ?: "-"} on ${o.newOpeningDate ?: "-"}" +
-                        (o.skipReason?.let { "  [SKIPPED: $it]" } ?: if (o.changes) "" else "  [no change]")
+                        (o.skipReason?.let { "  [${if (it.startsWith("SKIPPED")) it else "SKIPPED: $it"}]" } ?: if (o.changes) "" else "  [no change]")
             )
+            o.missing.sortedBy { it.date }.forEach {
+                println("      missing from Firefly: ${it.date} ${it.transactionId} ${it.amount} ${it.name.take(40)}")
+            }
+            o.sanityNote?.let { println("      ANCHOR SANITY: $it") }
         }
         println("== Firefly balance vs Plaid posted balance (Plaid current with its listed pending items backed out)")
         for ((id, current) in input.plaidCurrent.toSortedMap()) {
