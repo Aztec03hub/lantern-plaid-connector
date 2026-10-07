@@ -214,19 +214,27 @@ class TransactionConverter(
         }
     }
 
-    fun getTxAuthorizedTimestamp(tx: PlaidTransaction): OffsetDateTime? {
-        if (tx.authorizedDatetime != null) {
-            return tx.authorizedDatetime
-        } else if (tx.authorizedDate == null) {
-            return null
+    /**
+     * The Firefly timestamp for Plaid's calendar [date]: local midnight in [zoneId], or [datetime] (its time of day) when
+     * converting it to [zoneId] lands on the same calendar day. For a date-only transaction Plaid sends a fake midnight
+     * UTC (05:00Z or 00:00Z), which is 23:00 or 19:00 of the PREVIOUS day in a US winter; that must not move the date.
+     */
+    private fun resolveTimestamp(date: LocalDate, datetime: OffsetDateTime?): OffsetDateTime {
+        if (datetime != null) {
+            val local = datetime.atZoneSameInstant(zoneId)
+            if (local.toLocalDate() == date) return local.toOffsetDateTime()
         }
-        return getOffsetDateTimeForDate(zoneId, tx.authorizedDate)
+        return getOffsetDateTimeForDate(zoneId, date)
     }
 
-    fun getTxPostedTimestamp(tx: PlaidTransaction): OffsetDateTime {
-        return tx.datetime
-            ?: getOffsetDateTimeForDate(zoneId, tx.date)
+    /** When the bank says the transaction was authorized (the purchase date); null if Plaid has none. */
+    fun getTxAuthorizedTimestamp(tx: PlaidTransaction): OffsetDateTime? {
+        if (tx.authorizedDate == null) return tx.authorizedDatetime
+        return resolveTimestamp(tx.authorizedDate, tx.authorizedDatetime)
     }
+
+    /** When the transaction posted: always on Plaid's `date`, see [resolveTimestamp]. */
+    fun getTxPostedTimestamp(tx: PlaidTransaction): OffsetDateTime = resolveTimestamp(tx.date, tx.datetime)
 
     fun getTxDescription(tx: PlaidTransaction): String {
         // Note about the "name" field from Plaid's API docs:
@@ -1067,11 +1075,9 @@ class TransactionConverter(
         }
         val split = TransactionSplit(
             getFireflyTransactionDtoType(tx, isPair, sourceId, destinationId),
-            // Plaid's guidance on using authorized date vs posted date:
-            // The authorized_date, when available, is generally preferable to use over the date field for posted
-            // transactions, as it will generally represent the date the user actually made the transaction.
-            // Source: https://plaid.com/docs/api/products/transactions/#transactionssync
-            authorizedTime ?: postedTime,
+            // The Firefly date is the POSTED date, so balances match what the bank shows; the authorized (purchase)
+            //  date is kept in book_date.
+            postedTime,
             /**
              * Always positive per https://github.com/firefly-iii/firefly-iii/issues/2476
              * "Direction" of transactions handled in [getFireflyTransactionDtoType]
@@ -1081,6 +1087,7 @@ class TransactionConverter(
             java.math.BigDecimal.valueOf(abs(tx.amount)).toPlainString(),
             fireflyTx?.tx?.description ?: getTxDescription(tx),
             processDate = postedTime,
+            bookDate = authorizedTime,
             sourceId = sourceId,
             sourceName = sourceName,
             destinationId = destinationId,

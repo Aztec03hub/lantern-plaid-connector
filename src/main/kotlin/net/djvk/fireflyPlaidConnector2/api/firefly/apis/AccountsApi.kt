@@ -323,4 +323,27 @@ open class AccountsApi(
         ).wrap()
     }
 
+    /**
+     * Sets the account's opening balance through Firefly's own mechanism (PUT /accounts/{id}), which keeps a proper
+     * "opening balance" journal against Firefly's initial-balance account (never an expense account). Hand-written: the
+     * generated [AccountUpdate] has no liability_direction, which Firefly reads for a liability and which decides the
+     * sign (debit: negative, credit: positive, whatever is sent). [amount] is in Firefly's sign.
+     */
+    open suspend fun setOpeningBalance(
+        id: kotlin.String,
+        amount: kotlin.String,
+        date: java.time.LocalDate,
+        liabilityDirection: kotlin.String? = null,
+    ) {
+        val body = mutableMapOf<String, Any?>("opening_balance" to amount, "opening_balance_date" to date.toString())
+        if (liabilityDirection != null) body["liability_direction"] = liabilityDirection
+        jsonRequest(
+            RequestConfig<kotlin.Any?>(
+                RequestMethod.PUT, "/api/v1/accounts/$id", query = mutableMapOf(), headers = mutableMapOf(),
+            ),
+            body,
+            listOf("firefly_iii_auth"),
+        )
+    }
+
 }

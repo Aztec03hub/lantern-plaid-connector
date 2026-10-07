@@ -29,7 +29,6 @@ import org.mockito.kotlin.argumentCaptor
 import org.mockito.kotlin.doReturn
 import org.mockito.kotlin.mock
 import org.mockito.kotlin.whenever
-import java.math.BigDecimal
 
 /** Firefly shows what a debit liability owes as a NEGATIVE balance; Plaid reports `current` as the positive amount owed. */
 internal class LiabilityInitialBalanceTest {
@@ -45,7 +44,7 @@ internal class LiabilityInitialBalanceTest {
         AccountRead("accounts", "1", Account("acct", type, accountRole = role, liabilityDirection = direction), ObjectLink())
 
     /** Runs the batch initial-balance step for one account and returns the opening journal as a signed Firefly effect. */
-    private fun opening(account: AccountRead): Double = runBlocking {
+    private fun opening(account: AccountRead, extra: List<net.djvk.fireflyPlaidConnector2.api.plaid.models.Transaction> = listOf()): Pair<Double, java.time.LocalDate> = runBlocking {
         val plaid = PlaidMock()
         val firefly = FireflyMock()
         val balance = mock<AccountBalance>()
@@ -64,17 +63,17 @@ internal class LiabilityInitialBalanceTest {
         val accountResponse = createFireflyResponse(AccountSingle(account))
         whenever(firefly.accountsApi.getAccount(any(), anyOrNull())).thenReturn(accountResponse)
         val runner = BatchSyncRunnerTest.createRunner(plaid, firefly, setInitialBalance = true, syncHelper = helper)
+        val day = java.time.LocalDate.of(2025, 1, 10)
         val txs = listOf(
-            PlaidFixtures.getPaymentTransaction(accountId = plaidAccount, transactionId = "t1", amount = purchase, pendingTransactionId = null),
-            PlaidFixtures.getPaymentTransaction(accountId = plaidAccount, transactionId = "t2", amount = payment, pendingTransactionId = null),
-        )
-        runner.setInitialBalances(mapOf("token" to txs), helper, java.time.LocalDate.now().minusDays(30))
+            PlaidFixtures.getPaymentTransaction(accountId = plaidAccount, transactionId = "t1", amount = purchase, pendingTransactionId = null, date = day),
+            PlaidFixtures.getPaymentTransaction(accountId = plaidAccount, transactionId = "t2", amount = payment, pendingTransactionId = null, date = day.plusDays(2)),
+        ) + extra
+        runner.setInitialBalances(mapOf("token" to txs), helper, day.minusDays(30))
 
-        val captor = argumentCaptor<List<FireflyTransactionDto>>()
-        org.mockito.kotlin.verify(helper).optimisticInsertBatchIntoFirefly(captor.capture())
-        val split = captor.firstValue.single().tx
-        val amount = split.amount.toDouble()
-        if (split.type == TransactionTypeProperty.deposit) amount else -amount
+        val amount = argumentCaptor<String>()
+        val date = argumentCaptor<java.time.LocalDate>()
+        org.mockito.kotlin.verify(firefly.accountsApi).setOpeningBalance(org.mockito.kotlin.eq("1"), amount.capture(), date.capture(), anyOrNull())
+        amount.firstValue.toDouble() to date.firstValue
     }
 
     /** The balance Firefly ends at: the opening journal plus the imported transactions (Plaid out = Firefly minus). */
@@ -82,33 +81,49 @@ internal class LiabilityInitialBalanceTest {
 
     @Test
     fun aDebitLiabilityEndsAtMinusWhatIsOwed() {
-        val end = endBalance(opening(accountRead(ShortAccountTypeProperty.liabilities, LiabilityDirection.debit)))
+        val end = endBalance(opening(accountRead(ShortAccountTypeProperty.liabilities, LiabilityDirection.debit)).first)
         assertThat(end).isEqualTo(-owed)
     }
 
     @Test
     fun aCreditDirectionLiabilityEndsAtPlusWhatIsOwed() {
-        val end = endBalance(opening(accountRead(ShortAccountTypeProperty.liabilities, LiabilityDirection.credit)))
+        val end = endBalance(opening(accountRead(ShortAccountTypeProperty.liabilities, LiabilityDirection.credit)).first)
         assertThat(end).isEqualTo(owed)
     }
 
     @Test
     fun anAssetIsUnchanged() {
-        val end = endBalance(opening(accountRead(ShortAccountTypeProperty.asset)))
+        val end = endBalance(opening(accountRead(ShortAccountTypeProperty.asset)).first)
         assertThat(end).isEqualTo(owed)
     }
 
     @Test
     fun aCreditCardAssetStillEndsNegative() {
-        val end = endBalance(opening(accountRead(ShortAccountTypeProperty.asset, role = AccountRoleProperty.ccAsset)))
+        val end = endBalance(opening(accountRead(ShortAccountTypeProperty.asset, role = AccountRoleProperty.ccAsset)).first)
         assertThat(end).isEqualTo(-owed)
     }
 
     @Test
-    fun theRebalancePlanChangesOnlyTheOpeningByTheGap() {
-        // Firefly shows +23,817.37 for a debit loan whose opening is +23,817.37 and which has no transactions
-        val plan = RebalancePlan(2, "Lexus", BigDecimal("23817.37"), BigDecimal("-23817.37"), BigDecimal("23817.37"), listOf("g1"), null)
-        assertThat(plan.delta).isEqualByComparingTo("-47634.74")
-        assertThat(plan.newOpening).isEqualByComparingTo("-23817.37")
+    fun theOpeningIsDatedTheDayBeforeTheFirstTransactionNotOnImportDay() {
+        val (_, date) = opening(accountRead(ShortAccountTypeProperty.asset))
+        assertThat(date).isEqualTo(java.time.LocalDate.of(2025, 1, 9))
+    }
+
+    @Test
+    fun aPendingItemInPlaidsCurrentIsBackedOutOfThePostedAnchor() {
+        val pending = PlaidFixtures.getPaymentTransaction(
+            accountId = plaidAccount, transactionId = "p1", amount = 36.0, pending = true, pendingTransactionId = null,
+            date = java.time.LocalDate.of(2025, 1, 12),
+        )
+        val txs = listOf(
+            PlaidFixtures.getPaymentTransaction(accountId = plaidAccount, transactionId = "t1", amount = purchase, pendingTransactionId = null),
+            pending,
+        )
+        val o = BatchSyncRunner.openingFor(txs, owed, owedIsNegative = false)
+        // Plaid's current (250) includes the pending 36 spent, so the posted balance is 286; opening = 286 + posted 100
+        assertThat(o.postedAnchor.toDouble()).isEqualTo(286.0)
+        assertThat(o.amount.toDouble()).isEqualTo(386.0)
+        // and the account still ends at Plaid's current with the pending item imported: 386 - 136
+        assertThat(o.amount.toDouble() - 136.0).isEqualTo(owed)
     }
 }

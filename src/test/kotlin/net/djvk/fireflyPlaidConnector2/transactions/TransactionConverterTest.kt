@@ -496,7 +496,7 @@ internal class TransactionConverterTest {
                 // offset was used to create the Firefly transactions.
                 Arguments.of(
 //                    testName: String,
-                    "Authorized time is preferred over posted, and dateTime is preferred over date",
+                    "The Firefly date is the posted Plaid date at local midnight; authorized goes to book_date",
 //                    accountMap: Map<PlaidAccountId, FireflyAccountId>,
                     PlaidFixtures.getStandardAccountMapping(),
 //                    plaidCreatedTxs: List<PlaidTransaction>,
@@ -554,8 +554,9 @@ internal class TransactionConverterTest {
                                     sourceName = "Unknown Transfer Source",
                                     destinationId = "1",
                                     plaidLinks = listOf(PlaidLink("txWithAuthorizedDateAndDateTime", PlaidLinkLeg.single, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
-                                    date = defaultOffsetNow.minusDays(3),
-                                    processDate = defaultOffsetNow.minusDays(1),
+                                    date = TransactionConverter.getOffsetDateTimeForDate(java.time.ZoneId.of("America/New_York"), defaultLocalNow),
+                                    processDate = TransactionConverter.getOffsetDateTimeForDate(java.time.ZoneId.of("America/New_York"), defaultLocalNow),
+                                    bookDate = TransactionConverter.getOffsetDateTimeForDate(java.time.ZoneId.of("America/New_York"), defaultLocalNow.minusDays(2)),
                                 ).transactions.first()
                             ),
                             FireflyTransactionDto(
@@ -567,8 +568,9 @@ internal class TransactionConverterTest {
                                     sourceName = "Unknown Transfer Source",
                                     destinationId = "1",
                                     plaidLinks = listOf(PlaidLink("txWithAuthorizedDate", PlaidLinkLeg.single, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
-                                    date = defaultOffsetNow.minusDays(2),
-                                    processDate = defaultOffsetNow.minusDays(1),
+                                    date = TransactionConverter.getOffsetDateTimeForDate(java.time.ZoneId.of("America/New_York"), defaultLocalNow),
+                                    processDate = TransactionConverter.getOffsetDateTimeForDate(java.time.ZoneId.of("America/New_York"), defaultLocalNow),
+                                    bookDate = TransactionConverter.getOffsetDateTimeForDate(java.time.ZoneId.of("America/New_York"), defaultLocalNow.minusDays(2)),
                                 ).transactions.first()
                             ),
                             FireflyTransactionDto(
@@ -580,8 +582,8 @@ internal class TransactionConverterTest {
                                     sourceName = "Unknown Transfer Source",
                                     destinationId = "1",
                                     plaidLinks = listOf(PlaidLink("txWithPostedDateAndDateTime", PlaidLinkLeg.single, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
-                                    date = defaultOffsetNow.minusDays(1),
-                                    processDate = defaultOffsetNow.minusDays(1),
+                                    date = TransactionConverter.getOffsetDateTimeForDate(java.time.ZoneId.of("America/New_York"), defaultLocalNow),
+                                    processDate = TransactionConverter.getOffsetDateTimeForDate(java.time.ZoneId.of("America/New_York"), defaultLocalNow),
                                 ).transactions.first()
                             ),
                             FireflyTransactionDto(
@@ -593,8 +595,8 @@ internal class TransactionConverterTest {
                                     sourceName = "Unknown Transfer Source",
                                     destinationId = "1",
                                     plaidLinks = listOf(PlaidLink("txWithPostedDate", PlaidLinkLeg.single, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
-                                    date = defaultOffsetNow,
-                                    processDate = defaultOffsetNow,
+                                    date = TransactionConverter.getOffsetDateTimeForDate(java.time.ZoneId.of("America/New_York"), defaultLocalNow),
+                                    processDate = TransactionConverter.getOffsetDateTimeForDate(java.time.ZoneId.of("America/New_York"), defaultLocalNow),
                                 ).transactions.first()
                             ),
                         ),

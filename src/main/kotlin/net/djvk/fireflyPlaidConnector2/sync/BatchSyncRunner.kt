@@ -255,45 +255,22 @@ class BatchSyncRunner(
                     continue
                 }
                 val owedIsNegative = carriesOwedAsNegative(fireflyAccount)
-
                 val txs = plaidTxsByAccountId[accountId] ?: listOf()
-                val total = txs.fold(0.0) { acc, tx -> acc + tx.amount }
-
-                val initialBalance = initialBalanceFor(total, currentBalance, owedIsNegative)
-
-                val earliestTimestamp = txs.fold(OffsetDateTime.now()) { acc, tx ->
-                    val ts = converter.getTxPostedTimestamp(tx)
-                    if (ts < acc) {
-                        ts
-                    } else {
-                        acc
-                    }
-                }
-                logger.debug("Inserting initial balance $initialBalance for Firefly account id $fireflyAccountId")
-                syncHelper.optimisticInsertBatchIntoFirefly(
-                    listOf(
-                        FireflyTransactionDto(
-                            null, TransactionSplit(
-                                /**
-                                 * Would like this to be [TransactionTypeProperty.openingBalance], but the Firefly API doesn't
-                                 *  let us insert with that value.
-                                 *
-                                 */
-                                type = if (initialBalance < 0) TransactionTypeProperty.withdrawal else TransactionTypeProperty.deposit,
-                                date = earliestTimestamp.minusHours(1),
-                                // Sums of doubles carry binary noise (0.30000000000000004), so round to cents, and
-                                //  avoid scientific notation, which Firefly rejects
-                                amount = java.math.BigDecimal.valueOf(initialBalance.absoluteValue)
-                                    .setScale(2, java.math.RoundingMode.HALF_UP).toPlainString(),
-                                description = "Plaid Connector Initial Balance",
-                                sourceName = "Initial Balance",
-                                sourceId = if (initialBalance < 0) fireflyAccountId.toString() else null,
-                                destinationId = if (initialBalance < 0) null else fireflyAccountId.toString(),
-                                order = 0,
-                                reconciled = false,
-                            )
-                        )
+                val opening = openingFor(txs, currentBalance, owedIsNegative)
+                val isLiability = isLiabilityAccount(fireflyAccount)
+                if (isLiability && opening.amount.signum() > 0 && owedIsNegative) {
+                    logger.warn(
+                        "Firefly forces the opening balance of a debit liability to be negative, but Firefly account " +
+                                "$fireflyAccountId needs ${opening.amount}; opening balance NOT set, set it by hand"
                     )
+                    continue
+                }
+                // Dated the day before the first imported transaction, so the account does not read 0 before it
+                val earliest = txs.minOfOrNull { converter.getTxPostedTimestamp(it).toLocalDate() } ?: LocalDate.now()
+                logger.debug("Setting opening balance {} on {} for Firefly account id {}", opening.amount, earliest.minusDays(1), fireflyAccountId)
+                fireflyAccountsApi.setOpeningBalance(
+                    fireflyAccountId.toString(), opening.amount.toPlainString(), earliest.minusDays(1),
+                    if (isLiability) (fireflyAccount.attributes.liabilityDirection?.value ?: "debit") else null,
                 )
             }
         }
@@ -316,6 +293,27 @@ class BatchSyncRunner(
          * +current, or -current when [owedIsNegative], and the imported transactions move the balance by -[total]
          * (Plaid counts money out as positive), so opening = target + total.
          */
+        fun isLiabilityAccount(account: AccountRead): Boolean = account.attributes.type.value.startsWith("liabilit")
+
+        /** The opening balance and the posted-balance anchor it was computed from, see [openingFor]. */
+        data class Opening(val amount: java.math.BigDecimal, val postedAnchor: java.math.BigDecimal)
+
+        /**
+         * The opening balance (Firefly sign) for an account whose imported transactions are [txs] (Plaid sign) and whose
+         * Plaid `current` balance is [current]. Plaid's `current` includes the pending items it lists, so the anchor
+         * for the POSTED balance has them backed out (Firefly sign: target + sum of pending); the opening is then that
+         * anchor plus the posted transactions. The pending transactions themselves are imported too, so the account
+         * ends at the target with them and at the posted anchor without them.
+         */
+        fun openingFor(txs: List<Transaction>, current: Double, owedIsNegative: Boolean): Opening {
+            fun d(x: Double) = java.math.BigDecimal.valueOf(x)
+            val target = if (owedIsNegative) d(current).negate() else d(current)
+            val pending = txs.filter { it.pending }.fold(java.math.BigDecimal.ZERO) { a, t -> a + d(t.amount) }
+            val posted = txs.filter { !it.pending }.fold(java.math.BigDecimal.ZERO) { a, t -> a + d(t.amount) }
+            val anchor = target + pending
+            return Opening((anchor + posted).setScale(2, java.math.RoundingMode.HALF_UP), anchor.setScale(2, java.math.RoundingMode.HALF_UP))
+        }
+
         fun initialBalanceFor(total: Double, current: Double, owedIsNegative: Boolean): Double =
             if (owedIsNegative) total - current else total + current
     }
