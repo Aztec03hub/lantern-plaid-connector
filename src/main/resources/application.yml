@@ -97,6 +97,10 @@ fireflyPlaidConnector2:
     #   pull every transaction from the beginning of time.
     # Defaults to false.
     setInitialBalance: false
+    # Turn Firefly's running balance off while the batch writes, and on again after. Firefly recomputes later balances on
+    #   every insert, which limits a bulk import; measured 2 writes/s with it on, 53/s off. Afterwards run
+    #   `php artisan firefly-iii:refresh-running-balance --force` in Firefly. Defaults to false.
+    disableRunningBalance: false
     # The number of seconds in the past to use as min_last_updated_datetime in the Plaid /accounts/balance/get call
     # https://plaid.com/docs/api/products/balance/#accounts-balance-get-request-options-min-last-updated-datetime
     # Note that this field is only used for Capital One non-depository accounts.

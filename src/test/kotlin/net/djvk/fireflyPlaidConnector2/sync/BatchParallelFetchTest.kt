@@ -71,4 +71,34 @@ internal class BatchParallelFetchTest {
         assertThat(offsetsByToken.keys).hasSize(4)
         assertThat(maxInFlight.get()).describedAs("Items read at the same time").isEqualTo(4)
     }
+
+    @Test
+    fun theRunningBalanceIsTurnedOffForTheRunAndOnAgainEvenWhenTheRunFails() = runBlocking<Unit> {
+        val assets = createFireflyResponse(AccountArray((1..4).map { AccountRead("accounts", "$it", Account("a$it", ShortAccountTypeProperty.asset), ObjectLink()) }, Meta()))
+        val noLiabilities = createFireflyResponse(AccountArray(listOf(), Meta()))
+        whenever(firefly.accountsApi.listAccount(anyOrNull(), anyOrNull(), eq(AccountTypeFilter.asset))).thenReturn(assets)
+        whenever(firefly.accountsApi.listAccount(anyOrNull(), anyOrNull(), eq(AccountTypeFilter.liabilities))).thenReturn(noLiabilities)
+        val page = mock<TransactionsGetResponse> { on { transactions } doReturn listOf() }
+        val pageResponse = createPlaidResponse(page)
+        whenever(plaid.api.transactionsGet(any<TransactionsGetRequest>())).thenReturn(pageResponse)
+        val configurationApi = mock<net.djvk.fireflyPlaidConnector2.api.firefly.apis.ConfigurationApi>()
+        val reconciler = mock<TransferReconciler>()
+        whenever(reconciler.reconcile(any(), any(), any())).doSuspendableAnswer { throw IllegalStateException("pairing blew up") }
+        val items = (1..4).map { AccountConfig(it, "token$it", "plaid$it") }
+        val helper = SyncHelper(AccountConfigs(items), "t", firefly.aboutApi, firefly.transactionsApi, firefly.accountsApi, firefly.plaidLinksApi)
+        val runner = BatchSyncRunner(
+            5, false, null, 100, plaid.wrapper, helper, firefly.accountsApi,
+            net.djvk.fireflyPlaidConnector2.transactions.TransactionConverter(
+                false, "America/New_York", 5, false, "p-", false, "d-", net.djvk.fireflyPlaidConnector2.config.properties.TransactionStyleConfig(),
+            ),
+            reconciler, configurationApi, true, "tok",
+        )
+
+        val failure = runCatching { runner.run() }.exceptionOrNull()
+
+        assertThat(failure).hasMessageContaining("pairing blew up")
+        val order = org.mockito.kotlin.inOrder(configurationApi)
+        order.verify(configurationApi).setUseRunningBalance(false)
+        order.verify(configurationApi).setUseRunningBalance(true)
+    }
 }

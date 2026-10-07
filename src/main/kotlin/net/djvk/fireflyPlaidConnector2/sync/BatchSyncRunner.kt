@@ -6,6 +6,7 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.runBlocking
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.AccountsApi
+import net.djvk.fireflyPlaidConnector2.api.firefly.apis.ConfigurationApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.AccountRead
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionSplit
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionTypeProperty
@@ -52,6 +53,18 @@ class BatchSyncRunner(
 
     /** Pairs what is left unpaired in Firefly after the run; null (tests) skips it. */
     private val reconciler: TransferReconciler? = null,
+
+    /** Used only for [disableRunningBalance]; null (tests) leaves Firefly's configuration alone. */
+    private val configurationApi: ConfigurationApi? = null,
+    /**
+     * Turn Firefly's running balance off while this run writes, and on again after (also when it fails). Firefly
+     * recomputes every later balance on each insert, which was the limit of a bulk import (about 2 to 50 writes per
+     * second). Run `php artisan firefly-iii:refresh-running-balance --force` afterwards to fill the balances in.
+     */
+    @Value("\${fireflyPlaidConnector2.batch.disableRunningBalance:false}")
+    private val disableRunningBalance: Boolean = false,
+    @Value("\${fireflyPlaidConnector2.firefly.personalAccessToken:}")
+    private val fireflyAccessToken: String = "",
     ) : Runner {
     private val logger = LoggerFactory.getLogger(this::class.java)
 
@@ -76,15 +89,31 @@ class BatchSyncRunner(
                 allPlaidTxs.getOrPut(accessToken) { mutableListOf() }.addAll(txs)
             }
 
-            // Map Plaid transactions to Firefly transactions
-            val fireflyTxs = converter.convertBatchSync(allPlaidTxs.values.flatten(), accountMap)
+            val switchRunningBalance = disableRunningBalance && configurationApi != null
+            if (switchRunningBalance) {
+                configurationApi!!.setAccessToken(fireflyAccessToken)
+                configurationApi.setUseRunningBalance(false)
+                logger.info("Firefly's running balance is off for this run")
+            }
+            try {
+                // Map Plaid transactions to Firefly transactions
+                val fireflyTxs = converter.convertBatchSync(allPlaidTxs.values.flatten(), accountMap)
 
-            // Insert into Firefly
-            syncHelper.optimisticInsertBatchIntoFirefly(fireflyTxs)
+                // Insert into Firefly
+                syncHelper.optimisticInsertBatchIntoFirefly(fireflyTxs)
 
-            // Whatever this run could not pair in memory (a leg imported by an earlier or parallel run) is paired
-            //  from what Firefly holds now
-            reconciler?.let { it.reconcile(startDate.minusDays(it.transferMatchWindowDays), endDate) }
+                // Whatever this run could not pair in memory (a leg imported by an earlier or parallel run) is paired
+                //  from what Firefly holds now
+                reconciler?.let { it.reconcile(startDate.minusDays(it.transferMatchWindowDays), endDate) }
+            } finally {
+                if (switchRunningBalance) {
+                    configurationApi!!.setUseRunningBalance(true)
+                    logger.info(
+                        "Firefly's running balance is on again; fill it in with: " +
+                                "php artisan firefly-iii:refresh-running-balance --force"
+                    )
+                }
+            }
 
             // Set initial balance transaction if configured
             if (setInitialBalance) {

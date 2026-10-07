@@ -139,4 +139,21 @@ open class ConfigurationApi(
         ).wrap()
     }
 
+    /**
+     * Hand-written (the generated [setConfiguration] has no use_running_balance and sends the value's toString):
+     * PUT /api/v1/configuration/configuration.use_running_balance with a JSON boolean.
+     */
+    open suspend fun setUseRunningBalance(enabled: kotlin.Boolean) {
+        jsonRequest(
+            RequestConfig<kotlin.Any?>(
+                RequestMethod.PUT,
+                "/api/v1/configuration/configuration.use_running_balance",
+                query = mutableMapOf(),
+                headers = mutableMapOf(),
+            ),
+            mapOf("value" to enabled),
+            listOf("firefly_iii_auth"),
+        )
+    }
+
 }
