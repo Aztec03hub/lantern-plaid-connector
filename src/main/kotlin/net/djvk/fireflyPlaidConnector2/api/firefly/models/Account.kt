@@ -149,7 +149,7 @@ data class Account(
     val interest: kotlin.String? = null,
 
     @field:JsonProperty("interest_period")
-    val interestPeriod: LiabilityDirection? = null,
+    val interestPeriod: InterestPeriod? = null,
 
     @field:JsonProperty("notes")
     val notes: kotlin.String? = null,

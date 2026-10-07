@@ -56,6 +56,8 @@ abstract class ApiClient(
             registerModule(JavaTimeModule())
             configure(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS, false)
             configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
+            // A value Firefly adds to an enum later must not crash a read of something the connector barely uses
+            configure(DeserializationFeature.READ_UNKNOWN_ENUM_VALUES_AS_NULL, true)
         }
         protected val UNSAFE_HEADERS = listOf<String>()
     }
