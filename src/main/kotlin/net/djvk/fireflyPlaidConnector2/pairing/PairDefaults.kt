@@ -9,6 +9,7 @@ object PairDefaults {
     val outMarkers = listOf(
         Marker("ach", Regex("^AC ")),
         Marker("dcu-to", Regex("(?i)(^|onlin )to (loan|share) ")),
+        Marker("online-withdrawal", Regex("(?i)^withdrawal onlin ")),
         Marker("balance-transfer", Regex("BALANCE CONSOLIDATION")),
         Marker("sofi-vault", Regex("^(Roundup \\*|To Emergency Fund Vault)")),
     )

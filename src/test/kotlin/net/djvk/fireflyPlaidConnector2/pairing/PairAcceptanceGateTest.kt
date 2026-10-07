@@ -147,6 +147,18 @@ internal class PairAcceptanceGateTest {
         println("traps rejected: ${traps.size - trapsAccepted.size}/${traps.size}  (of which hard-vetoed: $trapVetoed)")
         println("min TRUE score: $minTrue   max trap score (non-vetoed): $maxTrap  (including vetoed, meaningless: $maxTrapAny)   autoMin=${PairingConfig().autoMin} reviewMin=${PairingConfig().reviewMin}")
         println("ambiguous components: ${result.ambiguous.size}; waiting: ${result.waiting.size}")
+        // every non-vetoed trap that scored at least reviewMin: its rules and the rules of the pair(s) that took its legs
+        val proposalOfLeg = result.proposals.flatMap { p -> listOf(p.edge.out.id to p.edge, p.edge.inn.id to p.edge) }.toMap()
+        fun rp(e: Edge?) = e?.points?.joinToString(" ") { "${it.rule}:${it.points}" } ?: "none"
+        println("traps scoring >= reviewMin (not vetoed), with the pair that beat each:")
+        traps.filter { it !in truth }.forEach { (o, i) ->
+            val e = engine.evaluate(legById.getValue(o), legById.getValue(i))
+            if (e != null && e.veto == null && e.score >= PairingConfig().reviewMin) {
+                println("  TRAP score=${e.score} gap=${e.gap} [${rp(e)}]")
+                println("     beaten on out leg by gap=${proposalOfLeg[o]?.gap} [${rp(proposalOfLeg[o])}]")
+                println("     beaten on in leg  by gap=${proposalOfLeg[i]?.gap} [${rp(proposalOfLeg[i])}]")
+            }
+        }
         println("review-band TRUE pairs by rule set (rule:points only):")
         reviewHistogram.forEach { (k, n) -> println("  $n x $k") }
         missed.forEach { (o, i) ->
