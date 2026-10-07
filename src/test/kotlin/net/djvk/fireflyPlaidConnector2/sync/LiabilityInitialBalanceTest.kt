@@ -68,7 +68,7 @@ internal class LiabilityInitialBalanceTest {
             PlaidFixtures.getPaymentTransaction(accountId = plaidAccount, transactionId = "t1", amount = purchase, pendingTransactionId = null, date = day),
             PlaidFixtures.getPaymentTransaction(accountId = plaidAccount, transactionId = "t2", amount = payment, pendingTransactionId = null, date = day.plusDays(2)),
         ) + extra).let { all -> if (noOwnTransactions) all.map { it.copy(accountId = "b".repeat(37)) } else all }
-        runner.setInitialBalances(mapOf("token" to txs), helper, day.minusDays(30))
+        runner.setInitialBalances(mapOf("token" to txs), helper)
         if ((noOwnTransactions && current == 0.0) || expectNoOpening) {
             org.mockito.kotlin.verify(firefly.accountsApi, org.mockito.kotlin.never()).setOpeningBalance(any(), any(), any(), anyOrNull())
             return@runBlocking null

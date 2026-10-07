@@ -38,6 +38,15 @@ const val OPENING_BALANCE_DESCRIPTION = "Plaid Connector Initial Balance"
 const val STATEMENT_TAG = "lantern-dcu-statement"
 private const val LEGACY_DCU_OPENING = "DCU statement opening balance"
 
+/** Whether [s] is an opening-balance journal of an older build or of the DCU statement import. */
+internal fun isLegacyOpeningSplit(s: net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionSplit) =
+    s.description == OPENING_BALANCE_DESCRIPTION || s.description == LEGACY_DCU_OPENING ||
+            s.externalId?.startsWith("dcu-stmt:opening") == true
+
+/** The own account of a legacy opening journal: the destination of a deposit, the source of a withdrawal. */
+internal fun legacyOwner(s: net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionSplit): Int? =
+    (if (s.type == TransactionTypeProperty.deposit) s.destinationId else s.sourceId)?.toIntOrNull()
+
 /** One journal to re-date to Plaid's posted date, and to give the authorized date in book_date. */
 data class Redate(
     val groupId: String,
@@ -102,10 +111,10 @@ class RepairPlanner(
     private val zoneId: ZoneId,
     /** Firefly account ids whose opening amount may move even when the anchor sanity check fails (gap confirmed by a person). */
     private val reanchor: Set<Int> = setOf(),
+    /** Plaid transaction ids that are deliberately not in Firefly: they do not block their account's opening. */
+    private val ignoreMissing: Set<String> = setOf(),
 ) {
-    private fun isLegacyOpening(s: net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionSplit) =
-        s.description == OPENING_BALANCE_DESCRIPTION || s.description == LEGACY_DCU_OPENING ||
-                s.externalId?.startsWith("dcu-stmt:opening") == true
+    private fun isLegacyOpening(s: net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionSplit) = isLegacyOpeningSplit(s)
 
     fun plan(input: RepairInput): RepairPlan {
         val redates = mutableListOf<Redate>()
@@ -157,10 +166,12 @@ class RepairPlanner(
         val posted = input.plaidTxs.values.filter { !it.pending }
         val held = input.journals.flatMap { g -> g.attributes.transactions.flatMap { it.plaidLinks.orEmpty() } }
             .map { it.plaidTransactionId }.toSet()
-        val missingByAccount = posted.filter { it.transactionId !in held }
+        val splitAccounts = input.journals.filter { it.attributes.transactions.size > 1 }
+            .flatMap { g -> g.attributes.transactions.flatMap { listOfNotNull(it.sourceId?.toIntOrNull(), it.destinationId?.toIntOrNull()) } }.toSet()
+        val missingByAccount = posted.filter { it.transactionId !in held && it.transactionId !in ignoreMissing }
             .groupBy { input.fireflyAccountOfPlaid[it.accountId] }
         val openings = accountIds.map { id ->
-            openingFix(id, input, legacyByAccount[id].orEmpty(), newDates, historyStart, missingByAccount[id].orEmpty())
+            openingFix(id, input, legacyByAccount[id].orEmpty(), newDates, historyStart, missingByAccount[id].orEmpty(), id in splitAccounts)
         }
 
         return RepairPlan(redates, unmatched, openings)
@@ -173,6 +184,7 @@ class RepairPlanner(
         newDates: Map<String, OffsetDateTime>,
         historyStart: LocalDate?,
         missing: List<PlaidTransaction>,
+        touchedBySplit: Boolean,
     ): OpeningFix {
         val account = input.accounts[id]
         val name = account?.attributes?.name ?: "account $id"
@@ -219,9 +231,11 @@ class RepairPlanner(
             val day = earliest ?: historyStart ?: LocalDate.now(zoneId)
             (anchor - sum).setScale(2, RoundingMode.HALF_UP) to day.minusDays(1)
         } else {
-            // Not in Plaid (a loan kept from statements): keep the opening the legacy journal had, same amount and date
+            // Not in Plaid (a loan kept from statements): keep the opening the legacy journal had, same amount and date.
+            //  For a liability the amount owed is what counts, and Firefly gives it the sign of its direction (debit:
+            //  negative, credit: positive), so that sign is sent too: it is also what Firefly echoes back later.
             val date = legacy.firstOrNull()?.second?.date?.atZoneSameInstant(zoneId)?.toLocalDate()
-            (if (isLiability) legacySum.abs() else legacySum) to date
+            (if (isLiability) (if (direction == "credit") legacySum.abs() else legacySum.abs().negate()) else legacySum) to date
         }
         val previous = oldOpening ?: legacySum
         val moved = (opening - previous).abs()
@@ -235,10 +249,11 @@ class RepairPlanner(
         val badSign = isLiability && ((direction == "credit" && finalOpening.signum() < 0) || (direction != "credit" && finalOpening.signum() > 0))
         val skip = when {
             account == null -> "account not read: not changing anything for it"
+            touchedBySplit -> "a split transaction touches this account and its splits are not summed; set the opening by hand"
             legacy.isEmpty() && current == null -> "nothing to repair"
-            missing.isNotEmpty() && current != null -> "SKIPPED: ${missing.size} Plaid transactions missing from Firefly (run a sync first)"
+            missing.isNotEmpty() && current != null -> "SKIPPED: ${missing.size} Plaid transactions missing from Firefly (run a sync first, or list the ids in repair.ignoreMissing if they are deliberately not imported)"
             current != null && !hasOwnJournals && opening.signum() == 0 -> "no history and a zero balance: no opening needed"
-            badSign && current != null ->
+            badSign ->
                 "this liability needs an opening of ${finalOpening.toPlainString()}, which Firefly forces to the other sign (${direction ?: "debit"}); set it by hand"
             else -> null
         }
@@ -282,10 +297,16 @@ class RepairDatesRunner(
     /** Comma separated Firefly account ids that may be re-anchored although the balance moved unexplained. */
     @Value("\${fireflyPlaidConnector2.repair.reanchor:}")
     reanchorIds: String = "",
+    /** Comma separated Plaid transaction ids that are deliberately not in Firefly. */
+    @Value("\${fireflyPlaidConnector2.repair.ignoreMissing:}")
+    ignoreMissingIds: String = "",
 ) : Runner {
     private val logger = LoggerFactory.getLogger(this::class.java)
     private val zoneId = ZoneId.of(timeZoneString)
-    private val planner = RepairPlanner(converter, zoneId, reanchorIds.split(",").mapNotNull { it.trim().toIntOrNull() }.toSet())
+    private val planner = RepairPlanner(
+        converter, zoneId, reanchorIds.split(",").mapNotNull { it.trim().toIntOrNull() }.toSet(),
+        ignoreMissingIds.split(",").map { it.trim() }.filter { it.isNotEmpty() }.toSet(),
+    )
 
     override fun run() = runBlocking<Unit> {
         syncHelper.setApiCreds()
@@ -315,7 +336,19 @@ class RepairDatesRunner(
         val plaidTxs = mutableMapOf<String, PlaidTransaction>()
         val plaidCurrent = mutableMapOf<Int, Double>()
         val pending = mutableMapOf<Int, BigDecimal>()
-        for ((token, ids) in items) {
+        val itemList = items.toList()
+        // Balances first, then transactions, then the transaction counts again: a posting in between would move the
+        //  balance without being in the list, so it aborts the read instead of landing in an opening
+        println("Plaid read started at ${java.time.OffsetDateTime.now()}")
+        for ((token, ids) in itemList) {
+            val balances = plaidApiWrapper.executeRequest(
+                { it.accountsBalanceGet(AccountsBalanceGetRequest(token, null, null, AccountsBalanceGetRequestOptions(ids, null))) },
+                "balance get request",
+            ).body().accounts
+            balances.forEach { b -> b.balances.current?.let { c -> accountMap[b.accountId]?.let { f -> plaidCurrent[f] = c } } }
+        }
+        val totals = mutableMapOf<String, Int>()
+        for ((token, ids) in itemList) {
             var offset = 0
             var total = 0
             do {
@@ -332,18 +365,25 @@ class RepairDatesRunner(
                 }
                 offset += page.size
             } while (offset < total && page.isNotEmpty())
-            val balances = plaidApiWrapper.executeRequest(
-                { it.accountsBalanceGet(AccountsBalanceGetRequest(token, null, null, AccountsBalanceGetRequestOptions(ids, null))) },
-                "balance get request",
-            ).body().accounts
-            balances.forEach { b -> b.balances.current?.let { c -> accountMap[b.accountId]?.let { f -> plaidCurrent[f] = c } } }
+            // An empty page before Plaid's total is a truncated read, which would hide missing transactions
+            check(offset >= total) { "Plaid returned an empty page at offset $offset of $total transactions; nothing was decided, run again" }
+            totals[token] = total
         }
+        for ((token, ids) in itemList) {
+            val again = plaidApiWrapper.executeRequest(
+                { it.transactionsGet(TransactionsGetRequest(token, end.minusDays(repairDays.toLong()), end, null, TransactionsGetRequestOptions(ids, 1, 0))) },
+                "transaction get request",
+            ).body().totalTransactions
+            check(again == totals[token]) { "Plaid's transactions changed while they were being read ($again now, ${totals[token]} before); run again" }
+        }
+        println("Plaid read finished at ${java.time.OffsetDateTime.now()}")
         // The whole history: openings are sums over every journal of the account, so a window would silently under-read
         //  them. fetchFireflyTransactionsBetween throws, instead of returning a truncated list, when it cannot read it all.
         val journals = fireflyTransactionService.fetchFireflyTransactionsBetween(LocalDate.of(2000, 1, 1), end.plusDays(2), 5000)
-        val accountIds = (plaidCurrent.keys + journals.flatMap { g -> g.attributes.transactions.flatMap { listOfNotNull(it.sourceId?.toIntOrNull(), it.destinationId?.toIntOrNull()) } }).toSet()
+        // Only the accounts the repair decides about: the configured ones and the owners of a legacy opening journal
+        val accountIds = plaidCurrent.keys + journals.flatMap { g -> g.attributes.transactions.filter { isLegacyOpeningSplit(it) }.mapNotNull { legacyOwner(it) } }
         // A failed read is an error, never a default: an account read as an asset would get the wrong sign
-        val accounts = accountIds.associateWith { id -> fireflyAccountsApi.getAccount(id.toString(), null).body().data }
+        val accounts = accountIds.toSet().associateWith { id -> fireflyAccountsApi.getAccount(id.toString(), null).body().data }
         return RepairInput(journals, plaidTxs, plaidCurrent, accounts, accountMap) to pending
     }
 
@@ -406,6 +446,13 @@ class RepairDatesRunner(
             } else if (o.oldOpening != null && o.oldOpening.signum() != 0) {
                 // Firefly ignores an opening of 0; only an empty one makes it delete the opening balance journal
                 fireflyAccountsApi.clearOpeningBalance(o.fireflyAccountId.toString())
+            }
+            // A 2xx does not prove Firefly stored it: read the account back before the legacy journals go
+            val stored = fireflyAccountsApi.getAccount(o.fireflyAccountId.toString(), null).body().data.attributes
+            val storedAmount = stored.openingBalance?.toBigDecimalOrNull() ?: BigDecimal.ZERO
+            check(storedAmount.compareTo(amount) == 0 && (amount.signum() == 0 || stored.openingBalanceDate?.toLocalDate() == date)) {
+                "Firefly did not store the opening balance of account ${o.fireflyAccountId} (sent $amount on $date, it holds " +
+                        "$storedAmount on ${stored.openingBalanceDate}); the legacy opening journals were NOT deleted"
             }
             // The opening is in place first, so a crash here leaves a duplicate legacy journal, never a gap
             syncHelper.deleteBatchInFirefly(o.legacyGroupIds)

@@ -292,7 +292,7 @@ internal class DatesAndOpeningsRepairTest {
         )
         val o = p.openings.single()
         assertThat(o.fireflyAccountId).isEqualTo(2)
-        assertThat(o.newOpening!!.toPlainString()).isEqualTo("33051.60") // Firefly makes it negative for a debit liability
+        assertThat(o.newOpening!!.toPlainString()).isEqualTo("-33051.60") // the amount owed, with the sign Firefly gives a debit liability
         assertThat(o.newOpeningDate).isEqualTo(LocalDate.of(2025, 4, 1))
         assertThat(o.liabilityDirection).isEqualTo("debit")
         assertThat(o.legacyGroupIds).containsExactly("g9")
@@ -437,6 +437,62 @@ internal class DatesAndOpeningsRepairTest {
         val vault = p.openings.single { it.fireflyAccountId == 6 }
         assertThat(vault.skipReason).contains("no opening needed")
         assertThat(vault.changes).isFalse()
+    }
+
+    @Test
+    fun aStatementKeptDebitLoanWhoseLegacyJournalHadTheWrongSignIsOpenedWithTheDirectionsSign() {
+        val legacy = journal(
+            "g9", midnight(LocalDate.of(2025, 4, 1)), null, type = TransactionTypeProperty.deposit, amount = "100.00",
+            source = null, destination = "2", description = "DCU statement opening balance", externalId = "dcu-stmt:opening:2",
+        )
+        val debit = plan(listOf(legacy), listOf(), accounts = mapOf(2 to account(ShortAccountTypeProperty.liabilities, "Loan", LiabilityDirection.debit))).openings.single()
+        assertThat(debit.newOpening!!.toPlainString()).isEqualTo("-100.00")
+        val credit = plan(listOf(legacy), listOf(), accounts = mapOf(2 to account(ShortAccountTypeProperty.liabilities, "Loan", LiabilityDirection.credit))).openings.single()
+        assertThat(credit.newOpening!!.toPlainString()).isEqualTo("100.00")
+        assertThat(debit.skipReason).isNull()
+    }
+
+    @Test
+    fun anAccountTouchedByASplitTransactionIsSkippedNotSummed() {
+        val day = LocalDate.of(2024, 12, 6)
+        val split = TransactionRead(
+            "transactions", "gs",
+            net.djvk.fireflyPlaidConnector2.api.firefly.models.Transaction(
+                transactions = listOf(
+                    FireflyFixtures.getTransaction(amount = "5.00", sourceId = "1", date = midnight(day)).transactions.first(),
+                    FireflyFixtures.getTransaction(amount = "7.00", sourceId = "1", date = midnight(day)).transactions.first(),
+                ),
+                groupTitle = "Split",
+            ),
+            ObjectLink(),
+        )
+        val o = plan(
+            listOf(journal("g1", midnight(day), "w1"), split), listOf(plaid("w1", day)), mapOf(1 to 500.0),
+            mapOf(1 to account(ShortAccountTypeProperty.asset, "Checking")),
+        ).openings.single()
+        assertThat(o.skipReason).contains("split transaction")
+    }
+
+    @Test
+    fun aMissingTransactionThatIsListedAsIgnoredDoesNotBlockTheOpening() {
+        val day = LocalDate.of(2024, 12, 6)
+        val planner = RepairPlanner(converter(), zone, setOf(), setOf("payroll"))
+        val o = planner.plan(
+            RepairInput(
+                listOf(journal("g1", midnight(day), "w1")),
+                listOf(plaid("w1", day), plaid("payroll", day.plusDays(3), amount = -5.0)).associateBy { it.transactionId },
+                mapOf(1 to 505.0), mapOf(1 to account(ShortAccountTypeProperty.asset, "Checking")), mapOf(plaidAccount to 1),
+            )
+        ).openings.single()
+        assertThat(o.skipReason).isNull()
+    }
+
+    @Test
+    fun aDaylightSavingGapAtMidnightGivesTheFirstInstantOfTheDay() {
+        // Sao Paulo (before 2019) skipped 00:00 on the start of DST
+        val sp = ZoneId.of("America/Sao_Paulo")
+        val d = TransactionConverter.getOffsetDateTimeForDate(sp, LocalDate.of(2018, 11, 4))
+        assertThat(d.atZoneSameInstant(sp).toLocalDate()).isEqualTo(LocalDate.of(2018, 11, 4))
     }
 
     // endregion

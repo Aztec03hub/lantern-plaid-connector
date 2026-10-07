@@ -117,7 +117,7 @@ class BatchSyncRunner(
 
             // Set initial balance transaction if configured
             if (setInitialBalance) {
-                setInitialBalances(allPlaidTxs, syncHelper, startDate)
+                setInitialBalances(allPlaidTxs, syncHelper)
             }
         }
     }
@@ -194,6 +194,8 @@ class BatchSyncRunner(
             // Keep going until we get all the transactions
         // By Plaid's total, not by page size: a short page in the middle must not end the read early
         } while (offset < total && plaidTxs.isNotEmpty())
+        // An empty page before Plaid's total is a truncated read: carrying on would build openings from a partial list
+        check(offset >= total) { "Plaid returned an empty page at offset $offset of $total transactions for ${redactAccessToken(accessToken)}" }
         logger.debug("Done fetching Plaid data for access token ${redactAccessToken(accessToken)} and account ids ${accountIds.joinToString()}")
         return result
     }
@@ -202,7 +204,6 @@ class BatchSyncRunner(
     suspend fun setInitialBalances(
         allPlaidTxs: Map<PlaidAccessToken, List<Transaction>>,
         syncHelper: SyncHelper,
-        startDate: LocalDate,
     ) {
         logger.info("Attempting to set initial balances")
         val historyStart = allPlaidTxs.values.flatten().minOfOrNull { converter.getTxPostedTimestamp(it).toLocalDate() }

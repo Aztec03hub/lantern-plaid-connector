@@ -136,4 +136,23 @@ internal class BatchParallelFetchTest {
 
         assertThat(offsets).containsExactly(0, 1, 2)
     }
+
+    @Test
+    fun aBatchPlaidReadThatEndsOnAnEmptyPageBeforeTheTotalFails() = runBlocking<Unit> {
+        val assets = createFireflyResponse(AccountArray(listOf(AccountRead("accounts", "1", Account("a1", ShortAccountTypeProperty.asset), ObjectLink())), Meta()))
+        val noLiabilities = createFireflyResponse(AccountArray(listOf(), Meta()))
+        whenever(firefly.accountsApi.listAccount(anyOrNull(), anyOrNull(), eq(AccountTypeFilter.asset))).thenReturn(assets)
+        whenever(firefly.accountsApi.listAccount(anyOrNull(), anyOrNull(), eq(AccountTypeFilter.liabilities))).thenReturn(noLiabilities)
+        whenever(plaid.api.transactionsGet(any<TransactionsGetRequest>())).doSuspendableAnswer {
+            val response = mock<TransactionsGetResponse>()
+            whenever(response.transactions).thenReturn(listOf())
+            whenever(response.totalTransactions).thenReturn(5)
+            createPlaidResponse(response)
+        }
+        val helper = SyncHelper(AccountConfigs(listOf(AccountConfig(1, "token1", "a".repeat(37)))), "t", firefly.aboutApi, firefly.transactionsApi, firefly.accountsApi, firefly.plaidLinksApi)
+
+        val failure = runCatching { BatchSyncRunnerTest.createRunner(plaid, firefly, syncHelper = helper).run() }.exceptionOrNull()
+
+        assertThat(failure).hasMessageContaining("empty page")
+    }
 }

@@ -185,9 +185,8 @@ class TransactionConverter(
         }
 
         fun getOffsetDateTimeForDate(zoneId: ZoneId, date: LocalDate): OffsetDateTime {
-            val instant = date.atStartOfDay(zoneId).toInstant()
-            val offset = zoneId.rules.getOffset(instant)
-            return date.atTime(OffsetTime.of(0, 0, 0, 0, offset))
+            // Where the zone has no midnight (a DST gap at 00:00) this is the first valid instant of the day
+            return date.atStartOfDay(zoneId).toOffsetDateTime()
         }
 
         /**

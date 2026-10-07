@@ -73,6 +73,18 @@ internal class RepairDatesRunnerTest {
 
     // region apply
 
+    /** What Firefly answers when the account is read back after the opening was set. */
+    private fun storedOpening(amount: String?, date: LocalDate?) = runBlocking {
+        val account = AccountRead(
+            "accounts", "2",
+            Account("Lexus", ShortAccountTypeProperty.liabilities, openingBalance = amount,
+                openingBalanceDate = date?.atStartOfDay()?.atOffset(java.time.ZoneOffset.ofHours(-6))),
+            ObjectLink(),
+        )
+        val response = createFireflyResponse(AccountSingle(account))
+        whenever(accountsApi.getAccount(any(), anyOrNull())).thenReturn(response)
+    }
+
     private fun noExpenseAccounts() = runBlocking {
         val none = createFireflyResponse(AccountArray(listOf(), Meta()))
         whenever(accountsApi.listAccount(anyOrNull(), anyOrNull(), eq(AccountTypeFilter.expense))).thenReturn(none)
@@ -81,6 +93,7 @@ internal class RepairDatesRunnerTest {
     @Test
     fun theOpeningIsSetBeforeTheLegacyJournalIsDeleted() = runBlocking<Unit> {
         noExpenseAccounts()
+        storedOpening("33051.60", LocalDate.of(2025, 3, 31))
         runner().applyPlan(RepairPlan(listOf(), 0, listOf(fix(null, "33051.60", listOf("g9"), "debit"))))
 
         val order = inOrder(accountsApi, syncHelper)
@@ -91,6 +104,7 @@ internal class RepairDatesRunnerTest {
     @Test
     fun aZeroOpeningClearsTheStaleOneInsteadOfSendingZero() = runBlocking<Unit> {
         noExpenseAccounts()
+        storedOpening(null, null)
         runner().applyPlan(RepairPlan(listOf(), 0, listOf(fix("500.00", "0.00", listOf("g9")))))
 
         verify(accountsApi).clearOpeningBalance("2")
@@ -152,7 +166,13 @@ internal class RepairDatesRunnerTest {
     @Test
     fun aFailedAccountReadAbortsTheReadInsteadOfDefaultingToAnAsset() {
         emptyFirefly()
-        val journal = TransactionRead("transactions", "g1", FireflyFixtures.getTransaction(sourceId = "4"), ObjectLink())
+        val journal = TransactionRead(
+            "transactions", "g1",
+            FireflyFixtures.getTransaction(
+                type = net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionTypeProperty.deposit, destinationId = "4",
+                description = "DCU statement opening balance",
+            ), ObjectLink(),
+        )
         runBlocking { whenever(service.fetchFireflyTransactionsBetween(any(), any(), any())).thenReturn(listOf(journal)) }
         runBlocking { whenever(accountsApi.getAccount(any(), anyOrNull())).doSuspendableAnswer { throw IllegalStateException("Firefly 503") } }
 
@@ -206,6 +226,67 @@ internal class RepairDatesRunnerTest {
         assertThat(seen[0].third).contains(""""opening_balance":"33051.60"""", """"opening_balance_date":"2025-04-01"""", """"liability_direction":"debit"""")
         assertThat(seen[1].third).doesNotContain("liability_direction")
         assertThat(seen[2].third).contains(""""opening_balance":""""", """"opening_balance_date":""""")
+    }
+
+    @Test
+    fun theLegacyJournalsAreNotDeletedWhenFireflyDidNotStoreTheOpening() = runBlocking<Unit> {
+        noExpenseAccounts()
+        storedOpening("-1.00", LocalDate.of(2025, 3, 31)) // the PUT answered 2xx but the account still holds something else
+        val failure = runCatching {
+            runner().applyPlan(RepairPlan(listOf(), 0, listOf(fix(null, "33051.60", listOf("g9"), "debit"))))
+        }.exceptionOrNull()
+
+        assertThat(failure).hasMessageContaining("did not store")
+        verify(syncHelper, never()).deleteBatchInFirefly(any())
+    }
+
+    @Test
+    fun aPlaidReadThatEndsOnAnEmptyPageBeforeTheTotalFails() {
+        emptyFirefly()
+        val acct = "a".repeat(37)
+        runBlocking { whenever(syncHelper.getAllPlaidAccessTokenAccountIdSets()).thenReturn(Pair(mapOf(acct to 1), sequenceOf("token" to listOf(acct)))) }
+        runBlocking {
+            val balances = mock<net.djvk.fireflyPlaidConnector2.api.plaid.models.AccountsGetResponse>()
+            whenever(balances.accounts).thenReturn(listOf())
+            val balanceResponse = createPlaidResponse(balances)
+            whenever(plaid.api.accountsBalanceGet(any<AccountsBalanceGetRequest>())).thenReturn(balanceResponse)
+            whenever(plaid.api.transactionsGet(any<TransactionsGetRequest>())).doSuspendableAnswer {
+                val response = mock<TransactionsGetResponse>()
+                whenever(response.transactions).thenReturn(listOf()) // empty, though 5 are promised
+                whenever(response.totalTransactions).thenReturn(5)
+                createPlaidResponse(response)
+            }
+        }
+
+        val failure = runCatching { runBlocking { runner().readState() } }.exceptionOrNull()
+
+        assertThat(failure).hasMessageContaining("empty page")
+    }
+
+    @Test
+    fun aPlaidTransactionCountThatChangesDuringTheReadAbortsIt() {
+        emptyFirefly()
+        val acct = "a".repeat(37)
+        runBlocking { whenever(syncHelper.getAllPlaidAccessTokenAccountIdSets()).thenReturn(Pair(mapOf(acct to 1), sequenceOf("token" to listOf(acct)))) }
+        runBlocking {
+            val balances = mock<net.djvk.fireflyPlaidConnector2.api.plaid.models.AccountsGetResponse>()
+            whenever(balances.accounts).thenReturn(listOf())
+            val balanceResponse = createPlaidResponse(balances)
+            whenever(plaid.api.accountsBalanceGet(any<AccountsBalanceGetRequest>())).thenReturn(balanceResponse)
+            val calls = java.util.concurrent.atomic.AtomicInteger(0)
+            whenever(plaid.api.transactionsGet(any<TransactionsGetRequest>())).doSuspendableAnswer {
+                val n = calls.incrementAndGet()
+                val response = mock<TransactionsGetResponse>()
+                val one = PlaidFixtures.getPaymentTransaction(accountId = acct, transactionId = "t1", pendingTransactionId = null)
+                whenever(response.transactions).thenReturn(if (n == 1) listOf(one) else listOf())
+                whenever(response.totalTransactions).thenReturn(if (n == 1) 1 else 2) // a posting arrived in between
+                createPlaidResponse(response)
+            }
+        }
+
+        val failure = runCatching { runBlocking { runner().readState() } }.exceptionOrNull()
+
+        assertThat(failure).hasMessageContaining("changed while")
     }
 
     // endregion
