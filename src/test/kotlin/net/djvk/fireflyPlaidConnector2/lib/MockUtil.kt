@@ -73,8 +73,15 @@ class FireflyMock {
     val aboutApi = mock<AboutApi>()
     val transactionsApi = mock<TransactionsApi>()
     val accountsApi = mock<AccountsApi>()
+    val plaidLinksApi = mock<net.djvk.fireflyPlaidConnector2.api.firefly.apis.PlaidLinksApi>()
 
     init {
+        // The startup probe (SyncHelper.setApiCreds) looks up one id; an empty answer means "endpoint exists"
+        plaidLinksApi.stub {
+            onBlocking { lookupPlaidLinks(any()) } doAnswer {
+                createFireflyResponse(net.djvk.fireflyPlaidConnector2.api.firefly.models.PlaidLinkLookupResponse(listOf()))
+            }
+        }
         val systemInfoData = SystemInfoData(
             version = MINIMUM_FIREFLY_VERSION,
             apiVersion = "1.0.0",

@@ -95,7 +95,7 @@ internal class SecurityHardeningTest {
     // region silent data loss
 
     @Test
-    fun pessimisticInsertDoesNotSwallowClientErrorsOtherThan422() = runBlocking<Unit> {
+    fun optimisticInsertDoesNotSwallowClientErrorsOtherThan409() = runBlocking<Unit> {
         val firefly = FireflyMock()
         // Produce a genuine 403 ClientRequestException using a mock engine
         val client = io.ktor.client.HttpClient(MockEngine { respond("{}", HttpStatusCode.Forbidden) }) {
@@ -107,12 +107,12 @@ internal class SecurityHardeningTest {
             e
         }!!
         whenever(firefly.transactionsApi.storeTransaction(any())).doSuspendableAnswer { throw forbidden }
-        val helper = SyncHelper(AccountConfigs(emptyList()), "token", firefly.aboutApi, firefly.transactionsApi, firefly.accountsApi)
+        val helper = SyncHelper(AccountConfigs(emptyList()), "token", firefly.aboutApi, firefly.transactionsApi, firefly.accountsApi, firefly.plaidLinksApi)
         val dto = FireflyTransactionDto(null, FireflyFixtures.getTransaction().transactions.first())
 
-        // Used for the "delete, then re-create" step of a transfer update: swallowing a failure here lost the
-        // transaction, because the delete had already happened.
-        assertThrows<ClientRequestException> { runBlocking { helper.pessimisticInsertBatchIntoFirefly(listOf(dto)) } }
+        // Only a 409 ("already imported") is skipped; swallowing any other client error would lose the transaction
+        // once the caller commits its Plaid cursor.
+        assertThrows<ClientRequestException> { runBlocking { helper.optimisticInsertBatchIntoFirefly(listOf(dto)) } }
     }
 
     // endregion

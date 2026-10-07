@@ -11,6 +11,7 @@ import net.djvk.fireflyPlaidConnector2.lib.FireflyFixtures
 import net.djvk.fireflyPlaidConnector2.api.firefly.infrastructure.HttpResponse as FireflyHttpResponse
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionSingle
 import net.djvk.fireflyPlaidConnector2.lib.FireflyMock
+import net.djvk.fireflyPlaidConnector2.lib.createFireflyResponse
 import net.djvk.fireflyPlaidConnector2.transactions.FireflyTransactionDto
 import net.djvk.fireflyPlaidConnector2.transactions.TransactionConverter
 import net.djvk.fireflyPlaidConnector2.util.Utilities
@@ -231,11 +232,19 @@ internal class NetworkResilienceTest {
         var calls = 0
         whenever(firefly.transactionsApi.storeTransaction(any())).doSuspendableAnswer {
             calls++
-            if (calls == 1) throw ConnectTimeoutException("timeout") else mock<FireflyHttpResponse<TransactionSingle>>()
+            if (calls == 1) throw ConnectTimeoutException("timeout") else createFireflyResponse(
+                TransactionSingle(
+                    net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionRead(
+                        "transactions", "1",
+                        net.djvk.fireflyPlaidConnector2.api.firefly.models.Transaction(transactions = it.getArgument<net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionStore>(0).transactions),
+                        net.djvk.fireflyPlaidConnector2.api.firefly.models.ObjectLink(),
+                    )
+                )
+            )
         }
         val helper = SyncHelper(
             net.djvk.fireflyPlaidConnector2.config.properties.AccountConfigs(emptyList()),
-            "token", firefly.aboutApi, firefly.transactionsApi, firefly.accountsApi,
+            "token", firefly.aboutApi, firefly.transactionsApi, firefly.accountsApi, firefly.plaidLinksApi,
         )
         val dto = FireflyTransactionDto(null, FireflyFixtures.getTransaction().transactions.first())
         val dto2 = FireflyTransactionDto(null, FireflyFixtures.getTransaction(description = "second").transactions.first())

@@ -3,6 +3,7 @@ package net.djvk.fireflyPlaidConnector2.sync
 import kotlinx.coroutines.runBlocking
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.AboutApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.AccountsApi
+import net.djvk.fireflyPlaidConnector2.api.firefly.apis.PlaidLinksApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.SearchApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.TransactionsApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionRead
@@ -41,10 +42,11 @@ internal class LiveFireflyTest {
     private val config = ApiConfiguration().getClientConfig()
     private val txApi = TransactionsApi(url, null, config)
     private val searchApi = SearchApi(url, null, config)
+    private val plaidLinksApi = PlaidLinksApi(url, null, config)
     private val syncHelper = SyncHelper(
-        AccountConfigs(emptyList()), token, AboutApi(url, null, config), txApi, AccountsApi(url, null, config), searchApi
+        AccountConfigs(emptyList()), token, AboutApi(url, null, config), txApi, AccountsApi(url, null, config), plaidLinksApi
     )
-    private val service = FireflyTransactionService(txApi, syncHelper, 30, "UTC", searchApi)
+    private val service = FireflyTransactionService(txApi, syncHelper, 30, "UTC", plaidLinksApi)
 
     private val converter = TransactionConverter(
         useNameForDestination = true, enablePrimaryCategorization = false, primaryCategoryPrefix = "p-",
@@ -53,7 +55,7 @@ internal class LiveFireflyTest {
     )
 
     private suspend fun creds() {
-        txApi.setAccessToken(token); searchApi.setAccessToken(token)
+        txApi.setAccessToken(token); searchApi.setAccessToken(token); plaidLinksApi.setAccessToken(token)
     }
 
     private fun today(): OffsetDateTime = LocalDate.now().atStartOfDay().atOffset(ZoneOffset.UTC)
