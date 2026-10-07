@@ -7,6 +7,7 @@ import net.djvk.fireflyPlaidConnector2.api.firefly.models.AccountArray
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.AccountRead
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.AccountTypeFilter
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.ObjectLink
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionRead
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.ShortAccountTypeProperty
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.Meta
 import net.djvk.fireflyPlaidConnector2.api.plaid.models.TransactionsGetRequest
@@ -100,5 +101,39 @@ internal class BatchParallelFetchTest {
         val order = org.mockito.kotlin.inOrder(configurationApi)
         order.verify(configurationApi).setUseRunningBalance(false)
         order.verify(configurationApi).setUseRunningBalance(true)
+    }
+
+    @Test
+    fun anItemIsReadToPlaidsTotalEvenWhenAPageIsShort() = runBlocking<Unit> {
+        val assets = createFireflyResponse(AccountArray(listOf(AccountRead("accounts", "1", Account("a1", ShortAccountTypeProperty.asset), ObjectLink())), Meta()))
+        val noLiabilities = createFireflyResponse(AccountArray(listOf(), Meta()))
+        whenever(firefly.accountsApi.listAccount(anyOrNull(), anyOrNull(), eq(AccountTypeFilter.asset))).thenReturn(assets)
+        whenever(firefly.accountsApi.listAccount(anyOrNull(), anyOrNull(), eq(AccountTypeFilter.liabilities))).thenReturn(noLiabilities)
+        whenever(firefly.transactionsApi.storeTransaction(any())).doSuspendableAnswer {
+            val store = it.getArgument<net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionStore>(0)
+            createFireflyResponse(
+                net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionSingle(
+                    TransactionRead("transactions", "1", net.djvk.fireflyPlaidConnector2.api.firefly.models.Transaction(transactions = store.transactions), ObjectLink())
+                )
+            )
+        }
+        val offsets = java.util.concurrent.CopyOnWriteArrayList<Int>()
+        // 3 transactions in total, delivered one per call although the page size is 100
+        whenever(plaid.api.transactionsGet(any<TransactionsGetRequest>())).doSuspendableAnswer {
+            val offset = it.getArgument<TransactionsGetRequest>(0).options!!.offset!!
+            offsets.add(offset)
+            val one = net.djvk.fireflyPlaidConnector2.lib.PlaidFixtures.getPaymentTransaction(
+                accountId = "a".repeat(37), transactionId = "t$offset", pendingTransactionId = null, amount = 5.0,
+            )
+            val response = mock<TransactionsGetResponse>()
+            whenever(response.transactions).thenReturn(listOf(one))
+            whenever(response.totalTransactions).thenReturn(3)
+            createPlaidResponse(response)
+        }
+        val helper = SyncHelper(AccountConfigs(listOf(AccountConfig(1, "token1", "a".repeat(37)))), "t", firefly.aboutApi, firefly.transactionsApi, firefly.accountsApi, firefly.plaidLinksApi)
+
+        BatchSyncRunnerTest.createRunner(plaid, firefly, syncHelper = helper).run()
+
+        assertThat(offsets).containsExactly(0, 1, 2)
     }
 }

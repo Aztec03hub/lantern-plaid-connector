@@ -132,6 +132,7 @@ class BatchSyncRunner(
         val result = mutableListOf<Transaction>()
         logger.debug("Fetching Plaid data for access token ${redactAccessToken(accessToken)} and account ids ${accountIds.joinToString()}")
         var offset = 0
+        var total = 0
         do {
             /**
              * Iterate through batches of Plaid transactions
@@ -166,10 +167,12 @@ class BatchSyncRunner(
             )
             val plaidTxs: List<Transaction>
             try {
-                plaidTxs = plaidApiWrapper.executeRequest(
+                val body = plaidApiWrapper.executeRequest(
                     { plaidApi -> plaidApi.transactionsGet(request) },
                     "transaction get request"
-                ).body().transactions
+                ).body()
+                plaidTxs = body.transactions
+                total = body.totalTransactions
                 logger.debug("\tReceived a batch of ${plaidTxs.size} Plaid transactions")
             } catch (cre: ClientRequestException) {
                 // The request object holds the access token, so don't log it
@@ -189,7 +192,8 @@ class BatchSyncRunner(
             offset += plaidTxs.size
 
             // Keep going until we get all the transactions
-        } while (plaidTxs.size == plaidBatchSize)
+        // By Plaid's total, not by page size: a short page in the middle must not end the read early
+        } while (offset < total && plaidTxs.isNotEmpty())
         logger.debug("Done fetching Plaid data for access token ${redactAccessToken(accessToken)} and account ids ${accountIds.joinToString()}")
         return result
     }

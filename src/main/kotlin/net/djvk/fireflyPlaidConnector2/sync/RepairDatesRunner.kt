@@ -413,15 +413,17 @@ class RepairDatesRunner(
         deleteOrphanInitialBalanceAccount()
     }
 
-    internal suspend fun deleteOrphanInitialBalanceAccount() {
-        var expense: AccountRead? = null
+    private suspend fun findInitialBalanceExpenseAccount(): AccountRead? {
         var page = 1
-        do {
+        while (true) {
             val response = fireflyAccountsApi.listAccount(page++, null, AccountTypeFilter.expense).body()
-            expense = response.data.firstOrNull { it.attributes.name == "Initial Balance" }
-            val more = response.meta.pagination?.let { it.currentPage < it.totalPages } == true
-        } while (expense == null && more)
-        if (expense == null) return
+            response.data.firstOrNull { it.attributes.name == "Initial Balance" }?.let { return it }
+            if (response.meta.pagination?.let { it.currentPage < it.totalPages } != true) return null
+        }
+    }
+
+    internal suspend fun deleteOrphanInitialBalanceAccount() {
+        val expense = findInitialBalanceExpenseAccount() ?: return
         val left = fireflyAccountsApi.listTransactionByAccount(expense.id, 1, 1, null, null, TransactionTypeFilter.all).body().data
         if (left.isNotEmpty()) {
             println("The expense account \"Initial Balance\" still has journals; not deleted.")

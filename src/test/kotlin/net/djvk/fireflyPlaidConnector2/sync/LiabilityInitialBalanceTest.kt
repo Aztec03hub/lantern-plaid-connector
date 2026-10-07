@@ -44,7 +44,7 @@ internal class LiabilityInitialBalanceTest {
         AccountRead("accounts", "1", Account("acct", type, accountRole = role, liabilityDirection = direction), ObjectLink())
 
     /** Runs the batch initial-balance step for one account and returns the opening journal as a signed Firefly effect. */
-    private fun opening(account: AccountRead, extra: List<net.djvk.fireflyPlaidConnector2.api.plaid.models.Transaction> = listOf(), noOwnTransactions: Boolean = false, current: Double = owed): Pair<Double, java.time.LocalDate>? = runBlocking {
+    private fun opening(account: AccountRead, extra: List<net.djvk.fireflyPlaidConnector2.api.plaid.models.Transaction> = listOf(), noOwnTransactions: Boolean = false, current: Double = owed, expectNoOpening: Boolean = false): Pair<Double, java.time.LocalDate>? = runBlocking {
         val plaid = PlaidMock()
         val firefly = FireflyMock()
         val balance = mock<AccountBalance>()
@@ -69,7 +69,7 @@ internal class LiabilityInitialBalanceTest {
             PlaidFixtures.getPaymentTransaction(accountId = plaidAccount, transactionId = "t2", amount = payment, pendingTransactionId = null, date = day.plusDays(2)),
         ) + extra).let { all -> if (noOwnTransactions) all.map { it.copy(accountId = "b".repeat(37)) } else all }
         runner.setInitialBalances(mapOf("token" to txs), helper, day.minusDays(30))
-        if (noOwnTransactions && current == 0.0) {
+        if ((noOwnTransactions && current == 0.0) || expectNoOpening) {
             org.mockito.kotlin.verify(firefly.accountsApi, org.mockito.kotlin.never()).setOpeningBalance(any(), any(), any(), anyOrNull())
             return@runBlocking null
         }
@@ -140,5 +140,22 @@ internal class LiabilityInitialBalanceTest {
     @Test
     fun aZeroBalanceAccountWithNoHistoryGetsNoOpening() {
         assertThat(opening(accountRead(ShortAccountTypeProperty.asset), noOwnTransactions = true, current = 0.0)).isNull()
+    }
+
+    @Test
+    fun aCreditLiabilityThatWouldNeedANegativeOpeningIsNotSet() {
+        // 1,000 was paid into it: opening = 250 + (100 - 30 - 1000) is negative, which Firefly would flip to positive
+        val deposit = PlaidFixtures.getPaymentTransaction(
+            accountId = plaidAccount, transactionId = "t3", amount = -1000.0, pendingTransactionId = null, date = java.time.LocalDate.of(2025, 1, 11),
+        )
+        assertThat(opening(accountRead(ShortAccountTypeProperty.liabilities, LiabilityDirection.credit), listOf(deposit), expectNoOpening = true)).isNull()
+    }
+
+    @Test
+    fun aDebitLiabilityThatWouldNeedAPositiveOpeningIsNotSet() {
+        val purchase = PlaidFixtures.getPaymentTransaction(
+            accountId = plaidAccount, transactionId = "t3", amount = 5000.0, pendingTransactionId = null, date = java.time.LocalDate.of(2025, 1, 11),
+        )
+        assertThat(opening(accountRead(ShortAccountTypeProperty.liabilities, LiabilityDirection.debit), listOf(purchase), expectNoOpening = true)).isNull()
     }
 }
