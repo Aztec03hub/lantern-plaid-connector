@@ -235,6 +235,20 @@ internal class PendingTransactionTest {
     }
 
     @Test
+    fun onlyASettledTransactionThatMayBeATransferIsALookupCandidateForPairing() {
+        val c = converter()
+        val transfer = posted().copy(
+            personalFinanceCategory = net.djvk.fireflyPlaidConnector2.transactions.PersonalFinanceCategoryEnum.TRANSFER_OUT_ACCOUNT_TRANSFER.toPersonalFinanceCategory()
+        )
+        assertThat(c.mightPairAsTransfer(transfer)).isTrue()
+        assertThat(c.mightPairAsTransfer(transfer.copy(pending = true))).describedAs("pending ones are never paired").isFalse()
+        val groceries = posted().copy(
+            personalFinanceCategory = net.djvk.fireflyPlaidConnector2.transactions.PersonalFinanceCategoryEnum.FOOD_AND_DRINK_COFFEE.toPersonalFinanceCategory()
+        )
+        assertThat(c.mightPairAsTransfer(groceries)).describedAs("a category that rules a transfer out").isFalse()
+    }
+
+    @Test
     fun aPendingTransactionIsNotPromotedWhenThePostedIdIsAlreadyIndexed() = runBlocking<Unit> {
         val pending = existingFirefly("ff1", single("pendingId"))
         // held by a transfer (not a pairing candidate, so nothing else skips the posted create first)
