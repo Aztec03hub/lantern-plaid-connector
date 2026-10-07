@@ -438,8 +438,21 @@ class TransactionConverter(
                 }
             }
 
-            // Nothing here guards against a Plaid id Firefly already holds (a retry after a partly failed iteration): the
-            //  link table refuses it with a 409, which the write treats as "already imported".
+            // A single create, or a conversion, whose Plaid id another Firefly transaction already holds (a retry after a
+            //  partly failed iteration, possibly held by a transfer) is skipped without a request; for a conversion the
+            //  transaction being converted is not "another". A two-leg create is left to the write: the link table's 409
+            //  lists which leg conflicts and the other one is then created on its own.
+            val links = convertedSingle.tx.plaidLinks.orEmpty()
+            if (convertedSingle.id != null || links.size == 1) {
+                val alreadyRecorded = links.mapNotNull { indexer.find(it.plaidTransactionId) }.firstOrNull { it.id != convertedSingle.id }
+                if (alreadyRecorded != null) {
+                    logger.info(
+                        "Skipping {} of {}: Firefly transaction {} already records it",
+                        if (convertedSingle.id == null) "create" else "conversion", links.map { it.plaidTransactionId }, alreadyRecorded.id,
+                    )
+                    continue
+                }
+            }
             if (convertedSingle.id == null) {
                 creates.add(convertedSingle)
             } else {
