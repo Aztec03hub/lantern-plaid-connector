@@ -101,6 +101,10 @@ class PairEngine(private val accounts: List<PairAccount>, private val config: Pa
                 allowed.none { it.id == inn.account } -> veto = "destination-contradiction"
                 rule.target is DestTarget.Mask -> points.add(RulePoints("destination-exact", 4, "destination", "mask $mask"))
                 allowed.size == 1 -> points.add(RulePoints("destination-institution", 3, "destination", byId[inn.account]?.name))
+                // 4.3.5 narrowing: an institution with several accounts (DCU) is narrowed to one by the inflow's own role,
+                // a card-payment text can only land on a card, so exactly one card at the named institution qualifies
+                inMarkers.contains("card-payment") && allowed.filter { "card" in it.roles }.singleOrNull()?.id == inn.account ->
+                    points.add(RulePoints("destination-narrowed", 3, "destination", "the only card at the named institution"))
                 else -> {
                     flags.add("ambiguous-destination")
                     points.add(RulePoints("destination-ambiguous", 0, "destination", "${allowed.size} accounts qualify"))

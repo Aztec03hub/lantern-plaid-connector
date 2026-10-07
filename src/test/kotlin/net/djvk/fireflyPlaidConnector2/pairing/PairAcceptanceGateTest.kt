@@ -92,63 +92,64 @@ internal class PairAcceptanceGateTest {
         val review = result.proposals.filter { !it.auto }
 
         val oracle = mapper.readTree(oracleFile)
-        val truth = oracle.filter { it["label"].asText() == "TRUE" }.map { it["out"].asText() to it["inn"].asText() }
+        // the TRUE set is oracle-v2 (statement-proven) when present, else oracle.json
+        val v2File = File(dir, "oracle-v2.json")
+        val v2 = if (v2File.exists()) mapper.readTree(v2File) else null
+        val truthRows = (v2 ?: oracle).filter { it.has("out") && it.has("inn") && (!it.has("label") || it["label"].asText() == "TRUE") }
+            .map { it["out"].asText() to it["inn"].asText() }
+        val truth = truthRows.filter { it.first in legById && it.second in legById }
+        val routedBy9 = truthRows.size - truth.size
         val traps = oracle.filter { it["label"].asText() == "FALSE" }.map { it["out"].asText() to it["inn"].asText() }
-        val truthSigs = truth.filter { it.first in legById && it.second in legById }.map { sig(legById.getValue(it.first), legById.getValue(it.second)) }
-            .groupingBy { it }.eachCount().toMutableMap()
-        val autoSigs = auto.groupingBy { sig(it.edge.out, it.edge.inn) }.eachCount()
-        val reviewSigs = review.groupingBy { sig(it.edge.out, it.edge.inn) }.eachCount()
 
+        // every proposal is explained by a TRUE signature (consumed up to its count), else it is a trap or a false positive
+        val remaining = truth.groupingBy { sig(legById.getValue(it.first), legById.getValue(it.second)) }.eachCount().toMutableMap()
+        val trapSet = traps.toSet()
         var foundAuto = 0
         var foundReview = 0
+        var falseAuto = 0
+        var falseReview = 0
+        val trapsAccepted = mutableListOf<Pair<String, String>>()
+        val reviewHistogram = sortedMapOf<String, Int>()
+        for (p in result.proposals.sortedByDescending { it.auto }) {
+            val s = sig(p.edge.out, p.edge.inn)
+            if ((remaining[s] ?: 0) > 0) {
+                remaining[s] = remaining.getValue(s) - 1
+                if (p.auto) foundAuto++ else {
+                    foundReview++
+                    reviewHistogram.merge(p.edge.points.filter { it.points != 0 }.joinToString(" ") { "${it.rule}:${it.points}" }, 1, Int::plus)
+                }
+            } else if ((p.edge.out.id to p.edge.inn.id) in trapSet) trapsAccepted.add(p.edge.out.id to p.edge.inn.id)
+            else if (p.auto) falseAuto++ else falseReview++
+        }
         val missed = mutableListOf<Pair<String, String>>()
-        val remainingAuto = autoSigs.toMutableMap()
-        val remainingReview = reviewSigs.toMutableMap()
+        val stillWanted = remaining.toMutableMap()
         for ((o, i) in truth) {
             val s = sig(legById.getValue(o), legById.getValue(i))
-            when {
-                (remainingAuto[s] ?: 0) > 0 -> { remainingAuto[s] = remainingAuto.getValue(s) - 1; foundAuto++ }
-                (remainingReview[s] ?: 0) > 0 -> { remainingReview[s] = remainingReview.getValue(s) - 1; foundReview++ }
-                else -> missed.add(o to i)
-            }
+            if ((stillWanted[s] ?: 0) > 0) { stillWanted[s] = stillWanted.getValue(s) - 1; missed.add(o to i) }
         }
-        val falseAuto = remainingAuto.filterValues { it > 0 }
-        val falseReview = remainingReview.filterValues { it > 0 }
-
-        // traps: no proposal may contain the exact (out, inn) of a trap
-        val proposed = result.proposals.map { it.edge.out.id to it.edge.inn.id }.toSet()
-        val trapsAccepted = traps.filter { it in proposed }
         val minTrue = truth.mapNotNull { (o, i) -> engine.evaluate(legById.getValue(o), legById.getValue(i))?.takeIf { it.veto == null }?.score }.minOrNull()
-        val maxTrap = traps.mapNotNull { (o, i) -> engine.evaluate(legById.getValue(o), legById.getValue(i))?.takeIf { it.veto == null }?.score }.maxOrNull()
+        val maxTrap = traps.filter { it !in truth }.mapNotNull { (o, i) -> engine.evaluate(legById.getValue(o), legById.getValue(i))?.takeIf { it.veto == null }?.score }.maxOrNull()
         val trapVetoed = traps.count { (o, i) -> engine.evaluate(legById.getValue(o), legById.getValue(i))?.veto != null }
 
         println("=== ACCEPTANCE GATE ===")
         println("universe: ${legs.size} settled legs, ${accounts.size} accounts; candidates scored: ${result.candidates}")
-        println("TRUE pairs found: ${foundAuto + foundReview}/${truth.size}  (auto ${foundAuto}, review band $foundReview)")
-        println("false positives: auto ${falseAuto.values.sum()}, review band ${falseReview.values.sum()}")
+        println("TRUE pairs found: ${foundAuto + foundReview}/${truth.size}  (auto ${foundAuto}, review band $foundReview); routed by 9: pending ($routedBy9 legs)")
+        println("false positives: auto $falseAuto, review band $falseReview")
         println("traps rejected: ${traps.size - trapsAccepted.size}/${traps.size}  (of which hard-vetoed: $trapVetoed)")
         println("min TRUE score: $minTrue   max trap score: $maxTrap   autoMin=${PairingConfig().autoMin} reviewMin=${PairingConfig().reviewMin}")
         println("ambiguous components: ${result.ambiguous.size}; waiting: ${result.waiting.size}")
+        println("review-band TRUE pairs by rule set (rule:points only):")
+        reviewHistogram.forEach { (k, n) -> println("  $n x $k") }
         missed.forEach { (o, i) ->
             val e = engine.evaluate(legById.getValue(o), legById.getValue(i))
-            println("MISSED ${byId.getValue(o).date} ${byId.getValue(o).accountName.take(16)} [${byId.getValue(o).text.take(40)}] -> " +
-                    "${byId.getValue(i).accountName.take(16)} [${byId.getValue(i).text.take(34)}] ${byId.getValue(i).date}  " +
-                    "score=${e?.score} veto=${e?.veto} layer=${e?.layer} families=${e?.families} points=${e?.points?.map { "${it.rule}:${it.points}" }}")
+            println("MISSED score=${e?.score} veto=${e?.veto} layer=${e?.layer} families=${e?.families} points=${e?.points?.map { "${it.rule}:${it.points}" }}")
         }
-        trapsAccepted.forEach { (o, i) -> println("TRAP ACCEPTED ${byId.getValue(o).text.take(40)} -> ${byId.getValue(i).text.take(40)}") }
-        falseAuto.keys.forEach { println("FALSE POSITIVE (auto) $it") }
-
-        // the optional statement-proven set: anything it names that the universe lacks is a section 9 routing, not a pair
-        File(dir, "oracle-v2.json").takeIf { it.exists() }?.let { f ->
-            val v2 = mapper.readTree(f)
-            val keys = v2.firstOrNull()?.fieldNames()?.asSequence()?.toList()
-            val pairs = v2.filter { it.has("out") && it.has("inn") && (!it.has("label") || it["label"].asText() == "TRUE") }
-            val inUniverse = pairs.count { it["out"].asText() in legById && it["inn"].asText() in legById }
-            println("oracle-v2: ${v2.size()} rows (fields $keys), ${pairs.size} pair rows, $inUniverse with both legs in the universe, ${pairs.size - inUniverse} routed by section 9")
+        trapsAccepted.forEach { (o, i) ->
+            println("TRAP ACCEPTED points=${engine.evaluate(legById.getValue(o), legById.getValue(i))?.points?.map { "${it.rule}:${it.points}" }}")
         }
 
         assertThat(missed).describedAs("TRUE pairs not found (auto or review)").isEmpty()
-        assertThat(falseAuto).describedAs("false positives among auto-merges").isEmpty()
+        assertThat(falseAuto + falseReview).describedAs("false positives").isZero()
         assertThat(trapsAccepted).describedAs("traps that were proposed").isEmpty()
         assertThat(foundReview).describedAs("TRUE pairs that only reach the review band: autoMin is not calibrated").isZero()
         if (minTrue != null && maxTrap != null) {

@@ -85,11 +85,22 @@ internal class PairEngineTest {
     @Test
     fun aByInstitutionDestinationWithSeveralAccountsGetsNoPointsAndIsFlagged() {
         // "PHILLIP LAFAYETT ACH XFER" names DCU, which has three linked accounts that could receive it
-        val result = engine().decide(listOf(out(o2, "AC PHILLIP LAFAYETT ACH XFER"), inn(imagine, "Credit Card Payment Received")))
+        val result = engine().decide(listOf(out(o2, "AC PHILLIP LAFAYETT ACH XFER"), inn(dcuChecking, "AC ACH XFER")))
         val edge = (result.proposals.singleOrNull()?.edge) ?: result.unmatched.single()
         assertThat(edge.flags).contains("ambiguous-destination")
         assertThat(edge.points.first { it.rule == "destination-ambiguous" }.points).isEqualTo(0)
         assertThat(edge.families).doesNotContain("destination")
+    }
+
+    @Test
+    fun aCardPaymentInflowNarrowsAnInstitutionToTheOnlyCardAndIsAutoMerged() {
+        val result = engine().decide(listOf(out(o2, "AC PHILLIP LAFAYETT ACH XFER"), inn(imagine, "Credit Card Payment Received")))
+        val p = result.proposals.single()
+        assertThat(p.edge.points.map { it.rule }).contains("destination-narrowed")
+        assertThat(p.auto).isTrue()
+        // a card payment landing on a non-card account is a contradiction of the narrowing, never narrowed
+        val wrong = engine().decide(listOf(out(o2, "AC PHILLIP LAFAYETT ACH XFER"), inn(dcuChecking, "Credit Card Payment Received")))
+        assertThat(wrong.proposals.flatMap { it.edge.points.map { r -> r.rule } }).doesNotContain("destination-narrowed")
     }
 
     @Test
