@@ -801,9 +801,9 @@ class TransactionConverter(
                 it.attributes.transactions.first().type
             ) }
             /**
-             * Filter out transactions imported while pending: they're provisional, and converting one to a transfer
-             *  moves its external id to the other leg's, so its posted version could not find it. (Needs [pendingTag];
-             *  without it a converted pending transaction is still found through its internal reference.)
+             * Filter out transactions imported while pending: they're provisional (Plaid may remove them, or post them
+             *  with another amount), so they are not paired into a transfer until they post. (Needs [pendingTag];
+             *  without it a paired pending transaction is still found through its link when it posts.)
              */
             .filter { pendingTag.isBlank() || it.attributes.transactions.first().tags?.contains(pendingTag) != true }
             .map { FireflyTransactionDto(it.id, it.attributes.transactions.first()) }

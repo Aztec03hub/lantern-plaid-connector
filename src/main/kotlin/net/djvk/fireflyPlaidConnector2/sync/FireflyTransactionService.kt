@@ -6,6 +6,7 @@ import net.djvk.fireflyPlaidConnector2.api.firefly.apis.PlaidLinksApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.TransactionsApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionRead
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionTypeFilter
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionTypeProperty
 import net.djvk.fireflyPlaidConnector2.transactions.FireflyTransactionDto
 import net.djvk.fireflyPlaidConnector2.transactions.PlaidLinkIndexer
 import org.slf4j.LoggerFactory
@@ -158,12 +159,16 @@ class FireflyTransactionService(
         // Process updates. This includes converting an existing deposit/withdrawal into a transfer, which is an in-place
         //  update with type=transfer (Firefly 6.7.7 accepts that), so every Firefly write here is safe to repeat.
         for (update in updates) {
-            // An update that adds a Plaid leg to a transaction Firefly rejects (422) or no longer has (404) creates that
-            //  leg on its own instead, so its money is not hidden behind a failed update
+            // An update that adds a Plaid leg to a transaction Firefly no longer has (404) creates that leg on its own
+            //  instead, so its money is not hidden behind a failed update. A pairing (the update makes a transfer) does
+            //  that on a 422 too: the existing transaction stays as it was and the new leg is recorded nowhere else. A
+            //  pending to posted update does NOT: after a 422 the pending transaction still holds that money, and this
+            //  sync's removal of the pending id was shielded, so a posted create beside it would count it twice.
             val fallback = update.fallbackCreate
             guarded(
                 DeadLetter("update", update.transactionId, update.id, update.tx, update.changesType),
                 instead = fallback?.let { { createGuarded(it) } },
+                insteadOn = if (update.tx.type == TransactionTypeProperty.transfer) setOf(404, 422) else setOf(404),
             ) {
                 syncHelper.updateBatchInFirefly(listOf(update))
             }
@@ -235,6 +240,7 @@ class FireflyTransactionService(
         letter: DeadLetter,
         retry: Boolean = false,
         instead: (suspend () -> Unit)? = null,
+        insteadOn: Set<Int> = setOf(),
         write: suspend () -> Unit,
     ): Boolean {
         val store = deadLetters
@@ -245,13 +251,22 @@ class FireflyTransactionService(
         } catch (cre: ClientRequestException) {
             val status = cre.response.status.value
             if (status == 409) {
-                // Nothing of the write was applied. For a create the money is recorded; for an update (pairing, or a
-                //  link change) the Plaid id is recorded on another transaction, so the target stays as it was.
-                logger.info("Firefly already holds a Plaid id of the ${letter.operation} of ${letter.key}; left as it was")
+                // Nothing of the write was applied. For a create the money is recorded; for an update the Plaid id is
+                //  recorded on another transaction, so the target stays as it was. The conversion already skips updates
+                //  whose new id the index holds, so an update 409 is a race or an anomaly a person must look at: after a
+                //  pending to posted update, the pending transaction may now be a second record of the posted money.
+                if (letter.operation == "update") {
+                    logger.error(
+                        "Firefly refused update of ${letter.key}: a Plaid id it sends is already on another transaction " +
+                                "(HTTP 409: ${runCatching { cre.response.bodyAsText() }.getOrDefault("")}); left as it was, check it by hand"
+                    )
+                } else {
+                    logger.info("Firefly already holds a Plaid id of the ${letter.operation} of ${letter.key}; left as it was")
+                }
                 store?.remove(letter.operation, letter.key)
                 return false
             }
-            if (instead != null && (status == 404 || status == 422)) {
+            if (instead != null && status in insteadOn) {
                 logger.warn("Firefly refused the ${letter.operation} of ${letter.key} (HTTP $status); creating its new Plaid leg on its own")
                 store?.remove(letter.operation, letter.key)
                 instead()

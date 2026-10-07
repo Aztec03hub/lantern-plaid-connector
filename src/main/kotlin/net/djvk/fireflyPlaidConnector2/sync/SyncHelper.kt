@@ -61,16 +61,22 @@ class SyncHelper(
     /**
      * The connector's dedupe is Firefly's Plaid link table, which only Lantern's Firefly fork has. On a stock Firefly
      * the `plaid_links` fields would be silently ignored and every retry would import the same transactions again, so
-     * a missing endpoint stops the start instead of letting the connector run without the guarantee.
+     * a missing endpoint stops the start instead of letting the connector run without the guarantee. The polled loop
+     * calls it again before each iteration's first write, so a Firefly swapped for a stock one while the connector runs
+     * fails the poll before anything is written, instead of once per poll after an unlinked create.
      */
-    protected suspend fun validatePlaidLinksEndpoint() {
+    suspend fun validatePlaidLinksEndpoint() {
         val missing = IllegalStateException(NOT_THE_FORK)
         try {
             fireflyPlaidLinksApi.lookupPlaidLinks(listOf(STARTUP_PROBE_ID)).body()
         } catch (cre: ClientRequestException) {
             if (cre.response.status == HttpStatusCode.NotFound || cre.response.status == HttpStatusCode.MethodNotAllowed) throw missing
             throw cre
-        } catch (e: com.fasterxml.jackson.core.JsonProcessingException) {
+        } catch (e: NoTransformationFoundException) {
+            // 200 with a body that is not JSON (an HTML page after a redirect, for example)
+            throw missing
+        } catch (e: io.ktor.serialization.ContentConvertException) {
+            // 200 with JSON that is not a lookup answer (Ktor wraps Jackson's error in this)
             throw missing
         }
     }

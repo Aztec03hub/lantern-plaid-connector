@@ -18,7 +18,7 @@ Firefly now refuses a second row for the same Plaid transaction id, and tells us
   `filterFireflyCandidateTransferTxs`, the dead letter key in `processFireflyTransactionUpdates` (first link id, never
   `externalId ?: ""`, which would make every create letter share key "" and overwrite each other), `letterFor` and the
   removal lookup in `reviseDeadLetteredCreates`, `survivingLeg`, `shouldSwapTransfer`, and the investment converter.
-- Reads: `GET /api/v1/plaid-links?plaid_transaction_id[]=...` (1 to 500 ids per call; the connector chunks larger sets)
+- Reads: `GET /api/v1/plaid-links?plaid_transaction_id[]=...` (Firefly takes 1 to 500 ids per call, but the ids travel in the query string and 500 is a 414, so the connector sends at most 50 per call, `PlaidLinksApi.MAX_IDS`)
   gives journal and group ids. The POST response carries `plaid_links` on every split (contract). That a group READ
   (`GET /transactions/{id}` and the window list) carries them too is not stated in the contract; the fork's
   `TransactionGroupTransformer` was changed for it, and the live test must assert it before the window list is trusted
@@ -39,7 +39,7 @@ Firefly now refuses a second row for the same Plaid transaction id, and tells us
 | `alreadyRecorded` in `convertPollSync` (skip a create whose id Firefly already records) | the database says so (409), see "Write rules" for the partial-conflict case |
 | Role rule for transfer ids, `survivingLeg` by external id, id swaps in `transferLegUpdate`/`convertDoubleFirefly` | `leg` says which leg survives or flips |
 | Dead letter pre-check "is the create's external id already in Firefly" in `retryDeadLetters` | a retried create that already landed is a 409 |
-| Investments: window read plus `knownExternalIds` set, and reliance on content-hash 422 for older ones | one link lookup of the 14-day re-read (chunked at 500); unknown ids are created |
+| Investments: window read plus `knownExternalIds` set, and reliance on content-hash 422 for older ones | one link lookup of the 14-day re-read (chunked at 50); unknown ids are created |
 
 ## What stays
 
@@ -63,15 +63,18 @@ Firefly now refuses a second row for the same Plaid transaction id, and tells us
 
 `SyncHelper.setApiCreds` (used by polled and batch) calls `GET /plaid-links?plaid_transaction_id[]=lantern-startup-probe`
 after the version check. 200 with a JSON object whose `data` is an array = ok. 404 or 405 (a stock Firefly has no such
-route), or a body that cannot be read as that JSON (an HTML page after a redirect, for example) = `IllegalStateException("... does not have /api/v1/plaid-links ... run Lantern's Firefly
+route), or a 200 body that cannot be read as that JSON (an HTML page after a redirect, for example: Ktor raises
+`NoTransformationFoundException` for a non-JSON content type and `ContentConvertException` for JSON of the wrong shape) = `IllegalStateException("... does not have /api/v1/plaid-links ... run Lantern's Firefly
 fork")`, which is not a network error, so `retryWhileNetworkDown` does not retry it and the process stops. 401/403
 propagate as before; 5xx and network errors are transient and are retried by `retryWhileNetworkDown`.
 
-The startup probe proves the fork at startup only. A stock Firefly ignores the unknown `plaid_links` field and answers
-200, so a Firefly swapped for a stock image while the connector runs would silently store creates with no links and no
-hash dedupe. Every successful POST and every PUT that sent `plaid_links` therefore checks that the response's split
-carries a `plaid_links` array containing the sent ids; if it does not, the iteration fails with the same
-`IllegalStateException` message (no extra request).
+A stock Firefly ignores the unknown `plaid_links` field and answers 200, so a Firefly swapped for a stock image while
+the connector runs would silently store creates with no links and no hash dedupe. The polled loop therefore repeats the
+probe at the start of every iteration (`processTransactions`, before the dead letter retry and any other write), so a
+swap fails the poll before anything is written. Every successful POST and every PUT that sent `plaid_links` also checks
+that the response's split carries a `plaid_links` array containing the sent ids; if it does not, the iteration fails
+with the same `IllegalStateException` message (no extra request). That check alone could not stop the damage: the
+create is already stored when it fails, and the next poll would store it again.
 
 ## Write rules (one place decides each outcome)
 
@@ -91,7 +94,8 @@ branch, so `retryDeadLetters` and `processFireflyTransactionUpdates` get the sam
     already imported). Dropping it would commit the cursor over B and lose that money for good.
 - **409 on update** is NOT "already imported" in general; nothing of the PUT was applied. By kind:
   - pairing PUT (adds the new leg's id to an existing group): the new leg is already recorded elsewhere; the existing
-    group stays as it was. INFO log. No money is lost or doubled.
+    group stays as it was. No money is lost or doubled. The converter skips a pairing whose new id the index already
+    holds, so this too is only a race: ERROR log (every update 409 is logged at ERROR with Firefly's conflict list).
   - pending to posted PUT: the posted id is already recorded on another transaction, so promoting would leave the pending
     group as a second record of the same money. The converter therefore never promotes when the posted id is already in
     the index (every create that carries a `pending_transaction_id` is looked up with the posted id too): the posted create
@@ -105,7 +109,9 @@ branch, so `retryDeadLetters` and `processFireflyTransactionUpdates` get the sam
   Plaid id from `reviseDeadLetteredCreates` (a later Plaid remove of that leg would not be applied, and the retry would
   bring it back). Instead the new leg is created as its own single (guarded as a create, so a rejection there becomes a
   create letter keyed by its id). A pending to posted PUT that gets 404 is likewise replaced by a plain create of the
-  posted transaction.
+  posted transaction, but on a 422 it is dead-lettered as an update: the pending group still holds that money and this
+  sync's removal of the pending id was shielded (`promotedFireflyIds`), so a posted create beside it would count the
+  money twice. The two are told apart by the update's type (a pairing PUT is a transfer).
 - 5xx / network: fail the iteration, nothing is committed, the next poll redoes it (the whole request is one database
   transaction, contract).
 - Update: `PUT /transactions/{group}` with `plaid_links` ONLY when the set changes (pending to posted, pairing, leg flip,
@@ -130,7 +136,7 @@ branch, so `retryDeadLetters` and `processFireflyTransactionUpdates` get the sam
 | **One leg of a transfer removed** | Index finds the transfer by the removed id. The surviving link's `leg` says what it becomes: destination leg survives = deposit, source leg survives = withdrawal. One PUT: `type`, the unknown side named "Unknown Transfer Source/Recipient", `plaid_links = [survivor as single]` (this also frees the removed id). Both legs removed in one sync = one DELETE. A transfer with only ONE link (paired with a manual transaction) whose Plaid leg is removed is not deleted: it becomes a single on the manual side (the account that is not the removed leg's), `plaid_links = []`, so the user's own record stays. The other bank's money is never deleted. A new amount/date for the survivor in the same sync is kept. | `plaid_links` set replaces; the removed id is freed |
 | **Both legs flip direction** | Unchanged `shouldSwapTransfer` rule (only when both flip in one sync, else review). The PUT also swaps the `leg` of both links (`source` <-> `destination`). | PUT full link set |
 | **Dead-lettered create, then Plaid event** | `reviseDeadLetteredCreates` unchanged in behaviour; it finds the letter whose key or `split.plaid_links` holds the id. | none |
-| **Investment transactions** | Link lookup of the ids read in the lookback (chunked at 500); create the unknown ones with a `single` link (`investment_transaction_id` is the Plaid id). A 409 is already imported. | lookup, 409 |
+| **Investment transactions** | Link lookup of the ids read in the lookback (chunked at 50); create the unknown ones with a `single` link (`investment_transaction_id` is the Plaid id). A 409 is already imported. | lookup, 409 |
 | **Batch mode** | Creates carry links; a 409 follows the create rules above (a partial conflict creates the other leg). The initial-balance insert has no Plaid id, so no link can protect it: it keeps `errorIfDuplicateHash = true` and the "duplicate of transaction" 422 skip for that one insert, so re-running batch mode after a failure does not add a second opening balance. | 409 |
 
 ## Behaviour change to flag

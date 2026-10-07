@@ -114,10 +114,8 @@ class BatchSyncRunner(
                         .addAll(plaidTxs)
 
                     /**
-                     * This would be where we query transactions from Firefly and look for dupes, but the Firefly
-                     *  API doesn't have a way to query by external id and I don't think it's worth the effort to
-                     *  do date range queries and sift through all transactions, so for now we'll rely on Firefly's
-                     *  "duplicate hash" dupe checking mechanism.
+                     * No dupe lookup here: every create carries its Plaid links, and Firefly's link table refuses
+                     *  (409) one that is already imported, which the insert treats as "already imported".
                      */
 
                     offset += plaidTxs.size

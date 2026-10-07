@@ -22,7 +22,7 @@ import kotlin.io.path.Path
  *
  * @property operation "create", "update" or "delete"
  * @property key what identifies the transaction, so a newer write for it replaces this one: the Firefly id for an
- *  update or delete, the external id for a create
+ *  update or delete, the first Plaid id of its links for a create (see FireflyTransactionService.letterKey)
  * @property split what was to be written (null for a delete). This is transaction content, which is why the file is
  *  written owner-only
  * @property message Firefly's own error message

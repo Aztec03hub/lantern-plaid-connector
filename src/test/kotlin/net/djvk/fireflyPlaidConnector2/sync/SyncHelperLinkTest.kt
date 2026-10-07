@@ -109,6 +109,35 @@ internal class SyncHelperLinkTest {
         assertThat(e).isInstanceOf(IllegalStateException::class.java)
     }
 
+    /** A real lookup client whose server answers every request with [body] as [contentType] and status 200. */
+    private fun probeAnswering(body: String, contentType: String) = SyncHelper(
+        AccountConfigs(emptyList()), "token", firefly.aboutApi, firefly.transactionsApi, firefly.accountsApi,
+        net.djvk.fireflyPlaidConnector2.api.firefly.apis.PlaidLinksApi(
+            "https://firefly.test",
+            MockEngine { respond(body, HttpStatusCode.OK, headersOf(HttpHeaders.ContentType, contentType)) },
+        ),
+    )
+
+    @Test
+    fun setApiCredsThrowsIllegalStateWhenThePlaidLinksProbeAnswersAnHtmlPage() = runBlocking<Unit> {
+        // a login page or proxy page after a redirect: Ktor has no JSON converter for text/html
+        val e = runCatching { probeAnswering("<html>login</html>", "text/html").setApiCreds() }.exceptionOrNull()
+
+        assertThat(e).isInstanceOf(IllegalStateException::class.java).hasMessageContaining("/api/v1/plaid-links")
+    }
+
+    @Test
+    fun setApiCredsThrowsIllegalStateWhenThePlaidLinksProbeAnswersJsonWithoutData() = runBlocking<Unit> {
+        val e = runCatching { probeAnswering("""{"message":"hello"}""", "application/json").setApiCreds() }.exceptionOrNull()
+
+        assertThat(e).isInstanceOf(IllegalStateException::class.java).hasMessageContaining("/api/v1/plaid-links")
+    }
+
+    @Test
+    fun theProbePassesOnARealEmptyLookupAnswer() = runBlocking<Unit> {
+        probeAnswering("""{"data":[]}""", "application/json").setApiCreds()
+    }
+
     @Test
     fun otherProbeFailuresPropagateAsTheyAre() = runBlocking<Unit> {
         whenever(firefly.plaidLinksApi.lookupPlaidLinks(any())).doSuspendableAnswer { throw statusError(HttpStatusCode.Unauthorized) }

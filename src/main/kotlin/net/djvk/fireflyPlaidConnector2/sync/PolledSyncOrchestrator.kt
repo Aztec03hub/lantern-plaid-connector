@@ -241,6 +241,10 @@ class PolledSyncOrchestrator(
         accountAccessTokenSequence: Sequence<Pair<PlaidAccessToken, List<PlaidAccountId>>>,
         cursorMap: MutableMap<PlaidAccessToken, PlaidSyncCursor>
     ): PollResult {
+        // Firefly still keeps Plaid links (it may have been swapped for a stock one since startup); checked before the
+        //  first write, because a stock Firefly would store every create of this poll, and of every poll after, unlinked
+        syncHelper.validatePlaidLinksEndpoint()
+
         // Writes Firefly rejected in earlier polls are retried first, so a newer write for the same transaction
         //  (below) always lands after the stale one
         fireflyTransactionService.retryDeadLetters()

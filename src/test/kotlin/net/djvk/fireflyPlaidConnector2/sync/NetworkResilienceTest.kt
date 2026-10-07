@@ -197,6 +197,22 @@ internal class NetworkResilienceTest {
     }
 
     @Test
+    fun aFireflyThatLostItsPlaidLinksEndpointFailsThePollBeforeAnyWrite() = runBlocking<Unit> {
+        // Firefly swapped for a stock one while the connector runs: every create would be stored unlinked, once per poll
+        val committed = mutableMapOf("token1" to "cursor-old")
+        whenever(syncHelper.validatePlaidLinksEndpoint()).doSuspendableAnswer { throw IllegalStateException("not the fork") }
+
+        assertThrows<IllegalStateException> {
+            runBlocking { orchestrator().processTransactions(mapOf("account1" to 1), sequenceOf(Pair("token1", listOf("account1"))), committed) }
+        }
+
+        verify(fireflyTransactionService, never()).retryDeadLetters()
+        verify(plaidSyncService, never()).processPlaidTransactions(any(), any())
+        verify(fireflyTransactionService, never()).processFireflyTransactionUpdates(any(), any(), any())
+        assertEquals("cursor-old", committed["token1"])
+    }
+
+    @Test
     fun retryWhileNetworkDownRetriesThenSucceeds() = runBlocking<Unit> {
         var attempts = 0
         val result = orchestrator().retryWhileNetworkDown("test", 1.milliseconds) {

@@ -136,6 +136,27 @@ class FireflyTransactionServiceTest {
     }
 
     @Test
+    fun a409OnAnUpdateIsLoggedAtErrorWithFireflysConflictList() = runBlocking<Unit> {
+        // An update 409 is a race the index could not see; after a pending to posted update it can leave the pending
+        //  transaction as a second record of the money, so a person must be told
+        val logger = org.slf4j.LoggerFactory.getLogger(FireflyTransactionService::class.java) as ch.qos.logback.classic.Logger
+        val seen = ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent>().also { it.start() }
+        logger.addAppender(seen)
+        try {
+            whenever(syncHelper.updateBatchInFirefly(any())).doSuspendableAnswer {
+                throw statusError(HttpStatusCode.Conflict, """{"conflicts":[{"plaid_transaction_id":"posted9"}]}""")
+            }
+
+            fireflyTransactionService.processFireflyTransactionUpdates(listOf(), listOf(FireflyTransactionDto("ff7", linked("posted9").tx)), listOf())
+
+            val error = seen.list.single { it.level == ch.qos.logback.classic.Level.ERROR }
+            assertThat(error.formattedMessage).contains("ff7").contains("posted9")
+        } finally {
+            logger.detachAppender(seen)
+        }
+    }
+
+    @Test
     fun a409OnAFreshUpdateIsNotKept() = runBlocking<Unit> {
         val (store, service) = serviceWithStore()
         whenever(syncHelper.updateBatchInFirefly(any())).doSuspendableAnswer { throw statusError(HttpStatusCode.Conflict) }
@@ -170,16 +191,31 @@ class FireflyTransactionServiceTest {
     }
 
     @Test
-    fun anUpdateWithAFallbackCreateThatGets422CreatesTheFallbackAndKeepsNoLetter() = runBlocking<Unit> {
+    fun aPairingUpdateWithAFallbackCreateThatGets422CreatesTheFallbackAndKeepsNoLetter() = runBlocking<Unit> {
         val (store, service) = serviceWithStore()
         val fallback = linked("leg2")
-        val update = FireflyTransactionDto("ff1", linked("leg1").tx, fallbackCreate = fallback)
+        val pairing = linked("leg1").tx.copy(type = TransactionTypeProperty.transfer)
+        val update = FireflyTransactionDto("ff1", pairing, fallbackCreate = fallback)
         whenever(syncHelper.updateBatchInFirefly(any())).doSuspendableAnswer { throw statusError(HttpStatusCode.UnprocessableEntity) }
 
         service.processFireflyTransactionUpdates(listOf(), listOf(update), listOf())
 
         verify(syncHelper).optimisticInsertBatchIntoFirefly(eq(listOf(fallback)))
         assertThat(store.read()).isEmpty()
+    }
+
+    @Test
+    fun aPendingToPostedUpdateThatGets422IsDeadLetteredAndTheFallbackIsNotCreated() = runBlocking<Unit> {
+        // The pending transaction still holds the money and this sync's removal of the pending id was shielded:
+        //  creating the posted one beside it would count the same money twice
+        val (store, service) = serviceWithStore()
+        val promotion = FireflyTransactionDto("ff1", linked("posted").tx, fallbackCreate = linked("posted"))
+        whenever(syncHelper.updateBatchInFirefly(any())).doSuspendableAnswer { throw statusError(HttpStatusCode.UnprocessableEntity) }
+
+        service.processFireflyTransactionUpdates(listOf(), listOf(promotion), listOf())
+
+        verify(syncHelper, never()).optimisticInsertBatchIntoFirefly(any())
+        assertThat(store.read().single().operation).isEqualTo("update")
     }
 
     @Test
