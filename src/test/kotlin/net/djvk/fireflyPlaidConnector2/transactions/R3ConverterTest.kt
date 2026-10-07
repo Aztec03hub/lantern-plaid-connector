@@ -112,14 +112,19 @@ internal class R3ConverterTest {
         assertThat(update.tx.plaidLinks).containsExactly(depLink.copy(leg = PlaidLinkLeg.single))
     }
 
-    /** An older-build transfer knows one leg only: nothing says where the other money is, so the old behaviour stays. */
+    /** A transfer paired with a manual transaction has one link; removing it leaves the user's own side, unlinked. */
     @Test
-    fun aTransferWithOnlyOneKnownLegIsStillDeletedWhenThatLegIsRemoved() = runBlocking<Unit> {
-        val legacy = existing("ff1", TransactionTypeProperty.transfer, listOf(depLink))
+    fun aTransferWithOnlyOneLinkBecomesAnUnlinkedSingleWhenThatLegIsRemoved() = runBlocking<Unit> {
+        val paired = existing("ff1", TransactionTypeProperty.transfer, listOf(depLink))
 
-        val result = converter().convertPollSync(accountMap, listOf(), listOf(), listOf("dep"), listOf(legacy))
+        val result = converter().convertPollSync(accountMap, listOf(), listOf(), listOf("dep"), listOf(paired))
 
-        assertThat(result.deletes).containsExactly("ff1")
+        assertThat(result.deletes).isEmpty()
+        val update = result.updates.single()
+        assertThat(update.id).isEqualTo("ff1")
+        assertThat(update.changesType).isTrue()
+        assertThat(update.tx.type).isEqualTo(TransactionTypeProperty.withdrawal)
+        assertThat(update.tx.plaidLinks).isEmpty()
     }
 
     /**

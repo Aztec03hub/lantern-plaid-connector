@@ -121,7 +121,19 @@ internal class TransactionConverterTest {
                                     destinationId = "1",
                                 ).transactions.first()
                                     // An in-place update never re-sends the reconciled flag or order (M2)
-                                    .copy(order = null, reconciled = null)
+                                    .copy(order = null, reconciled = null),
+                                // If Firefly refuses the pairing, the new Plaid leg is created on its own
+                                fallbackCreate = FireflyTransactionDto(
+                                    null,
+                                    FireflyFixtures.getTransaction(
+                                        type = TransactionTypeProperty.deposit,
+                                        description = "AMERICAN EXPRESS DES:ACH PMT ID : W1111 INDN:JOHN Q PUBLIC CO ID:XXXXX11111 WEB",
+                                        amount = "1111.22",
+                                        sourceName = "Unknown Transfer Source",
+                                        destinationId = "1",
+                                        plaidLinks = listOf(PlaidLink("plaidTransactionId", PlaidLinkLeg.single, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
+                                    ).transactions.first()
+                                ),
                             )
                         ),
                         deletes = listOf(),
@@ -173,7 +185,19 @@ internal class TransactionConverterTest {
                                     destinationId = "2",
                                 ).transactions.first()
                                     // An in-place update never re-sends the reconciled flag or order (M2)
-                                    .copy(order = null, reconciled = null)
+                                    .copy(order = null, reconciled = null),
+                                // If Firefly refuses the pairing, the new Plaid leg is created on its own
+                                fallbackCreate = FireflyTransactionDto(
+                                    null,
+                                    FireflyFixtures.getTransaction(
+                                        type = TransactionTypeProperty.withdrawal,
+                                        description = "AMERICAN EXPRESS DES:ACH PMT ID : W1111 INDN:JOHN Q PUBLIC CO ID:XXXXX11111 WEB",
+                                        amount = "1111.22",
+                                        sourceId = "1",
+                                        destinationName = "Unknown Transfer Recipient",
+                                        plaidLinks = listOf(PlaidLink("plaidTransactionId", PlaidLinkLeg.single, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
+                                    ).transactions.first()
+                                ),
                             )
                         ),
                         deletes = listOf(),
