@@ -44,7 +44,7 @@ internal class LiabilityInitialBalanceTest {
         AccountRead("accounts", "1", Account("acct", type, accountRole = role, liabilityDirection = direction), ObjectLink())
 
     /** Runs the batch initial-balance step for one account and returns the opening journal as a signed Firefly effect. */
-    private fun opening(account: AccountRead, extra: List<net.djvk.fireflyPlaidConnector2.api.plaid.models.Transaction> = listOf(), noOwnTransactions: Boolean = false, current: Double = owed, expectNoOpening: Boolean = false): Pair<Double, java.time.LocalDate>? = runBlocking {
+    private fun opening(account: AccountRead, extra: List<net.djvk.fireflyPlaidConnector2.api.plaid.models.Transaction> = listOf(), noOwnTransactions: Boolean = false, current: Double = owed, expectNoOpening: Boolean = false, countChanged: Boolean = false): Pair<Double, java.time.LocalDate>? = runBlocking {
         val plaid = PlaidMock()
         val firefly = FireflyMock()
         val balance = mock<AccountBalance>()
@@ -68,8 +68,13 @@ internal class LiabilityInitialBalanceTest {
             PlaidFixtures.getPaymentTransaction(accountId = plaidAccount, transactionId = "t1", amount = purchase, pendingTransactionId = null, date = day),
             PlaidFixtures.getPaymentTransaction(accountId = plaidAccount, transactionId = "t2", amount = payment, pendingTransactionId = null, date = day.plusDays(2)),
         ) + extra).let { all -> if (noOwnTransactions) all.map { it.copy(accountId = "b".repeat(37)) } else all }
+        // the count-only re-read the step makes before it trusts the balance
+        val countResponse = mock<net.djvk.fireflyPlaidConnector2.api.plaid.models.TransactionsGetResponse>()
+        whenever(countResponse.totalTransactions).thenReturn(if (countChanged) txs.size + 1 else txs.size)
+        val countHttp = createPlaidResponse(countResponse)
+        whenever(plaid.api.transactionsGet(any<net.djvk.fireflyPlaidConnector2.api.plaid.models.TransactionsGetRequest>())).thenReturn(countHttp)
         runner.setInitialBalances(mapOf("token" to txs), helper)
-        if ((noOwnTransactions && current == 0.0) || expectNoOpening) {
+        if ((noOwnTransactions && current == 0.0) || expectNoOpening || countChanged) {
             org.mockito.kotlin.verify(firefly.accountsApi, org.mockito.kotlin.never()).setOpeningBalance(any(), any(), any(), anyOrNull())
             return@runBlocking null
         }
@@ -157,5 +162,10 @@ internal class LiabilityInitialBalanceTest {
             accountId = plaidAccount, transactionId = "t3", amount = 5000.0, pendingTransactionId = null, date = java.time.LocalDate.of(2025, 1, 11),
         )
         assertThat(opening(accountRead(ShortAccountTypeProperty.liabilities, LiabilityDirection.debit), listOf(purchase), expectNoOpening = true)).isNull()
+    }
+
+    @Test
+    fun anItemWhoseTransactionCountChangedAfterTheReadGetsNoOpening() {
+        assertThat(opening(accountRead(ShortAccountTypeProperty.asset), countChanged = true)).isNull()
     }
 }

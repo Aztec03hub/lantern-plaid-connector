@@ -50,17 +50,25 @@ class FireflyTransactionService(
     suspend fun fetchExistingFireflyTransactions(): List<TransactionRead> =
         fetchFireflyTransactionsBetween(windowStart(), LocalDate.now(zoneId), fireflyPageCountMax)
 
-    suspend fun fetchFireflyTransactionsBetween(
-        start: LocalDate,
-        end: LocalDate,
-        maxPages: Int,
-    ): List<TransactionRead> {
+    suspend fun fetchFireflyTransactionsBetween(start: LocalDate, end: LocalDate, maxPages: Int): List<TransactionRead> =
+        readRange(start, end, maxPages, strict = false)
+
+    /**
+     * Like [fetchFireflyTransactionsBetween], but fails when Firefly's total changes between pages or the groups read do
+     * not add up to it (a write by another process shifted the pages), instead of returning a list with a journal
+     * missed or doubled. For a read that sums journals, such as an opening balance.
+     */
+    suspend fun fetchFireflyTransactionsStrictly(start: LocalDate, end: LocalDate, maxPages: Int): List<TransactionRead> =
+        readRange(start, end, maxPages, strict = true)
+
+    private suspend fun readRange(start: LocalDate, end: LocalDate, maxPages: Int, strict: Boolean): List<TransactionRead> {
         val existingFireflyTxs = mutableListOf<TransactionRead>()
         val today = end
         val transferWindowStart = start
 
         // Firefly pages are 1-based; starting at 0 fetched page 1 twice
         var fireflyTxPage = 1
+        var firstTotal: Int? = null
         var lastPageHadMore: Boolean
         do {
             logger.debug("Fetching page $fireflyTxPage of Firefly transactions with window starting at $transferWindowStart")
@@ -71,6 +79,10 @@ class FireflyTransactionService(
                 TransactionTypeFilter.all,
             ).body()
             val pagination = response.meta.pagination
+            if (strict && pagination?.total != null) {
+                firstTotal = firstTotal ?: pagination.total
+                check(pagination.total == firstTotal) { FIREFLY_CHANGED }
+            }
             // Fail on the size of the range, not on a page count, which depends on the Firefly user's page size preference
             if (pagination != null && (pagination.total ?: 0) > maxRangeTransactions) {
                 throw RuntimeException("Firefly range read of ${pagination?.total} transactions exceeds the failsafe $maxRangeTransactions")
@@ -96,6 +108,9 @@ class FireflyTransactionService(
             throw RuntimeException("Exceeded Firefly failsafe max page count $maxPages")
         }
 
+        if (strict && firstTotal != null) {
+            check(existingFireflyTxs.map { it.id }.distinct().size == firstTotal && existingFireflyTxs.size == firstTotal) { FIREFLY_CHANGED }
+        }
         return existingFireflyTxs
     }
 
@@ -197,6 +212,9 @@ class FireflyTransactionService(
 
     companion object {
         /** 401/403 mean the Firefly credentials are wrong for every transaction; 408/429 are transient. */
+        private const val FIREFLY_CHANGED = "Firefly changed while it was being read (its transaction count moved between pages, " +
+                "or the groups read do not add up to it); nothing was decided, run again"
+
         private val notPermanent4xx = setOf(401, 403, 408, 429)
 
         /** The 4xx answers that reject one write for good (409 is handled before these, as "already recorded"). */

@@ -136,7 +136,7 @@ internal class RepairDatesRunnerTest {
     // region the reads and the dry run
 
     private fun emptyFirefly() = runBlocking {
-        whenever(service.fetchFireflyTransactionsBetween(any(), any(), any())).thenReturn(listOf())
+        whenever(service.fetchFireflyTransactionsStrictly(any(), any(), any())).thenReturn(listOf())
         whenever(syncHelper.fetchAccountKinds()).thenReturn(mapOf())
         whenever(syncHelper.getAllPlaidAccessTokenAccountIdSets()).thenReturn(Pair(mapOf(), sequenceOf()))
     }
@@ -151,7 +151,7 @@ internal class RepairDatesRunnerTest {
                 destinationId = "2", description = "DCU statement opening balance", externalId = "dcu-stmt:opening:2",
             ), ObjectLink(),
         )
-        whenever(service.fetchFireflyTransactionsBetween(any(), any(), any())).thenReturn(listOf(legacy))
+        whenever(service.fetchFireflyTransactionsStrictly(any(), any(), any())).thenReturn(listOf(legacy))
         val account = createFireflyResponse(AccountSingle(AccountRead("accounts", "2", Account("Lexus", ShortAccountTypeProperty.liabilities), ObjectLink())))
         whenever(accountsApi.getAccount(any(), anyOrNull())).thenReturn(account)
 
@@ -173,7 +173,7 @@ internal class RepairDatesRunnerTest {
                 description = "DCU statement opening balance",
             ), ObjectLink(),
         )
-        runBlocking { whenever(service.fetchFireflyTransactionsBetween(any(), any(), any())).thenReturn(listOf(journal)) }
+        runBlocking { whenever(service.fetchFireflyTransactionsStrictly(any(), any(), any())).thenReturn(listOf(journal)) }
         runBlocking { whenever(accountsApi.getAccount(any(), anyOrNull())).doSuspendableAnswer { throw IllegalStateException("Firefly 503") } }
 
         val failure = runCatching { runBlocking { runner().readState() } }.exceptionOrNull()
@@ -287,6 +287,14 @@ internal class RepairDatesRunnerTest {
         val failure = runCatching { runBlocking { runner().readState() } }.exceptionOrNull()
 
         assertThat(failure).hasMessageContaining("changed while")
+    }
+
+    @Test
+    fun aLiabilityOpeningIsAcceptedWhateverSignFireflyEchoesBack() = runBlocking<Unit> {
+        noExpenseAccounts()
+        storedOpening("33051.60", LocalDate.of(2025, 3, 31)) // sent -33051.60 for a debit loan; the amount owed is what matters
+        runner().applyPlan(RepairPlan(listOf(), 0, listOf(fix(null, "-33051.60", listOf("g9"), "debit"))))
+        verify(syncHelper).deleteBatchInFirefly(listOf("g9"))
     }
 
     // endregion

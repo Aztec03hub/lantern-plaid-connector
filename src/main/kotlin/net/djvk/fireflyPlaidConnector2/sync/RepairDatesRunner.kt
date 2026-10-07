@@ -82,7 +82,9 @@ data class OpeningFix(
     val changes: Boolean get() {
         if (skipReason != null) return false
         val newAmount = newOpening ?: BigDecimal.ZERO
-        val amountDiffers = (oldOpening ?: BigDecimal.ZERO).compareTo(newAmount) != 0
+        // A liability's sign is Firefly's to decide (direction), so only the amount owed is compared
+        val amountDiffers = (oldOpening ?: BigDecimal.ZERO).let { if (liabilityDirection != null) it.abs() else it }
+            .compareTo(if (liabilityDirection != null) newAmount.abs() else newAmount) != 0
         // The date of an opening of zero means nothing
         return legacyGroupIds.isNotEmpty() || amountDiffers || (newAmount.signum() != 0 && oldOpeningDate != newOpeningDate)
     }
@@ -152,10 +154,8 @@ class RepairPlanner(
         for (group in input.journals) {
             val split = group.attributes.transactions.singleOrNull() ?: continue
             if (!isLegacyOpening(split)) continue
-            val account = (split.destinationId ?: split.sourceId)?.toIntOrNull() ?: continue
-            // the own account is the one that is not the "Initial Balance" side; for a deposit it is the destination
-            val own = if (split.type == TransactionTypeProperty.deposit) split.destinationId?.toIntOrNull() else split.sourceId?.toIntOrNull()
-            legacyByAccount.getOrPut(own ?: account) { mutableListOf() }.add(group.id to split)
+            val own = legacyOwner(split) ?: continue
+            legacyByAccount.getOrPut(own) { mutableListOf() }.add(group.id to split)
         }
         val accountIds = (input.plaidCurrent.keys + legacyByAccount.keys).toSortedSet()
         // The start of the imported history, across every configured account: an account with no transactions of its
@@ -234,7 +234,7 @@ class RepairPlanner(
             // Not in Plaid (a loan kept from statements): keep the opening the legacy journal had, same amount and date.
             //  For a liability the amount owed is what counts, and Firefly gives it the sign of its direction (debit:
             //  negative, credit: positive), so that sign is sent too: it is also what Firefly echoes back later.
-            val date = legacy.firstOrNull()?.second?.date?.atZoneSameInstant(zoneId)?.toLocalDate()
+            val date = legacy.minOfOrNull { it.second.date.toInstant() }?.atZone(zoneId)?.toLocalDate()
             (if (isLiability) (if (direction == "credit") legacySum.abs() else legacySum.abs().negate()) else legacySum) to date
         }
         val previous = oldOpening ?: legacySum
@@ -249,6 +249,7 @@ class RepairPlanner(
         val badSign = isLiability && ((direction == "credit" && finalOpening.signum() < 0) || (direction != "credit" && finalOpening.signum() > 0))
         val skip = when {
             account == null -> "account not read: not changing anything for it"
+            current == null && id in input.fireflyAccountOfPlaid.values -> "Plaid returned no balance for this configured account; nothing changed, run again"
             touchedBySplit -> "a split transaction touches this account and its splits are not summed; set the opening by hand"
             legacy.isEmpty() && current == null -> "nothing to repair"
             missing.isNotEmpty() && current != null -> "SKIPPED: ${missing.size} Plaid transactions missing from Firefly (run a sync first, or list the ids in repair.ignoreMissing if they are deliberately not imported)"
@@ -315,7 +316,7 @@ class RepairDatesRunner(
         val plan = planner.plan(input)
         print(plan, input, pendingByAccount)
         if (!apply) {
-            println("DRY RUN: nothing was changed. Add --fireflyPlaidConnector2.repair.apply=true to apply.")
+            println("DRY RUN: nothing was changed. Add --fireflyPlaidConnector2.repair.apply=true to apply (apply reads Plaid and Firefly again, so it can differ from this plan).")
             return@runBlocking
         }
         applyPlan(plan)
@@ -339,7 +340,7 @@ class RepairDatesRunner(
         val itemList = items.toList()
         // Balances first, then transactions, then the transaction counts again: a posting in between would move the
         //  balance without being in the list, so it aborts the read instead of landing in an opening
-        println("Plaid read started at ${java.time.OffsetDateTime.now()}")
+        println("Plaid read started at ${OffsetDateTime.now()}")
         for ((token, ids) in itemList) {
             val balances = plaidApiWrapper.executeRequest(
                 { it.accountsBalanceGet(AccountsBalanceGetRequest(token, null, null, AccountsBalanceGetRequestOptions(ids, null))) },
@@ -376,10 +377,10 @@ class RepairDatesRunner(
             ).body().totalTransactions
             check(again == totals[token]) { "Plaid's transactions changed while they were being read ($again now, ${totals[token]} before); run again" }
         }
-        println("Plaid read finished at ${java.time.OffsetDateTime.now()}")
+        println("Plaid read finished at ${OffsetDateTime.now()}")
         // The whole history: openings are sums over every journal of the account, so a window would silently under-read
         //  them. fetchFireflyTransactionsBetween throws, instead of returning a truncated list, when it cannot read it all.
-        val journals = fireflyTransactionService.fetchFireflyTransactionsBetween(LocalDate.of(2000, 1, 1), end.plusDays(2), 5000)
+        val journals = fireflyTransactionService.fetchFireflyTransactionsStrictly(LocalDate.of(2000, 1, 1), end.plusDays(2), 5000)
         // Only the accounts the repair decides about: the configured ones and the owners of a legacy opening journal
         val accountIds = plaidCurrent.keys + journals.flatMap { g -> g.attributes.transactions.filter { isLegacyOpeningSplit(it) }.mapNotNull { legacyOwner(it) } }
         // A failed read is an error, never a default: an account read as an asset would get the wrong sign
@@ -450,7 +451,9 @@ class RepairDatesRunner(
             // A 2xx does not prove Firefly stored it: read the account back before the legacy journals go
             val stored = fireflyAccountsApi.getAccount(o.fireflyAccountId.toString(), null).body().data.attributes
             val storedAmount = stored.openingBalance?.toBigDecimalOrNull() ?: BigDecimal.ZERO
-            check(storedAmount.compareTo(amount) == 0 && (amount.signum() == 0 || stored.openingBalanceDate?.toLocalDate() == date)) {
+            // The sign of a liability opening is Firefly's (its direction decides), so only the amount is compared there
+            val sameAmount = if (o.liabilityDirection != null) storedAmount.abs().compareTo(amount.abs()) == 0 else storedAmount.compareTo(amount) == 0
+            check(sameAmount && (amount.signum() == 0 || stored.openingBalanceDate?.toLocalDate() == date)) {
                 "Firefly did not store the opening balance of account ${o.fireflyAccountId} (sent $amount on $date, it holds " +
                         "$storedAmount on ${stored.openingBalanceDate}); the legacy opening journals were NOT deleted"
             }

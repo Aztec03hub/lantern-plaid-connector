@@ -238,6 +238,30 @@ class BatchSyncRunner(
                 continue
             }
 
+            // A posting between the transaction read and the balance read moves the balance without being in the list;
+            //  that would land in the opening silently, so an item whose transaction count changed is skipped
+            val countNow = try {
+                plaidApiWrapper.executeRequest(
+                    { plaidApi ->
+                        val today = LocalDate.now()
+                        plaidApi.transactionsGet(
+                            TransactionsGetRequest(accessToken, today.minusDays(syncDays.toLong()), today, null, TransactionsGetRequestOptions(accountIds, 1, 0))
+                        )
+                    },
+                    "transaction count request"
+                ).body().totalTransactions
+            } catch (e: Exception) {
+                logger.error("Failed to re-check the transaction count for ${redactAccessToken(accessToken)}; its opening balances are skipped", e)
+                continue
+            }
+            if (countNow != plaidTxs.size) {
+                logger.warn(
+                    "Plaid's transaction count for {} changed during the run ({} now, {} read); its opening balances are skipped, run again",
+                    redactAccessToken(accessToken), countNow, plaidTxs.size,
+                )
+                continue
+            }
+
             // Group transactions and balance data by Plaid account id
             val plaidTxsByAccountId = plaidTxs.groupBy { it.accountId }
             val balancesByAccountId = balances.accounts.associate { Pair(it.accountId, it.balances.current) }

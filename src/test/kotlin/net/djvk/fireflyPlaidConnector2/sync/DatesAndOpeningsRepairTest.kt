@@ -495,5 +495,30 @@ internal class DatesAndOpeningsRepairTest {
         assertThat(d.atZoneSameInstant(sp).toLocalDate()).isEqualTo(LocalDate.of(2018, 11, 4))
     }
 
+    @Test
+    fun aConfiguredPlaidAccountWithNoBalanceIsSkippedNotPlannedAsAStatementKeptLoan() {
+        val legacy = journal(
+            "g9", midnight(LocalDate.of(2025, 4, 1)), null, type = TransactionTypeProperty.deposit, amount = "100.00",
+            source = null, destination = "1", description = OPENING_BALANCE_DESCRIPTION,
+        )
+        // account 1 is configured (plaidAccount -> 1) but Plaid gave no `current` for it
+        val o = plan(listOf(legacy), listOf(), mapOf(), mapOf(1 to account(ShortAccountTypeProperty.asset, "Checking"))).openings.single()
+        assertThat(o.skipReason).contains("no balance")
+        assertThat(o.changes).isFalse()
+    }
+
+    @Test
+    fun theOpeningDateOfAStatementKeptLoanIsTheEarliestLegacyJournalWhateverTheReadOrder() {
+        fun legacy(id: String, d: LocalDate) = journal(
+            id, midnight(d), null, type = TransactionTypeProperty.deposit, amount = "10.00", source = null, destination = "2",
+            description = "DCU statement opening balance",
+        )
+        val acct = mapOf(2 to account(ShortAccountTypeProperty.liabilities, "Loan", LiabilityDirection.debit))
+        val a = planner.plan(RepairInput(listOf(legacy("g1", LocalDate.of(2025, 4, 1)), legacy("g2", LocalDate.of(2025, 2, 1))), mapOf(), mapOf(), acct)).openings.single()
+        val b = planner.plan(RepairInput(listOf(legacy("g2", LocalDate.of(2025, 2, 1)), legacy("g1", LocalDate.of(2025, 4, 1))), mapOf(), mapOf(), acct)).openings.single()
+        assertThat(a.newOpeningDate).isEqualTo(LocalDate.of(2025, 2, 1))
+        assertThat(b.newOpeningDate).isEqualTo(a.newOpeningDate)
+    }
+
     // endregion
 }
