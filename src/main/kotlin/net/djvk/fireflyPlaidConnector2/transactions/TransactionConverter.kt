@@ -229,7 +229,8 @@ class TransactionConverter(
 
     /** When the bank says the transaction was authorized (the purchase date); null if Plaid has none. */
     fun getTxAuthorizedTimestamp(tx: PlaidTransaction): OffsetDateTime? {
-        if (tx.authorizedDate == null) return tx.authorizedDatetime
+        // A time with no date is not usable: it can be a fake midnight UTC that is the previous local day
+        if (tx.authorizedDate == null) return null
         return resolveTimestamp(tx.authorizedDate, tx.authorizedDatetime)
     }
 

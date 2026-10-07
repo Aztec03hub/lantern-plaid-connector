@@ -259,9 +259,10 @@ class BatchSyncRunner(
                 val txs = plaidTxsByAccountId[accountId] ?: listOf()
                 val opening = openingFor(txs, currentBalance, owedIsNegative)
                 val isLiability = isLiabilityAccount(fireflyAccount)
-                if (isLiability && opening.amount.signum() > 0 && owedIsNegative) {
+                val creditDirection = fireflyAccount.attributes.liabilityDirection == net.djvk.fireflyPlaidConnector2.api.firefly.models.LiabilityDirection.credit
+                if (isLiability && ((creditDirection && opening.amount.signum() < 0) || (!creditDirection && opening.amount.signum() > 0))) {
                     logger.warn(
-                        "Firefly forces the opening balance of a debit liability to be negative, but Firefly account " +
+                        "Firefly forces the sign of a liability opening balance (debit: negative, credit: positive), but Firefly account " +
                                 "$fireflyAccountId needs ${opening.amount}; opening balance NOT set, set it by hand"
                     )
                     continue
@@ -293,11 +294,6 @@ class BatchSyncRunner(
                     account.attributes.liabilityDirection != net.djvk.fireflyPlaidConnector2.api.firefly.models.LiabilityDirection.credit
         }
 
-        /**
-         * The opening balance (Firefly sign) that makes the account end at Plaid's `current`: the target balance is
-         * +current, or -current when [owedIsNegative], and the imported transactions move the balance by -[total]
-         * (Plaid counts money out as positive), so opening = target + total.
-         */
         fun isLiabilityAccount(account: AccountRead): Boolean = account.attributes.type.value.startsWith("liabilit")
 
         /** The opening balance and the posted-balance anchor it was computed from, see [openingFor]. */
@@ -319,7 +315,5 @@ class BatchSyncRunner(
             return Opening((anchor + posted).setScale(2, java.math.RoundingMode.HALF_UP), anchor.setScale(2, java.math.RoundingMode.HALF_UP))
         }
 
-        fun initialBalanceFor(total: Double, current: Double, owedIsNegative: Boolean): Double =
-            if (owedIsNegative) total - current else total + current
     }
 }

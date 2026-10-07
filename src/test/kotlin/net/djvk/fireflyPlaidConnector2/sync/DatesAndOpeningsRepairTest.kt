@@ -120,7 +120,7 @@ internal class DatesAndOpeningsRepairTest {
         "transactions", id,
         FireflyFixtures.getTransaction(
             type = type, date = date, amount = amount, sourceId = source, destinationId = destination,
-            description = description, tags = tags, externalId = externalId, transactionJournalId = "j$id",
+            description = description, tags = tags, externalId = externalId, transactionJournalId = "j$id", processDate = date,
             sourceName = if (source == null) "Initial Balance" else null,
             destinationName = if (destination == null) "Shop" else null,
             plaidLinks = plaidId?.let { listOf(PlaidLink(it, leg, plaidAccount)) },
@@ -177,11 +177,107 @@ internal class DatesAndOpeningsRepairTest {
     }
 
     @Test
-    fun aJournalNotInPlaidsHistoryIsOnlyFixedWhenItIsAtElevenPm() {
-        val fixed = plan(listOf(journal("g1", midnight(LocalDate.of(2024, 12, 6)).minusHours(1), "gone")), listOf())
-        assertThat(fixed.redates.single().newDate).isEqualTo(midnight(LocalDate.of(2024, 12, 6)))
-        val untouched = plan(listOf(journal("g2", midnight(LocalDate.of(2024, 12, 6)).plusHours(3), "gone")), listOf())
-        assertThat(untouched.redates).isEmpty()
+    fun aJournalNotInPlaidsHistoryIsReportedAndNeverMoved() {
+        // at 23:00 (the old winter shift), at 19:00 (a fake 00:00Z in summer) and at a real 23:00 time: none are guessed at
+        for (hour in listOf(23, 19, 18)) {
+            val p = plan(listOf(journal("g$hour", midnight(LocalDate.of(2024, 12, 6)).minusHours((24 - hour).toLong()), "gone")), listOf())
+            assertThat(p.redates).describedAs("hour $hour").isEmpty()
+            assertThat(p.unmatchedJournals).isEqualTo(1)
+        }
+    }
+
+    @Test
+    fun aJournalWithTheRightDateButAStaleProcessDateIsRedated() {
+        val day = LocalDate.of(2024, 12, 6)
+        val stale = journal("g1", midnight(day), "w1").let { r ->
+            TransactionRead(r.type, r.id, r.attributes.copy(transactions = r.attributes.transactions.map { it.copy(processDate = midnight(day).minusHours(1)) }), r.links)
+        }
+        val p = plan(listOf(stale), listOf(plaid("w1", day)))
+        assertThat(p.redates.single().newProcessDate).isEqualTo(midnight(day))
+    }
+
+    @Test
+    fun aPairIsDatedFromItsDestinationLegOrFromTheSourceLegWhenThatOneIsGone() {
+        val day = LocalDate.of(2024, 12, 6)
+        fun pair(vararg legs: Pair<String, PlaidLinkLeg>) = TransactionRead(
+            "transactions", "gp",
+            FireflyFixtures.getTransaction(
+                type = TransactionTypeProperty.transfer, date = midnight(day.minusDays(5)), amount = "10.00", sourceId = "1", destinationId = "2",
+                processDate = midnight(day.minusDays(5)),
+                plaidLinks = legs.map { PlaidLink(it.first, it.second, plaidAccount) }, transactionJournalId = "jgp",
+            ), ObjectLink(),
+        )
+        val both = plan(
+            listOf(pair("src" to PlaidLinkLeg.source, "dst" to PlaidLinkLeg.destination)),
+            listOf(plaid("src", day.plusDays(1)), plaid("dst", day)),
+        )
+        assertThat(both.redates.single().newDate).isEqualTo(midnight(day))
+        val onlySource = plan(
+            listOf(pair("src" to PlaidLinkLeg.source, "dst" to PlaidLinkLeg.destination)),
+            listOf(plaid("src", day.plusDays(1))),
+        )
+        assertThat(onlySource.redates.single().newDate).isEqualTo(midnight(day.plusDays(1)))
+    }
+
+    @Test
+    fun anAuthorizedTimeWithNoAuthorizedDateIsNotUsedForBookDate() {
+        val tx = firefly(plaid("a2", LocalDate.of(2024, 12, 6), authorizedDatetime = OffsetDateTime.of(2024, 12, 4, 5, 0, 0, 0, ZoneOffset.UTC)))
+        assertThat(tx.bookDate).isNull()
+    }
+
+    @Test
+    fun theDaylightSavingDaysKeepTheirCalendarDate() {
+        for (day in listOf(LocalDate.of(2025, 3, 9), LocalDate.of(2025, 11, 2), LocalDate.of(2025, 3, 10))) {
+            for (h in listOf(0, 5, 6)) {
+                val tx = firefly(plaid("d$day$h", day, datetime = OffsetDateTime.of(day.atStartOfDay().plusHours(h.toLong()), ZoneOffset.UTC)))
+                assertThat(tx.date.atZoneSameInstant(zone).toLocalDate()).describedAs("$day +${h}h").isEqualTo(day)
+            }
+        }
+    }
+
+    @Test
+    fun aMissingAccountReadSkipsTheAccountInsteadOfTreatingItAsAnAsset() {
+        val day = LocalDate.of(2024, 12, 6)
+        val o = plan(listOf(journal("g1", midnight(day), "c1", source = "4")), listOf(plaid("c1", day)), mapOf(4 to 250.0), mapOf()).openings.single()
+        assertThat(o.skipReason).contains("account not read")
+        assertThat(o.changes).isFalse()
+    }
+
+    @Test
+    fun aCreditLiabilityThatWouldNeedANegativeOpeningIsSkipped() {
+        val day = LocalDate.of(2024, 12, 6)
+        // owed to me 20 now, but 500 was paid into it: the opening would be negative, which Firefly forces positive
+        val o = plan(
+            listOf(journal("g1", midnight(day), "c1", type = TransactionTypeProperty.deposit, amount = "500.00", source = null, destination = "4")),
+            listOf(plaid("c1", day, amount = -500.0)), mapOf(4 to 20.0),
+            mapOf(4 to account(ShortAccountTypeProperty.liabilities, "Loan to a friend", LiabilityDirection.credit)),
+        ).openings.single()
+        assertThat(o.skipReason).contains("set it by hand")
+    }
+
+    @Test
+    fun aStatementOpeningJournalEvenWhenTaggedIsStillReplaced() {
+        val legacy = journal(
+            "g9", midnight(LocalDate.of(2025, 4, 1)), null, type = TransactionTypeProperty.deposit, amount = "33051.60",
+            source = null, destination = "2", description = "DCU statement opening balance", externalId = "dcu-stmt:opening:2",
+            tags = listOf(STATEMENT_TAG),
+        )
+        val interest = journal("g8", midnight(LocalDate.of(2025, 5, 1)).minusHours(1), null, description = "Interest", tags = listOf(STATEMENT_TAG), source = "2")
+        val p = plan(listOf(legacy, interest), listOf(), accounts = mapOf(2 to account(ShortAccountTypeProperty.liabilities, "Lexus", LiabilityDirection.debit)))
+        assertThat(p.openings.single().legacyGroupIds).containsExactly("g9")
+        assertThat(p.redates).isEmpty() // the tagged interest journal keeps its date
+    }
+
+    @Test
+    fun theOpeningDateIsComparedInTheOffsetFireflyEchoesIt() {
+        val day = LocalDate.of(2024, 12, 6)
+        // Firefly runs in New York: its midnight of the 5th is 23:00 on the 4th in Chicago, which must not read as a move
+        val echoed = OffsetDateTime.of(2024, 12, 5, 0, 0, 0, 0, ZoneOffset.ofHours(-5))
+        val o = plan(
+            listOf(journal("g1", midnight(day), "w1")), listOf(plaid("w1", day)), mapOf(1 to 490.0),
+            mapOf(1 to account(ShortAccountTypeProperty.asset, "Checking", opening = "500.00", openingDate = echoed)),
+        ).openings.single()
+        assertThat(o.changes).isFalse()
     }
 
     @Test

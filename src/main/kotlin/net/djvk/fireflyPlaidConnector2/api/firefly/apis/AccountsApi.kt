@@ -346,4 +346,16 @@ open class AccountsApi(
         )
     }
 
+    /**
+     * Removes the account's opening balance: Firefly (AccountUpdateService::updateOpeningBalance) deletes the opening
+     * balance journal when the amount is submitted empty, and ignores an amount of 0.
+     */
+    open suspend fun clearOpeningBalance(id: kotlin.String) {
+        jsonRequest(
+            RequestConfig<kotlin.Any?>(RequestMethod.PUT, "/api/v1/accounts/$id", query = mutableMapOf(), headers = mutableMapOf()),
+            mapOf("opening_balance" to "", "opening_balance_date" to ""),
+            listOf("firefly_iii_auth"),
+        )
+    }
+
 }
