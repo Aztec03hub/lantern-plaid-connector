@@ -23,6 +23,7 @@ package net.djvk.fireflyPlaidConnector2.api.firefly.models
 
 import com.fasterxml.jackson.annotation.JsonInclude
 import com.fasterxml.jackson.annotation.JsonProperty
+import net.djvk.fireflyPlaidConnector2.api.firefly.apis.FireflyTransactionSplitId
 
 /**
  *
@@ -269,5 +270,9 @@ data class TransactionSplitUpdate(
     /* Hand-added, Lantern's Firefly fork only: the FULL desired set of Plaid links for this split (see [PlaidLink]). */
     @field:JsonProperty("plaid_links")
     val plaidLinks: kotlin.collections.List<PlaidLink>? = null,
+
+    /* The journal this split updates; the fork's contract asks for it on every split of an update. */
+    @field:JsonProperty("transaction_journal_id")
+    val transactionJournalId: FireflyTransactionSplitId? = null,
 )
 

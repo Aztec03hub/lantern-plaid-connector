@@ -64,3 +64,19 @@ data class PlaidLinkLookupResponse(
     @field:JsonProperty("data")
     val data: kotlin.collections.List<PlaidLinkLookupRow>,
 )
+
+/** The body of Firefly's 409 on a write: EVERY Plaid id of the request that is stored on a different transaction. */
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class PlaidLinkConflictError(
+    @field:JsonProperty("message")
+    val message: kotlin.String? = null,
+
+    @field:JsonProperty("conflicts")
+    val conflicts: kotlin.collections.List<PlaidLinkConflict> = listOf(),
+)
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class PlaidLinkConflict(
+    @field:JsonProperty("plaid_transaction_id")
+    val plaidTransactionId: kotlin.String,
+)

@@ -23,6 +23,12 @@ data class FireflyTransactionDto(
      * a deposit and back). The type is only sent on an update when it changes, so an ordinary update can never alter it.
      */
     val changesType: Boolean = false,
+    /**
+     * For an update that adds a Plaid leg to an existing transaction (pairing, or pending to posted): what to create
+     * instead if Firefly rejects the update (422) or the transaction is gone (404), so the new leg's money is never
+     * hidden behind a rejected update.
+     */
+    val fallbackCreate: FireflyTransactionDto? = null,
 ) {
     val transactionId: String
         get() = id ?: throw RuntimeException("Can't use a Firefly transaction without an id for sorting")
@@ -33,9 +39,10 @@ data class FireflyTransactionDto(
     fun toTransactionStore(): TransactionStore {
         return TransactionStore(
             listOf(tx),
-            // The Plaid link table is the dedupe. Firefly's content hash would also reject two real, identical purchases
-            //  (same day, merchant and amount), which the connector then skipped, losing the second one.
-            errorIfDuplicateHash = false,
+            // A transaction with a Plaid link is deduped by the link table. Without the old external id, Firefly's content
+            //  hash could also reject two real, identical purchases, which the connector then skipped. A transaction
+            //  with no link (batch mode's opening balance) has only the hash to stop a second copy on a re-run.
+            errorIfDuplicateHash = tx.plaidLinks.isNullOrEmpty(),
             applyRules = true,
             fireWebhooks = true,
             groupTitle = null,

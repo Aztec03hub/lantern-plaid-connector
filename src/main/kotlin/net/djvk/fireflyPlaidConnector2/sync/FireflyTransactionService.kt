@@ -152,17 +152,19 @@ class FireflyTransactionService(
         var notCreated = 0
         // Insert new transactions
         for (create in creates) {
-            var created = 0
-            val kept = guarded(DeadLetter("create", letterKey(create.tx), null, create.tx, false)) {
-                created = syncHelper.optimisticInsertBatchIntoFirefly(listOf(create))
-            }
-            if (kept || created == 0) notCreated++
+            if (!createGuarded(create)) notCreated++
         }
 
         // Process updates. This includes converting an existing deposit/withdrawal into a transfer, which is an in-place
         //  update with type=transfer (Firefly 6.7.7 accepts that), so every Firefly write here is safe to repeat.
         for (update in updates) {
-            guarded(DeadLetter("update", update.transactionId, update.id, update.tx, update.changesType)) {
+            // An update that adds a Plaid leg to a transaction Firefly rejects (422) or no longer has (404) creates that
+            //  leg on its own instead, so its money is not hidden behind a failed update
+            val fallback = update.fallbackCreate
+            guarded(
+                DeadLetter("update", update.transactionId, update.id, update.tx, update.changesType),
+                instead = fallback?.let { { createGuarded(it) } },
+            ) {
                 syncHelper.updateBatchInFirefly(listOf(update))
             }
         }
@@ -172,6 +174,15 @@ class FireflyTransactionService(
             guarded(DeadLetter("delete", id, id)) { syncHelper.deleteBatchInFirefly(listOf(id)) }
         }
         return notCreated
+    }
+
+    /** @return true if [create] made a new Firefly transaction (false: dead-lettered, or already imported) */
+    private suspend fun createGuarded(create: FireflyTransactionDto): Boolean {
+        var created = 0
+        val kept = guarded(DeadLetter("create", letterKey(create.tx), null, create.tx, false)) {
+            created = syncHelper.optimisticInsertBatchIntoFirefly(listOf(create))
+        }
+        return !kept && created > 0
     }
 
     companion object {
@@ -190,6 +201,14 @@ class FireflyTransactionService(
         val store = deadLetters ?: return
         for (letter in store.read()) {
             if (letter.abandoned) continue
+            if (letter.operation == "create" && letter.split?.plaidLinks.isNullOrEmpty()) {
+                // Written by a build from before the link table: sent now it would be unprotected against duplicates
+                logger.error(
+                    "The dead-lettered create ${letter.key} carries no Plaid link (older build); ABANDONED, enter it by hand if it is missing"
+                )
+                store.add(letter.copy(abandoned = true))
+                continue
+            }
             guarded(letter, retry = true) {
                 val split = letter.split
                 when (letter.operation) {
@@ -212,7 +231,12 @@ class FireflyTransactionService(
      *
      * @return true if the write was kept as a dead letter
      */
-    private suspend fun guarded(letter: DeadLetter, retry: Boolean = false, write: suspend () -> Unit): Boolean {
+    private suspend fun guarded(
+        letter: DeadLetter,
+        retry: Boolean = false,
+        instead: (suspend () -> Unit)? = null,
+        write: suspend () -> Unit,
+    ): Boolean {
         val store = deadLetters
         try {
             write()
@@ -221,8 +245,16 @@ class FireflyTransactionService(
         } catch (cre: ClientRequestException) {
             val status = cre.response.status.value
             if (status == 409) {
-                logger.info("Firefly already holds the Plaid id(s) of the ${letter.operation} of ${letter.key}; already imported")
+                // Nothing of the write was applied. For a create the money is recorded; for an update (pairing, or a
+                //  link change) the Plaid id is recorded on another transaction, so the target stays as it was.
+                logger.info("Firefly already holds a Plaid id of the ${letter.operation} of ${letter.key}; left as it was")
                 store?.remove(letter.operation, letter.key)
+                return false
+            }
+            if (instead != null && (status == 404 || status == 422)) {
+                logger.warn("Firefly refused the ${letter.operation} of ${letter.key} (HTTP $status); creating its new Plaid leg on its own")
+                store?.remove(letter.operation, letter.key)
+                instead()
                 return false
             }
             // 401/403 mean the Firefly credentials are wrong for every transaction; 408/429 are transient

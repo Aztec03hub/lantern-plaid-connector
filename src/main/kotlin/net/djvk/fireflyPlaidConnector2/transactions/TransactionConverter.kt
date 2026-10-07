@@ -95,6 +95,37 @@ class TransactionConverter(
     private val transferMatcher = TransferMatcher(timeZoneString, transferMatchWindowDays)
 
     companion object {
+        /**
+         * [transfer] has one or two Plaid links (one when it was paired with a manually entered transaction). Taking
+         * [removedPlaidId] out of it leaves the money of the other side as a plain withdrawal (the source side stays) or
+         * deposit (the destination side stays), with a generic counterparty. The other link, if any, becomes `single`
+         * (which also frees the removed id); with none left `plaid_links` is `[]`, so the user's own side is kept and
+         * unlinked. Null if [transfer] isn't such a transfer or [removedPlaidId] is not one of its links.
+         */
+        fun survivingLeg(transfer: TransactionSplit, removedPlaidId: String): TransactionSplit? {
+            val links = transfer.plaidLinks.orEmpty()
+            if (transfer.type != TransactionTypeProperty.transfer || links.size !in 1..2) return null
+            val removed = links.firstOrNull { it.plaidTransactionId == removedPlaidId } ?: return null
+            val survivors = links.filter { it !== removed }.map { it.copy(leg = PlaidLinkLeg.single) }
+            return when (removed.leg) {
+                PlaidLinkLeg.destination -> transfer.copy(
+                    type = TransactionTypeProperty.withdrawal,
+                    destinationId = null,
+                    destinationName = "Unknown Transfer Recipient",
+                    plaidLinks = survivors,
+                )
+
+                PlaidLinkLeg.source -> transfer.copy(
+                    type = TransactionTypeProperty.deposit,
+                    sourceId = null,
+                    sourceName = "Unknown Transfer Source",
+                    plaidLinks = survivors,
+                )
+
+                PlaidLinkLeg.single -> null
+            }
+        }
+
         private val importTagPlaceholder = Regex("\\{([^{}]*)\\}")
 
         /**
@@ -389,8 +420,13 @@ class TransactionConverter(
                         )
                         // Converted in place, so keep the user's tags and reconciliation on the existing transaction
                         val target = existingFireflyTxs.firstOrNull { it.id == converted.id }
-                        if (target == null) converted
-                        else FireflyTransactionDto(converted.id, preserveUserFields(converted.tx, target, keepCounterparty = false))
+                        // If Firefly refuses the pairing, the new leg is created on its own instead of being lost
+                        val fallback = convertSingle(requirePlaidTransaction(create), accountMap, importTag, link = true)
+                        if (target == null) converted.copy(fallbackCreate = fallback)
+                        else FireflyTransactionDto(
+                            converted.id, preserveUserFields(converted.tx, target, keepCounterparty = false),
+                            fallbackCreate = fallback,
+                        )
                     } else {
                         convertDoublePlaid(
                             requirePlaidTransaction(create.deposit),
@@ -418,6 +454,12 @@ class TransactionConverter(
             val target = indexer.find(plaidUpdate.transactionId)
             if (target == null) {
                 logger.error("Failed to find existing Firefly transaction to update for Plaid id ${plaidUpdate.transactionId}")
+                continue
+            }
+            if (target.attributes.transactions.size != 1) {
+                // A PUT of one split to a group of several journals destroys the others (and their links)
+                logger.error("Firefly transaction ${target.id} has several splits; not updating it from Plaid id ${plaidUpdate.transactionId}, check it by hand")
+                needsReview.add(target.id)
                 continue
             }
 
@@ -461,7 +503,9 @@ class TransactionConverter(
         for (plaidDeleteId in plaidDeletedTxs) {
             val target = indexer.find(plaidDeleteId)
             if (target == null) {
-                logger.error("Failed to find existing Firefly transaction to delete for Plaid id $plaidDeleteId")
+                // The normal outcome of a retried removal (the first attempt freed the id) or of a pending id whose
+                //  posted version already replaced it
+                logger.info("No Firefly transaction holds removed Plaid id $plaidDeleteId; nothing to delete")
                 continue
             }
             if (promotedFireflyIds.contains(target.id)) {
@@ -472,7 +516,10 @@ class TransactionConverter(
             if (!handledRemovals.add(target.id)) continue
             val split = target.attributes.transactions.singleOrNull()
             val legIds = split?.plaidLinks.orEmpty().map { it.plaidTransactionId }
-            if (split?.type == TransactionTypeProperty.transfer && legIds.size == 2 && !deletedPlaidIds.containsAll(legIds)) {
+            // A transfer with one link was paired with a manually entered transaction: the user's own side is never deleted
+            if (split?.type == TransactionTypeProperty.transfer && legIds.isNotEmpty() &&
+                (legIds.size == 1 || !deletedPlaidIds.containsAll(legIds))
+            ) {
                 // Plaid removed ONE leg of a transfer made from two Plaid transactions. The other leg's money is still
                 //  real, so the transfer is not deleted (that would drop it) and not kept either (a re-added leg would
                 //  then be counted again beside it): it becomes a plain withdrawal or deposit for the surviving leg.
@@ -525,6 +572,12 @@ class TransactionConverter(
     ): FireflyTransactionDto? {
         val pendingId = posted.pendingTransactionId ?: return null
         val target = indexer.find(pendingId) ?: return null
+        if (indexer.find(posted.transactionId) != null) {
+            // The posted id is already recorded (a retry, or another transaction). Replacing the pending link would be
+            //  refused (409) and the pending group is then deleted by Plaid's removal like any other pending one.
+            logger.info("Not promoting pending transaction {}: Firefly already holds posted {}", pendingId, posted.transactionId)
+            return null
+        }
         val existingSplit = target.attributes.transactions.singleOrNull() ?: return null
         // The pending id on the link is replaced by the posted id (same leg, same account), atomically in the one PUT
         val relinked = existingSplit.plaidLinks.orEmpty().map {
@@ -553,6 +606,7 @@ class TransactionConverter(
         return FireflyTransactionDto(
             target.id,
             preserveUserFields(converted.tx, target, keepCounterparty = false).copy(plaidLinks = relinked),
+            fallbackCreate = convertSingle(posted, accountMap, currentImportTag(), link = true),
         )
     }
 
@@ -647,38 +701,12 @@ class TransactionConverter(
         currencyCode = existing.currencyCode,
         tags = existing.tags,
         externalId = existing.externalId,
+        transactionJournalId = existing.transactionJournalId,
     )
 
-    /**
-     * [transfer] is a transfer made from two Plaid legs (two links, one `source` and one `destination`). Plaid removed
-     * the leg [removedPlaidId]; this is the same money as a plain withdrawal (the source leg survives) or deposit (the
-     * destination leg survives) on that leg's account, with a generic counterparty, and the surviving link becomes
-     * `single` (which also frees the removed id). Null if [transfer] isn't such a transfer or [removedPlaidId] is
-     * neither of its legs.
-     */
-    fun survivingLeg(transfer: TransactionSplit, removedPlaidId: String): TransactionSplit? {
-        val links = transfer.plaidLinks.orEmpty()
-        if (transfer.type != TransactionTypeProperty.transfer || links.size != 2) return null
-        val removed = links.firstOrNull { it.plaidTransactionId == removedPlaidId } ?: return null
-        val survivor = links.first { it !== removed }.copy(leg = PlaidLinkLeg.single)
-        return when (removed.leg) {
-            PlaidLinkLeg.destination -> transfer.copy(
-                type = TransactionTypeProperty.withdrawal,
-                destinationId = null,
-                destinationName = "Unknown Transfer Recipient",
-                plaidLinks = listOf(survivor),
-            )
-
-            PlaidLinkLeg.source -> transfer.copy(
-                type = TransactionTypeProperty.deposit,
-                sourceId = null,
-                sourceName = "Unknown Transfer Source",
-                plaidLinks = listOf(survivor),
-            )
-
-            PlaidLinkLeg.single -> null
-        }
-    }
+    /** See the companion's [survivingLeg]. */
+    fun survivingLeg(transfer: TransactionSplit, removedPlaidId: String): TransactionSplit? =
+        Companion.survivingLeg(transfer, removedPlaidId)
 
     /**
      * Applies a Plaid change ([plaidTx], a "modified" event) to the write that has not reached Firefly yet
@@ -721,6 +749,7 @@ class TransactionConverter(
             tags = mergeTags(existingSplit.tags, update.tags),
             currencyId = existingSplit.currencyId ?: update.currencyId,
             currencyCode = existingSplit.currencyCode ?: update.currencyCode,
+            transactionJournalId = existingSplit.transactionJournalId,
             // The connector sets reconciled=false on create; sending it again would un-reconcile what the user
             //  reconciled. null omits it from the update JSON.
             reconciled = null,

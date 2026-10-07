@@ -8,6 +8,10 @@ import net.djvk.fireflyPlaidConnector2.api.firefly.apis.AboutApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.AccountsApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.FireflyTransactionId
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.PlaidLinksApi
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.PlaidLink
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.PlaidLinkConflictError
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionRead
+import net.djvk.fireflyPlaidConnector2.transactions.TransactionConverter
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.TransactionsApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.FireflyApiError
 import net.djvk.fireflyPlaidConnector2.config.properties.AccountConfigs
@@ -25,6 +29,10 @@ const val MINIMUM_FIREFLY_VERSION = "6.1.2"
 
 /** A Plaid id that cannot exist, looked up at startup to prove the link table endpoint is there. */
 private const val STARTUP_PROBE_ID = "lantern-startup-probe"
+
+private const val NOT_THE_FORK = "This Firefly does not keep Plaid links (no /api/v1/plaid-links endpoint, or a write came " +
+        "back without them), so it is not Lantern's Firefly fork. The connector relies on its Plaid link table to refuse " +
+        "duplicate transactions and will not run without it. Point fireflyPlaidConnector2.firefly.url at the Lantern fork."
 
 @Component
 class SyncHelper(
@@ -56,11 +64,7 @@ class SyncHelper(
      * a missing endpoint stops the start instead of letting the connector run without the guarantee.
      */
     protected suspend fun validatePlaidLinksEndpoint() {
-        val missing = IllegalStateException(
-            "This Firefly has no /api/v1/plaid-links endpoint, so it is not Lantern's Firefly fork. The connector " +
-                    "relies on its Plaid link table to refuse duplicate transactions and will not run without it. " +
-                    "Point fireflyPlaidConnector2.firefly.url at the Lantern fork."
-        )
+        val missing = IllegalStateException(NOT_THE_FORK)
         try {
             fireflyPlaidLinksApi.lookupPlaidLinks(listOf(STARTUP_PROBE_ID)).body()
         } catch (cre: ClientRequestException) {
@@ -136,12 +140,17 @@ class SyncHelper(
                 }
             } catch (cre: ClientRequestException) {
                 when (cre.response.status) {
-                    HttpStatusCode.Conflict -> logger.info("Skipped transaction $plaidIds that Firefly already holds")
+                    HttpStatusCode.Conflict -> created += insertUnconflictedLegs(fireflyTx, plaidIds, cre)
                     HttpStatusCode.UnprocessableEntity -> {
                         val error = cre.response.body<FireflyApiError>()
-                        // Log the Plaid ids and Firefly's message only: the full error object and the transaction hold field values
-                        logger.error("Firefly transaction insert rejected (${error.message}) for tx $plaidIds")
-                        throw cre
+                        // A transaction with no Plaid link (the batch opening balance) is deduped by Firefly's content hash
+                        if (plaidIds.isEmpty() && error.message.lowercase().contains("duplicate of transaction")) {
+                            logger.info("Skipped transaction that Firefly identified as a duplicate")
+                        } else {
+                            // Log the Plaid ids and Firefly's message only: the full error object and the transaction hold field values
+                            logger.error("Firefly transaction insert rejected (${error.message}) for tx $plaidIds")
+                            throw cre
+                        }
                     }
                     else -> throw cre
                 }
@@ -162,25 +171,64 @@ class SyncHelper(
         return created
     }
 
+    /**
+     * Firefly answered 409: the body lists EVERY Plaid id of the request that is stored on a different transaction, and
+     * nothing of the request was written. Ids that are all conflicting mean "already imported". If a transfer's two
+     * legs were sent and only one conflicts, the other leg is NOT in Firefly, so it is created on its own (as a plain
+     * withdrawal or deposit): dropping the whole write would let the caller commit its cursor over that money.
+     *
+     * @return how many transactions this created
+     */
+    private suspend fun insertUnconflictedLegs(
+        fireflyTx: FireflyTransactionDto,
+        plaidIds: List<String>,
+        cre: ClientRequestException,
+    ): Int {
+        val conflicted = cre.response.body<PlaidLinkConflictError>().conflicts.map { it.plaidTransactionId }.toSet()
+        check(conflicted.isNotEmpty()) { "Firefly answered 409 for $plaidIds without listing a conflicting Plaid id" }
+        val missing = plaidIds.filter { it !in conflicted }
+        if (missing.isEmpty()) {
+            logger.info("Skipped transaction $plaidIds that Firefly already holds")
+            return 0
+        }
+        val leg = if (plaidIds.size == 2 && conflicted.size == 1) TransactionConverter.survivingLeg(fireflyTx.tx, conflicted.single()) else null
+        checkNotNull(leg) { "Firefly answered 409 for $plaidIds but only $conflicted conflict; cannot split the request" }
+        logger.warn("Firefly already holds $conflicted of $plaidIds; creating $missing on its own")
+        return optimisticInsertBatchIntoFirefly(listOf(FireflyTransactionDto(null, leg)))
+    }
+
     /** @return false if the transaction was skipped (zero amount), true if it was sent */
     suspend fun insertIntoFirefly(fireflyTx: FireflyTransactionDto): Boolean {
         if (fireflyTx.tx.amount.toDouble() == 0.0) {
             logger.info("Skipped transaction ${fireflyTx.tx.plaidLinks?.map { it.plaidTransactionId }} with amount 0.0")
             return false
         }
-        fireflyTxApi.storeTransaction(fireflyTx.toTransactionStore())
+        val stored = fireflyTxApi.storeTransaction(fireflyTx.toTransactionStore()).body().data
+        requireLinksStored(fireflyTx.tx.plaidLinks, stored)
         return true
+    }
+
+    /**
+     * A stock Firefly ignores `plaid_links` and answers 200, so a Firefly swapped for one while the connector runs would
+     * store transactions that nothing dedupes. A write that sent links must come back carrying them.
+     */
+    private fun requireLinksStored(sent: List<PlaidLink>?, stored: TransactionRead) {
+        val wanted = sent.orEmpty().map { it.plaidTransactionId }
+        if (wanted.isEmpty()) return
+        val held = stored.attributes.transactions.flatMap { it.plaidLinks.orEmpty() }.map { it.plaidTransactionId }.toSet()
+        check(held.containsAll(wanted)) { NOT_THE_FORK }
     }
 
     suspend fun updateBatchInFirefly(fireflyTxs: List<FireflyTransactionDto>) {
         for (fireflyTx in fireflyTxs) {
-            fireflyTxApi.updateTransaction(
+            val stored = fireflyTxApi.updateTransaction(
                 fireflyTx.id
                     ?: throw IllegalArgumentException(
-                        "Can't update Firefly transaction without id (external id ${fireflyTx.tx.externalId})"
+                        "Can't update Firefly transaction without id (Plaid ids ${fireflyTx.tx.plaidLinks?.map { it.plaidTransactionId }})"
                     ),
                 fireflyTx.toTransactionUpdate(),
-            )
+            ).body().data
+            requireLinksStored(fireflyTx.tx.plaidLinks, stored)
         }
     }
 

@@ -380,6 +380,7 @@ data class TransactionSplit(
             paymentDate = paymentDate,
             invoiceDate = invoiceDate,
             plaidLinks = plaidLinks,
+            transactionJournalId = transactionJournalId,
         )
     }
 }

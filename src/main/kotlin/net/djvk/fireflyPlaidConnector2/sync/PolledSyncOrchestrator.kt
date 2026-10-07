@@ -266,17 +266,33 @@ class PolledSyncOrchestrator(
             ).withDeadLetters()
         }
 
-        // Fetch existing Firefly transactions in the pull window (the pool a new transfer leg is paired from), plus
-        //  any older ones that Plaid's updates, removals, pending-to-posted links and possible transfer legs refer to
-        //  (which the window would otherwise miss). A create that is not one of these needs no lookup: if Firefly
-        //  already holds it, the write answers 409.
+        // Fetch existing Firefly transactions in the pull window: the pool a new transfer leg is paired from
         val windowFireflyTxs = fireflyTransactionService.fetchExistingFireflyTransactions()
+        //  Settled creates dated before the window that could be transfer legs are paired from a dated range read too
+        //  (a link lookup only finds a create's OWN record, never the other leg): a second bank imported with its whole
+        //  history would otherwise record every old transfer as an unpaired withdrawal plus deposit. Dedupe is not its
+        //  job any more, the link table does that.
+        val windowStart = fireflyTransactionService.windowStart()
+        val oldPairableDates = plaidTransactions.created
+            .filter { converter.mightPairAsTransfer(it) }
+            .map { minOf(it.date, it.authorizedDate ?: it.date) }
+            .filter { it < windowStart }
+        val oldFireflyTxs = if (oldPairableDates.isEmpty()) listOf() else
+            fireflyTransactionService.fetchFireflyTransactionsBetween(
+                oldPairableDates.min().minusDays(1), windowStart.minusDays(1), maxHistoryPages,
+            )
+        // Plaid's updates, removals, pending-to-posted links and possible transfer legs may refer to Firefly transactions
+        //  the reads above missed; a link lookup finds them. A posted create that replaces a pending one is looked up
+        //  under its own id too: if Firefly already holds it, the pending one is not promoted onto it. A create that is
+        //  none of these needs no lookup: if Firefly already holds it, the write answers 409.
         val referencedPlaidIds = plaidTransactions.updated.map { it.transactionId } +
                 plaidTransactions.deleted +
                 plaidTransactions.created.mapNotNull { it.pendingTransactionId } +
+                plaidTransactions.created.filter { it.pendingTransactionId != null }.map { it.transactionId } +
                 plaidTransactions.created.filter { converter.mightPairAsTransfer(it) }.map { it.transactionId }
-        val existingFireflyTxs = windowFireflyTxs +
-                fireflyTransactionService.fetchMissingByPlaidId(referencedPlaidIds, windowFireflyTxs)
+        val knownFireflyTxs = windowFireflyTxs + oldFireflyTxs
+        val existingFireflyTxs = knownFireflyTxs +
+                fireflyTransactionService.fetchMissingByPlaidId(referencedPlaidIds, knownFireflyTxs)
 
         // Convert Plaid transactions to Firefly format
         logger.trace("Converting Plaid transactions to Firefly transactions")
@@ -523,3 +539,6 @@ class InvestmentSyncException(val failedItemNames: List<String>) :
     IllegalStateException("Investment sync failed for ${failedItemNames.size} Item(s): $failedItemNames") {
     val failedItems: Int get() = failedItemNames.size
 }
+
+/** No page cap for the history range read: it is bounded by the transaction ceiling in [FireflyTransactionService] instead. */
+private const val maxHistoryPages = Int.MAX_VALUE
