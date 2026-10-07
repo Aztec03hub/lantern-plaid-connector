@@ -73,6 +73,7 @@ object FireflyFixtures {
         longitude: Double? = null,
         zoomLevel: Int? = null,
         hasAttachments: Boolean? = null,
+        plaidLinks: List<net.djvk.fireflyPlaidConnector2.api.firefly.models.PlaidLink>? = null,
     ): Transaction {
         return Transaction(
             transactions = listOf(
@@ -137,6 +138,7 @@ object FireflyFixtures {
                     longitude = longitude,
                     zoomLevel = zoomLevel,
                     hasAttachments = hasAttachments,
+                    plaidLinks = plaidLinks,
                 )
             ),
             createdAt = createdAt,

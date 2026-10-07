@@ -33,7 +33,9 @@ data class FireflyTransactionDto(
     fun toTransactionStore(): TransactionStore {
         return TransactionStore(
             listOf(tx),
-            errorIfDuplicateHash = true,
+            // The Plaid link table is the dedupe. Firefly's content hash would also reject two real, identical purchases
+            //  (same day, merchant and amount), which the connector then skipped, losing the second one.
+            errorIfDuplicateHash = false,
             applyRules = true,
             fireWebhooks = true,
             groupTitle = null,

@@ -264,7 +264,10 @@ data class TransactionSplitUpdate(
     val paymentDate: java.time.OffsetDateTime? = null,
 
     @field:JsonProperty("invoice_date")
-    val invoiceDate: java.time.OffsetDateTime? = null
+    val invoiceDate: java.time.OffsetDateTime? = null,
 
+    /* Hand-added, Lantern's Firefly fork only: the FULL desired set of Plaid links for this split (see [PlaidLink]). */
+    @field:JsonProperty("plaid_links")
+    val plaidLinks: kotlin.collections.List<PlaidLink>? = null,
 )
 

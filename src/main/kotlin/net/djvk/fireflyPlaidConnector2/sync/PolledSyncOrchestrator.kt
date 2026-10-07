@@ -6,7 +6,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import net.djvk.fireflyPlaidConnector2.transactions.FireflyAccountId
-import net.djvk.fireflyPlaidConnector2.transactions.FireflyTransactionExternalIdIndexer
 import net.djvk.fireflyPlaidConnector2.transactions.InvestmentTransactionConverter
 import net.djvk.fireflyPlaidConnector2.transactions.TransactionConverter
 import net.djvk.fireflyPlaidConnector2.util.Utilities
@@ -123,9 +122,8 @@ class PolledSyncOrchestrator(
      * transactions from Plaid and inserts the ones Firefly doesn't have yet.
      *
      * Plaid has no cursor or change events for investment transactions, so each poll re-reads the last
-     * [investmentLookbackDays] days. Transactions already in Firefly's pull window are skipped by external id; older
-     * ones are rejected by Firefly's duplicate detection, which the insert tolerates. Later corrections or
-     * cancellations of an already-imported investment transaction are not propagated.
+     * [investmentLookbackDays] days. The ones Firefly already holds (a link lookup) are skipped; a 409 on the insert is
+     * tolerated. Later corrections or cancellations of an already-imported investment transaction are not propagated.
      *
      * One Item failing (for example because it wasn't linked with the investments product) does not stop the other
      * Items; once all have been tried, an exception reports the failed ones.
@@ -138,8 +136,6 @@ class PolledSyncOrchestrator(
         val investmentItems = syncHelper.getInvestmentAccessTokenAccountIdSets().toList()
         if (investmentItems.isEmpty()) return
 
-        // The Firefly window is read at most once per call, and only if Plaid returned something to compare with
-        var knownExternalIds: Set<String>? = null
         val failedItems = mutableListOf<String>()
 
         for ((accessToken, accountIds) in investmentItems) {
@@ -148,13 +144,9 @@ class PolledSyncOrchestrator(
                     accessToken, accountIds, today.minusDays(investmentLookbackDays), today
                 )
                 if (plaidTxs.isEmpty()) continue
-                val known = knownExternalIds ?: fireflyTransactionService.fetchExistingFireflyTransactions()
-                    .flatMap { it.attributes.transactions }
-                    .mapNotNull { it.externalId }
-                    .toSet()
-                    .also { knownExternalIds = it }
+                val held = fireflyTransactionService.heldPlaidIds(plaidTxs.map { it.investmentTransactionId })
                 val creates = plaidTxs
-                    .filter { FireflyTransactionExternalIdIndexer.getExternalId(it.investmentTransactionId) !in known }
+                    .filter { it.investmentTransactionId !in held }
                     .mapNotNull { tx ->
                         val fireflyAccountId = accountMap[tx.accountId]
                         if (fireflyAccountId == null) {
@@ -274,28 +266,17 @@ class PolledSyncOrchestrator(
             ).withDeadLetters()
         }
 
-        // Fetch existing Firefly transactions in the pull window, plus any older ones that Plaid's updates, removals
-        //  and pending-to-posted links refer to (which the window would otherwise miss)
+        // Fetch existing Firefly transactions in the pull window (the pool a new transfer leg is paired from), plus
+        //  any older ones that Plaid's updates, removals, pending-to-posted links and possible transfer legs refer to
+        //  (which the window would otherwise miss). A create that is not one of these needs no lookup: if Firefly
+        //  already holds it, the write answers 409.
         val windowFireflyTxs = fireflyTransactionService.fetchExistingFireflyTransactions()
-        //  Creates dated before the window are looked up too: an iteration that failed part way is retried with the
-        //  same creates, and without this the only protection against inserting them twice is Firefly's content hash,
-        //  which changes with the import tag and with Plaid edits. They are read as one dated range (a first import
-        //  has thousands, and one search request each was measured at ~50 ms apiece); the few updates, removals and
-        //  pending links older than the window are still looked up one by one.
-        val windowStart = fireflyTransactionService.windowStart()
-        val oldCreateDates = plaidTransactions.created
-            .map { minOf(it.date, it.authorizedDate ?: it.date) }
-            .filter { it < windowStart }
-        val oldFireflyTxs = if (oldCreateDates.isEmpty()) listOf() else
-            fireflyTransactionService.fetchFireflyTransactionsBetween(
-                oldCreateDates.min().minusDays(1), windowStart.minusDays(1), maxHistoryPages,
-            )
         val referencedPlaidIds = plaidTransactions.updated.map { it.transactionId } +
                 plaidTransactions.deleted +
-                plaidTransactions.created.mapNotNull { it.pendingTransactionId }
-        val knownFireflyTxs = windowFireflyTxs + oldFireflyTxs
-        val existingFireflyTxs = knownFireflyTxs +
-                fireflyTransactionService.fetchMissingByPlaidId(referencedPlaidIds, knownFireflyTxs)
+                plaidTransactions.created.mapNotNull { it.pendingTransactionId } +
+                plaidTransactions.created.filter { converter.mightPairAsTransfer(it) }.map { it.transactionId }
+        val existingFireflyTxs = windowFireflyTxs +
+                fireflyTransactionService.fetchMissingByPlaidId(referencedPlaidIds, windowFireflyTxs)
 
         // Convert Plaid transactions to Firefly format
         logger.trace("Converting Plaid transactions to Firefly transactions")
@@ -367,9 +348,8 @@ class PolledSyncOrchestrator(
         if (plaid.created.isEmpty() && plaid.updated.isEmpty() && plaid.deleted.isEmpty()) return
         val creates = store.read().filter { it.operation == "create" && it.split != null }
         if (creates.isEmpty()) return
-        fun letterFor(plaidId: String) = creates.firstOrNull {
-            val id = FireflyTransactionExternalIdIndexer.getExternalId(plaidId)
-            it.key == id || it.split?.internalReference == id
+        fun letterFor(plaidId: String) = creates.firstOrNull { letter ->
+            letter.split?.plaidLinks.orEmpty().any { it.plaidTransactionId == plaidId }
         }
 
         for (posted in plaid.created) {
@@ -384,19 +364,17 @@ class PolledSyncOrchestrator(
             store.add(letter.copy(split = converter.reviseUnsentCreate(letter.split!!, modified, accountMap), attempts = 0, abandoned = false))
         }
         for (removedId in plaid.deleted) {
-            val letter = store.read().firstOrNull {
-                it.operation == "create" && it.split != null &&
-                        (it.key == FireflyTransactionExternalIdIndexer.getExternalId(removedId) ||
-                                it.split.internalReference == FireflyTransactionExternalIdIndexer.getExternalId(removedId))
+            val letter = store.read().firstOrNull { l ->
+                l.operation == "create" && l.split?.plaidLinks.orEmpty().any { it.plaidTransactionId == removedId }
             } ?: continue
-            val survivor = converter.survivingLeg(letter.split!!, FireflyTransactionExternalIdIndexer.getExternalId(removedId))
+            val survivor = converter.survivingLeg(letter.split!!, removedId)
             if (survivor == null) {
                 logger.info("Dropping the dead-lettered create ${letter.key}: Plaid removed ${removedId}")
                 store.remove("create", letter.key)
             } else {
                 logger.info("Plaid removed one leg of the dead-lettered transfer ${letter.key}; keeping the other leg's money")
                 store.remove("create", letter.key)
-                store.add(letter.copy(key = survivor.externalId ?: letter.key, split = survivor, attempts = 0, abandoned = false))
+                store.add(letter.copy(key = FireflyTransactionService.letterKey(survivor), split = survivor, attempts = 0, abandoned = false))
             }
         }
     }
@@ -545,6 +523,3 @@ class InvestmentSyncException(val failedItemNames: List<String>) :
     IllegalStateException("Investment sync failed for ${failedItemNames.size} Item(s): $failedItemNames") {
     val failedItems: Int get() = failedItemNames.size
 }
-
-/** No page cap for the history range read: it is bounded by the transaction ceiling in [FireflyTransactionService] instead. */
-private const val maxHistoryPages = Int.MAX_VALUE

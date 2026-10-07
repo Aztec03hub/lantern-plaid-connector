@@ -1,5 +1,7 @@
 package net.djvk.fireflyPlaidConnector2.transactions
 
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.PlaidLink
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.PlaidLinkLeg
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionSplit
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionTypeProperty
 import net.djvk.fireflyPlaidConnector2.api.plaid.models.InvestmentTransaction
@@ -52,9 +54,9 @@ class InvestmentTransactionConverter(
             currencyCode = tx.isoCurrencyCode,
             notes = describe(tx),
             tags = tags,
-            externalId = FireflyTransactionExternalIdIndexer.getExternalId(tx.investmentTransactionId),
             order = 0,
             reconciled = false,
+            plaidLinks = listOf(PlaidLink(tx.investmentTransactionId, PlaidLinkLeg.single, tx.accountId)),
         )
         return FireflyTransactionDto(null, split)
     }

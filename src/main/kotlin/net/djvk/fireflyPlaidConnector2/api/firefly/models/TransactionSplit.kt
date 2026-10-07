@@ -317,7 +317,16 @@ data class TransactionSplit(
 
     /* If the transaction has attachments. */
     @field:JsonProperty("has_attachments")
-    val hasAttachments: kotlin.Boolean? = null
+    val hasAttachments: kotlin.Boolean? = null,
+
+    /*
+     * Hand-added, Lantern's Firefly fork only: the Plaid transaction ids stored on this split (see [PlaidLink]). Always
+     * present on a read (empty if none). On a write it is omitted when null; on an update, omitted means "links
+     * unchanged", a list is the full desired set and an empty list removes them all.
+     */
+    @field:JsonProperty("plaid_links")
+    @field:com.fasterxml.jackson.annotation.JsonInclude(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL)
+    val plaidLinks: kotlin.collections.List<PlaidLink>? = null,
 ) {
     /** @param includeType send the transaction type too; only wanted when converting to a transfer */
     fun toTransactionSplitUpdate(includeType: Boolean = false): TransactionSplitUpdate {
@@ -369,7 +378,8 @@ data class TransactionSplit(
             processDate = processDate,
             dueDate = dueDate,
             paymentDate = paymentDate,
-            invoiceDate = invoiceDate
+            invoiceDate = invoiceDate,
+            plaidLinks = plaidLinks,
         )
     }
 }

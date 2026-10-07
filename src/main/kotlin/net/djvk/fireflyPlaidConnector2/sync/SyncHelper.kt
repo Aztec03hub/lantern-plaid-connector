@@ -7,7 +7,7 @@ import io.ktor.http.*
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.AboutApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.AccountsApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.FireflyTransactionId
-import net.djvk.fireflyPlaidConnector2.api.firefly.apis.SearchApi
+import net.djvk.fireflyPlaidConnector2.api.firefly.apis.PlaidLinksApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.TransactionsApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.FireflyApiError
 import net.djvk.fireflyPlaidConnector2.config.properties.AccountConfigs
@@ -23,6 +23,9 @@ typealias PlaidAccountId = String
 
 const val MINIMUM_FIREFLY_VERSION = "6.1.2"
 
+/** A Plaid id that cannot exist, looked up at startup to prove the link table endpoint is there. */
+private const val STARTUP_PROBE_ID = "lantern-startup-probe"
+
 @Component
 class SyncHelper(
     private val plaidAccountsConfig: AccountConfigs,
@@ -32,7 +35,7 @@ class SyncHelper(
     private val fireflyAboutApi: AboutApi,
     private val fireflyTxApi: TransactionsApi,
     private val fireflyAccountsApi: AccountsApi,
-    private val fireflySearchApi: SearchApi? = null,
+    private val fireflyPlaidLinksApi: PlaidLinksApi,
 ) {
     private val logger = LoggerFactory.getLogger(this::class.java)
 
@@ -42,8 +45,30 @@ class SyncHelper(
         fireflyTxApi.setAccessToken(fireflyAccessToken)
         fireflyAccountsApi.setAccessToken(fireflyAccessToken)
         fireflyAboutApi.setAccessToken(fireflyAccessToken)
-        fireflySearchApi?.setAccessToken(fireflyAccessToken)
+        fireflyPlaidLinksApi.setAccessToken(fireflyAccessToken)
         validateFireflyApiVersion()
+        validatePlaidLinksEndpoint()
+    }
+
+    /**
+     * The connector's dedupe is Firefly's Plaid link table, which only Lantern's Firefly fork has. On a stock Firefly
+     * the `plaid_links` fields would be silently ignored and every retry would import the same transactions again, so
+     * a missing endpoint stops the start instead of letting the connector run without the guarantee.
+     */
+    protected suspend fun validatePlaidLinksEndpoint() {
+        val missing = IllegalStateException(
+            "This Firefly has no /api/v1/plaid-links endpoint, so it is not Lantern's Firefly fork. The connector " +
+                    "relies on its Plaid link table to refuse duplicate transactions and will not run without it. " +
+                    "Point fireflyPlaidConnector2.firefly.url at the Lantern fork."
+        )
+        try {
+            fireflyPlaidLinksApi.lookupPlaidLinks(listOf(STARTUP_PROBE_ID)).body()
+        } catch (cre: ClientRequestException) {
+            if (cre.response.status == HttpStatusCode.NotFound || cre.response.status == HttpStatusCode.MethodNotAllowed) throw missing
+            throw cre
+        } catch (e: com.fasterxml.jackson.core.JsonProcessingException) {
+            throw missing
+        }
     }
 
     protected suspend fun validateFireflyApiVersion() {
@@ -87,37 +112,43 @@ class SyncHelper(
         }
     }
 
-    suspend fun optimisticInsertBatchIntoFirefly(fireflyTxs: List<FireflyTransactionDto>) {
+    /**
+     * Creates each of [fireflyTxs]. A 409 means Firefly already holds one of its Plaid ids (the link table refuses a
+     * second row), so that transaction is "already imported" and skipped; the rest carry on.
+     *
+     * @return how many transactions were actually created (not skipped as already imported or as zero amount)
+     */
+    suspend fun optimisticInsertBatchIntoFirefly(fireflyTxs: List<FireflyTransactionDto>): Int {
         if (fireflyTxs.isNotEmpty()) {
             logger.debug("Optimistic insert of ${fireflyTxs.size} txs into Firefly")
         }
-        var index = 0
+        var created = 0
         var timedOut = 0
         var firstTimeout: ConnectTimeoutException? = null
         for (fireflyTx in fireflyTxs) {
+            val plaidIds = fireflyTx.tx.plaidLinks.orEmpty().map { it.plaidTransactionId }
             try {
-                insertIntoFirefly(fireflyTx)
-                index++
-                if (index % 100 == 0) {
-                    logger.debug("Insert of tx index $index successful")
+                if (insertIntoFirefly(fireflyTx)) {
+                    created++
+                    if (created % 100 == 0) {
+                        logger.debug("Insert of tx index $created successful")
+                    }
                 }
             } catch (cre: ClientRequestException) {
-                if (cre.response.status == HttpStatusCode.UnprocessableEntity) {
-                    val error = cre.response.body<FireflyApiError>()
-                    if (error.message.lowercase().contains("duplicate of transaction")) {
-                        logger.info("Skipped transaction ${fireflyTx.tx.externalId} that Firefly identified as a duplicate")
-                    } else {
-                        // Log the external id and Firefly's message only: the full error object and the transaction hold field values
-                        logger.error("Firefly transaction insert rejected (${error.message}) for tx ${fireflyTx.tx.externalId}")
+                when (cre.response.status) {
+                    HttpStatusCode.Conflict -> logger.info("Skipped transaction $plaidIds that Firefly already holds")
+                    HttpStatusCode.UnprocessableEntity -> {
+                        val error = cre.response.body<FireflyApiError>()
+                        // Log the Plaid ids and Firefly's message only: the full error object and the transaction hold field values
+                        logger.error("Firefly transaction insert rejected (${error.message}) for tx $plaidIds")
                         throw cre
                     }
-                } else {
-                    throw cre
+                    else -> throw cre
                 }
             } catch (e: ConnectTimeoutException) {
                 // Keep going so one timeout doesn't block the rest, but remember it: silently skipping would lose
                 //  the transaction for good once the caller commits its Plaid cursor.
-                logger.error("Timeout inserting firefly tx ${fireflyTx.tx.externalId}; will fail this batch", e)
+                logger.error("Timeout inserting firefly tx $plaidIds; will fail this batch", e)
                 firstTimeout = firstTimeout ?: e
                 timedOut++
             }
@@ -128,37 +159,17 @@ class SyncHelper(
                 firstTimeout
             )
         }
+        return created
     }
 
-    /**
-     * The only difference between this and [optimisticInsertBatchIntoFirefly] is that this doesn't expect or tolerate
-     *  duplicate errors.
-     */
-    suspend fun pessimisticInsertBatchIntoFirefly(fireflyTxs: List<FireflyTransactionDto>) {
-        if (fireflyTxs.isNotEmpty()) {
-            logger.debug("Pessimistic insert of ${fireflyTxs.size} txs into Firefly")
-        }
-        for (fireflyTx in fireflyTxs) {
-            try {
-                insertIntoFirefly(fireflyTx)
-            } catch (cre: ClientRequestException) {
-                if (cre.response.status == HttpStatusCode.UnprocessableEntity) {
-                    val error = cre.response.body<FireflyApiError>()
-                    logger.error("Firefly transaction insert rejected (${error.message}) for tx ${fireflyTx.tx.externalId}")
-                }
-                // Every client error propagates. This used to swallow anything that wasn't a 422, which for a
-                //  transfer update (delete, then this insert) meant the transaction was deleted and never re-created.
-                throw cre
-            }
-        }
-    }
-
-    suspend fun insertIntoFirefly(fireflyTx: FireflyTransactionDto) {
+    /** @return false if the transaction was skipped (zero amount), true if it was sent */
+    suspend fun insertIntoFirefly(fireflyTx: FireflyTransactionDto): Boolean {
         if (fireflyTx.tx.amount.toDouble() == 0.0) {
-            logger.info("Skipped transaction ${fireflyTx.tx.externalId} with amount 0.0")
-            return
+            logger.info("Skipped transaction ${fireflyTx.tx.plaidLinks?.map { it.plaidTransactionId }} with amount 0.0")
+            return false
         }
         fireflyTxApi.storeTransaction(fireflyTx.toTransactionStore())
+        return true
     }
 
     suspend fun updateBatchInFirefly(fireflyTxs: List<FireflyTransactionDto>) {

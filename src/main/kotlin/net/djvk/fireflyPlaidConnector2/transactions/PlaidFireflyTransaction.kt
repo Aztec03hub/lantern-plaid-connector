@@ -23,25 +23,25 @@ sealed interface PlaidFireflyTransaction {
     companion object {
         /**
          * Normalizes Plaid and Firefly transactions into PlaidFireflyTransaction objects, joining them together as a
-         * MatchedTransaction when a Plaid transaction has a transactionId that matches a Firefly transaction's
-         * externalId.
+         * MatchedTransaction when a Plaid transaction has a transactionId that matches the Plaid link of a Firefly
+         * transaction. The Firefly transactions here are single-split deposits/withdrawals, so at most one link.
          */
         fun normalizeByTransactionId(
             plaidTxs: List<Transaction>,
             fireflyTxs: List<FireflyTransactionDto>,
             accountMap: Map<String, Int>
         ): List<PlaidFireflyTransaction> {
-            val plaidById = plaidTxs.groupBy { FireflyTransactionExternalIdIndexer.getExternalId(it.transactionId) }
-            val fireflyByExtId = fireflyTxs.groupBy { it.tx.externalId }
-            val externalIds = plaidById.keys.union(fireflyByExtId.keys)
+            val plaidById = plaidTxs.groupBy { it.transactionId }
+            val fireflyByPlaidId = fireflyTxs.groupBy { it.tx.plaidLinks?.firstOrNull()?.plaidTransactionId }
+            val plaidIds = plaidById.keys.union(fireflyByPlaidId.keys)
 
-            return externalIds.flatMap { externalId ->
-                val matchingPlaid = plaidById[externalId] ?: listOf()
-                val matchingFirefly = fireflyByExtId[externalId] ?: listOf()
+            return plaidIds.flatMap { plaidId ->
+                val matchingPlaid = plaidById[plaidId] ?: listOf()
+                val matchingFirefly = fireflyByPlaidId[plaidId] ?: listOf()
 
-                // For all transactions that do not have an external ID, or if we've found more matching transactions
-                // than we expected to find, return them without attempting to combine.
-                if (externalId == null || matchingFirefly.size > 1 || matchingPlaid.size > 1) {
+                // For all transactions that have no Plaid link (entered by hand), or if we've found more matching
+                // transactions than we expected to find, return them without attempting to combine.
+                if (plaidId == null || matchingFirefly.size > 1 || matchingPlaid.size > 1) {
                     val convertedFirefly = matchingFirefly.map { FireflyTransaction(it) }
                     val convertedPlaid = matchingPlaid.map { matchingPlaidTx ->
                         val accountId = accountMap[matchingPlaidTx.accountId]

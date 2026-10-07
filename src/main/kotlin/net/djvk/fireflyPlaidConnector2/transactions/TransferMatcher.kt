@@ -29,6 +29,12 @@ class TransferMatcher(
             PersonalFinanceCategoryEnum.Primary.BANK_FEES,
         )
 
+    /** False only when Plaid's category says [tx] is not a transfer; with no category we try to match it anyway. */
+    fun isPossibleTransfer(tx: net.djvk.fireflyPlaidConnector2.api.plaid.models.Transaction?): Boolean {
+        val category = tx?.personalFinanceCategory
+        return category == null || transferTypes.contains(PersonalFinanceCategoryEnum.from(category).primary)
+    }
+
     /**
      * Identify matching transaction pairs that can be converted to a single "transfer" in Firefly.
      *
@@ -41,10 +47,7 @@ class TransferMatcher(
 
         // Split-out the transactions that are unlikely to be transfers based on their category. If we're not sure,
         // we'll try to match it as a transfer anyway.
-        val (possibleTransfers, nonTransfers) = txs.partition {
-            val category = it.plaidTransaction?.personalFinanceCategory
-            category == null || transferTypes.contains(PersonalFinanceCategoryEnum.from(category).primary)
-        }
+        val (possibleTransfers, nonTransfers) = txs.partition { isPossibleTransfer(it.plaidTransaction) }
 
         val results = nonTransfers.toMutableList()
 

@@ -2,12 +2,12 @@ package net.djvk.fireflyPlaidConnector2.sync
 
 import io.ktor.client.plugins.ClientRequestException
 import io.ktor.client.statement.bodyAsText
-import net.djvk.fireflyPlaidConnector2.api.firefly.apis.SearchApi
+import net.djvk.fireflyPlaidConnector2.api.firefly.apis.PlaidLinksApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.TransactionsApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionRead
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionTypeFilter
 import net.djvk.fireflyPlaidConnector2.transactions.FireflyTransactionDto
-import net.djvk.fireflyPlaidConnector2.transactions.FireflyTransactionExternalIdIndexer
+import net.djvk.fireflyPlaidConnector2.transactions.PlaidLinkIndexer
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.stereotype.Component
@@ -29,8 +29,8 @@ class FireflyTransactionService(
     @Value("\${fireflyPlaidConnector2.timeZone:UTC}")
     timeZoneString: String = "UTC",
 
-    /** Used to look up Firefly transactions that are older than the pull window; see [fetchMissingByPlaidId]. */
-    private val fireflySearchApi: SearchApi,
+    /** Used to find the Firefly transactions of Plaid ids outside the pull window; see [fetchMissingByPlaidId]. */
+    private val plaidLinksApi: PlaidLinksApi,
 
     /** Where Firefly writes that were permanently rejected are kept; null means a rejected write fails the iteration. */
     private val deadLetters: DeadLetterStore? = null,
@@ -101,38 +101,35 @@ class FireflyTransactionService(
 
     /**
      * Plaid can update or remove a transaction long after we imported it, a pending transaction can take days to
-     * post, and an iteration that failed part way is retried with the same Plaid creates, so the Firefly transactions
-     * a poll refers to may be older than the pull window.
+     * post, and a transfer's second leg can arrive long after its first, so the Firefly transactions a poll refers to
+     * may be older than the pull window.
      *
-     * This looks up, via Firefly's search (`external_id_is:`), the ones for [plaidTransactionIds] that aren't already
-     * in [alreadyFetched]. Every id is looked up (a history import needs them all) and a failed lookup propagates:
-     * swallowing it would let the caller commit its Plaid cursor over a change that was never applied or a create
-     * that would be inserted twice.
-     * ponytail: one search request per id, sequential; batch or parallelise if a 24-month history import is too slow.
+     * This resolves the ones for [plaidTransactionIds] that aren't already in [alreadyFetched]: one link lookup per 500
+     * ids (`GET /plaid-links`), then one read per Firefly transaction found. A failed lookup propagates: swallowing it
+     * would let the caller commit its Plaid cursor over a change that was never applied.
      */
     suspend fun fetchMissingByPlaidId(
         plaidTransactionIds: Collection<String>,
         alreadyFetched: List<TransactionRead>,
     ): List<TransactionRead> {
-        val searchApi = fireflySearchApi
-        val known = FireflyTransactionExternalIdIndexer(alreadyFetched)
-        val missing = plaidTransactionIds.distinct().filter { known.findExistingFireflyTx(it) == null }
+        val known = PlaidLinkIndexer(alreadyFetched)
+        val missing = plaidTransactionIds.distinct().filter { known.find(it) == null }
         if (missing.isEmpty()) return listOf()
 
-        val found = mutableListOf<TransactionRead>()
-        for (plaidId in missing) {
-            val externalId = FireflyTransactionExternalIdIndexer.getExternalId(plaidId)
-            // A transfer built from two Plaid transactions has one leg's id as its external id and the other's as
-            //  its internal reference, so a miss on the first is followed by the second.
-            val match = searchApi.searchTransactions("external_id_is:\"$externalId\"", 1).body().data
-                .firstOrNull { read -> read.attributes.transactions.any { it.externalId == externalId } }
-                ?: searchApi.searchTransactions("internal_reference_is:\"$externalId\"", 1).body().data
-                    .firstOrNull { read -> read.attributes.transactions.any { it.internalReference == externalId } }
-            if (match != null) found.add(match)
+        val groupIds = linkedSetOf<String>()
+        for (chunk in missing.chunked(PlaidLinksApi.MAX_IDS)) {
+            plaidLinksApi.lookupPlaidLinks(chunk).body().data.mapTo(groupIds) { it.transactionGroupId }
         }
-        logger.debug("Found {} of {} out-of-window Firefly transactions by external id", found.size, missing.size)
+        val found = groupIds.map { fireflyTxApi.getTransaction(it).body().data }
+        logger.debug("Found {} Firefly transactions for {} Plaid ids outside the window", found.size, missing.size)
         return found
     }
+
+    /** Which of [plaidTransactionIds] Firefly already holds: link lookups only, no transaction reads. */
+    suspend fun heldPlaidIds(plaidTransactionIds: Collection<String>): Set<String> =
+        plaidTransactionIds.distinct().chunked(PlaidLinksApi.MAX_IDS)
+            .flatMap { chunk -> plaidLinksApi.lookupPlaidLinks(chunk).body().data.map { it.plaidTransactionId } }
+            .toSet()
 
     /**
      * Processes transaction updates in Firefly.
@@ -141,20 +138,25 @@ class FireflyTransactionService(
      * letter file and the rest carry on, so one bad transaction can't stall every bank. Anything else (network, 5xx,
      * authentication, rate limit) still fails the iteration, which is then retried as a whole.
      *
-     * @return how many of [creates] were dead-lettered instead of created, so the caller doesn't count them as created
+     * A 409 (a Plaid id Firefly already holds, see the link table) is not a rejection: it means "already imported", so
+     * it is logged, dropped and never dead-lettered.
+     *
+     * @return how many of [creates] did not create a transaction (dead-lettered, or already imported), so the caller
+     *  doesn't count them as created
      */
     suspend fun processFireflyTransactionUpdates(
         creates: List<FireflyTransactionDto>,
         updates: List<FireflyTransactionDto>,
         deletes: List<String>
     ): Int {
-        var deadLetteredCreates = 0
+        var notCreated = 0
         // Insert new transactions
         for (create in creates) {
-            val kept = guarded(DeadLetter("create", create.tx.externalId ?: "", null, create.tx, false)) {
-                syncHelper.optimisticInsertBatchIntoFirefly(listOf(create))
+            var created = 0
+            val kept = guarded(DeadLetter("create", letterKey(create.tx), null, create.tx, false)) {
+                created = syncHelper.optimisticInsertBatchIntoFirefly(listOf(create))
             }
-            if (kept) deadLetteredCreates++
+            if (kept || created == 0) notCreated++
         }
 
         // Process updates. This includes converting an existing deposit/withdrawal into a transfer, which is an in-place
@@ -169,25 +171,25 @@ class FireflyTransactionService(
         for (id in deletes) {
             guarded(DeadLetter("delete", id, id)) { syncHelper.deleteBatchInFirefly(listOf(id)) }
         }
-        return deadLetteredCreates
+        return notCreated
+    }
+
+    companion object {
+        /** What identifies a create in the dead letter file: its first Plaid id, so a later Plaid event for it finds it. */
+        fun letterKey(split: net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionSplit): String =
+            split.plaidLinks?.firstOrNull()?.plaidTransactionId ?: ""
     }
 
     /**
      * Retries the writes Firefly rejected in earlier polls. The ones that go through are removed from the dead letter
      * file; the ones that are still rejected stay (with Firefly's latest message) until [DeadLetterStore.maxAttempts]
      * retries have failed, after which they are abandoned: no longer retried, but still in the file and still reported.
-     * A create whose external id is already in Firefly is dropped rather than inserted again.
+     * A create whose Plaid id is already in Firefly answers 409 and is dropped rather than inserted again.
      */
     suspend fun retryDeadLetters() {
         val store = deadLetters ?: return
         for (letter in store.read()) {
             if (letter.abandoned) continue
-            if (letter.operation == "create" && letter.key.startsWith(FireflyTransactionExternalIdIndexer.EXTERNAL_ID_PREFIX) &&
-                fetchMissingByPlaidId(listOf(letter.key.removePrefix(FireflyTransactionExternalIdIndexer.EXTERNAL_ID_PREFIX)), listOf()).isNotEmpty()
-            ) {
-                store.remove(letter.operation, letter.key)
-                continue
-            }
             guarded(letter, retry = true) {
                 val split = letter.split
                 when (letter.operation) {
@@ -205,6 +207,9 @@ class FireflyTransactionService(
      * A 404 on an update or delete means the Firefly transaction is gone (the user deleted it, or a later removal
      * did): that write can never succeed, so the letter is dropped with a WARN instead of being retried forever.
      *
+     * A 409 means Firefly already holds a Plaid id of this write (the link table refuses a second row for it): the
+     * money is recorded, so the letter is dropped and nothing is retried.
+     *
      * @return true if the write was kept as a dead letter
      */
     private suspend fun guarded(letter: DeadLetter, retry: Boolean = false, write: suspend () -> Unit): Boolean {
@@ -215,6 +220,11 @@ class FireflyTransactionService(
             return false
         } catch (cre: ClientRequestException) {
             val status = cre.response.status.value
+            if (status == 409) {
+                logger.info("Firefly already holds the Plaid id(s) of the ${letter.operation} of ${letter.key}; already imported")
+                store?.remove(letter.operation, letter.key)
+                return false
+            }
             // 401/403 mean the Firefly credentials are wrong for every transaction; 408/429 are transient
             if (store == null || status !in 400..499 || status in setOf(401, 403, 408, 429)) throw cre
             if (status == 404 && letter.operation != "create") {
