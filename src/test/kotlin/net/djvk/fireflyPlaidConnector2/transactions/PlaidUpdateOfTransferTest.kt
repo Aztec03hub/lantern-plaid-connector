@@ -2,6 +2,8 @@ package net.djvk.fireflyPlaidConnector2.transactions
 
 import kotlinx.coroutines.runBlocking
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.ObjectLink
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.PlaidLink
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.PlaidLinkLeg
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionRead
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionTypeProperty
 import net.djvk.fireflyPlaidConnector2.config.properties.TransactionStyleConfig
@@ -35,7 +37,10 @@ internal class PlaidUpdateOfTransferTest {
             sourceId = "2",
             destinationId = "1",
             description = "User edited transfer description",
-            externalId = "plaid-legId",
+            plaidLinks = listOf(
+                PlaidLink("otherId", PlaidLinkLeg.source, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                PlaidLink("legId", PlaidLinkLeg.destination, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            ),
             currencyId = "5",
             currencyCode = "USD",
         ), ObjectLink()
@@ -62,6 +67,7 @@ internal class PlaidUpdateOfTransferTest {
         assertThat(update.tx.sourceName).isNull()
         assertThat(update.tx.destinationName).isNull()
         assertThat(update.tx.description).isEqualTo("User edited transfer description")
+        assertThat(update.tx.plaidLinks).describedAs("a modify sends no links").isNull()
         // Must not be routed to the delete-and-recreate transfer path
         assertThat(update.tx.type).isNotEqualTo(TransactionTypeProperty.transfer)
     }

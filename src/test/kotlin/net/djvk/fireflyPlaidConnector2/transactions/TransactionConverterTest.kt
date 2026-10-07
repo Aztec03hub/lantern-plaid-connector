@@ -2,6 +2,8 @@ package net.djvk.fireflyPlaidConnector2.transactions
 
 import kotlinx.coroutines.runBlocking
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.ObjectLink
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.PlaidLink
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.PlaidLinkLeg
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionRead
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionTypeProperty
 import net.djvk.fireflyPlaidConnector2.api.plaid.PlaidTransactionId
@@ -93,6 +95,7 @@ internal class TransactionConverterTest {
                                 type = TransactionTypeProperty.withdrawal,
                                 amount = "1111.22",
                                 sourceId = "2",
+                                plaidLinks = listOf(PlaidLink("existingPlaidId", PlaidLinkLeg.single, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")),
                                 // The transfer matching logic attempts to find the closest (by date) matching
                                 // transaction. Offset this date compared to the other Firefly transactions above so
                                 // that when this one "wins" we know it's not incidental just because this one was
@@ -110,7 +113,10 @@ internal class TransactionConverterTest {
                                 FireflyFixtures.getTransaction(
                                     type = TransactionTypeProperty.transfer,
                                     amount = "1111.22",
-                                    externalId = "plaid-plaidTransactionId",
+                                    plaidLinks = listOf(
+                                        PlaidLink("existingPlaidId", PlaidLinkLeg.source, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                                        PlaidLink("plaidTransactionId", PlaidLinkLeg.destination, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                                    ),
                                     sourceId = "2",
                                     destinationId = "1",
                                 ).transactions.first()
@@ -146,6 +152,7 @@ internal class TransactionConverterTest {
                                 type = TransactionTypeProperty.deposit,
                                 amount = "1111.22",
                                 destinationId = "2",
+                                plaidLinks = listOf(PlaidLink("existingPlaidId", PlaidLinkLeg.single, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")),
                             ), ObjectLink()
                         ),
                     ),
@@ -158,7 +165,10 @@ internal class TransactionConverterTest {
                                 FireflyFixtures.getTransaction(
                                     type = TransactionTypeProperty.transfer,
                                     amount = "1111.22",
-                                    externalId = "plaid-plaidTransactionId",
+                                    plaidLinks = listOf(
+                                        PlaidLink("existingPlaidId", PlaidLinkLeg.destination, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                                        PlaidLink("plaidTransactionId", PlaidLinkLeg.source, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                                    ),
                                     sourceId = "1",
                                     destinationId = "2",
                                 ).transactions.first()
@@ -212,13 +222,14 @@ internal class TransactionConverterTest {
                                 FireflyFixtures.getTransaction(
                                     type = TransactionTypeProperty.transfer,
                                     amount = "1111.22",
-                                    externalId = "plaid-plaidDepositId",
+                                    plaidLinks = listOf(
+                                        PlaidLink("plaidWithdrawalId", PlaidLinkLeg.source, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                                        PlaidLink("plaidDepositId", PlaidLinkLeg.destination, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                                    ),
                                     description = "Plaid Deposit Tx",
                                     sourceId = "1",
                                     destinationId = "2",
                                 ).transactions.first()
-                                    // H1-R2: the withdrawal leg's id is kept on the transfer
-                                    .copy(internalReference = "plaid-plaidWithdrawalId")
                             ),
                         ),
                         updates = listOf(),
@@ -250,7 +261,7 @@ internal class TransactionConverterTest {
                                 type = TransactionTypeProperty.deposit,
                                 amount = "123.45",
                                 destinationId = "2",
-                                externalId = "unrelated"
+                                plaidLinks = listOf(PlaidLink("unrelated", PlaidLinkLeg.single, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"))
                             ), ObjectLink()
                         ),
                     ),
@@ -289,7 +300,7 @@ internal class TransactionConverterTest {
                                 amount = "123.45",
                                 sourceId = "1",
                                 destinationName = "Unknown Transfer Recipient",
-                                externalId = "plaid-plaidUpdateId",
+                                plaidLinks = listOf(PlaidLink("plaidUpdateId", PlaidLinkLeg.single, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
                             ), ObjectLink()
                         ),
                     ),
@@ -305,7 +316,6 @@ internal class TransactionConverterTest {
                                     amount = "1111.22",
                                     sourceId = "1",
                                     destinationName = "Unknown Transfer Recipient",
-                                    externalId = "plaid-plaidUpdateId",
                                 ).transactions.first()
                                     // M2: the user's description and counterparty, and the reconciled flag, are kept
                                     .copy(order = null, reconciled = null, destinationName = null)
@@ -335,7 +345,7 @@ internal class TransactionConverterTest {
                                 type = TransactionTypeProperty.deposit,
                                 amount = "123.45",
                                 destinationId = "2",
-                                externalId = "unrelated"
+                                plaidLinks = listOf(PlaidLink("unrelated", PlaidLinkLeg.single, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"))
                             ), ObjectLink()
                         ),
                     ),
@@ -369,7 +379,7 @@ internal class TransactionConverterTest {
                                 amount = "123.45",
                                 sourceId = "1",
                                 destinationName = "Unknown Transfer Recipient",
-                                externalId = "plaid-deletedTransactionId",
+                                plaidLinks = listOf(PlaidLink("deletedTransactionId", PlaidLinkLeg.single, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
                             ), ObjectLink()
                         ),
                     ),
@@ -422,7 +432,7 @@ internal class TransactionConverterTest {
                                 amount = "234.56",
                                 sourceId = "1",
                                 destinationName = "Unknown Transfer Recipient",
-                                externalId = "plaid-plaidWithdrawalWithMatchingFfId",
+                                plaidLinks = listOf(PlaidLink("plaidWithdrawalWithMatchingFfId", PlaidLinkLeg.single, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
                             ), ObjectLink()
                         ),
                     ),
@@ -437,7 +447,7 @@ internal class TransactionConverterTest {
                                     amount = "1111.22",
                                     sourceName = "Unknown Transfer Source",
                                     destinationId = "1",
-                                    externalId = "plaid-plaidDepositId",
+                                    plaidLinks = listOf(PlaidLink("plaidDepositId", PlaidLinkLeg.single, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
                                 ).transactions.first()
                             ),
                             FireflyTransactionDto(
@@ -448,7 +458,7 @@ internal class TransactionConverterTest {
                                     amount = "123.45",
                                     sourceId = "1",
                                     destinationName = "Unknown Transfer Recipient",
-                                    externalId = "plaid-plaidWithdrawalId",
+                                    plaidLinks = listOf(PlaidLink("plaidWithdrawalId", PlaidLinkLeg.single, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
                                 ).transactions.first()
                             ),
                         ),
@@ -519,7 +529,7 @@ internal class TransactionConverterTest {
                                     amount = "1111.11",
                                     sourceName = "Unknown Transfer Source",
                                     destinationId = "1",
-                                    externalId = "plaid-txWithAuthorizedDateAndDateTime",
+                                    plaidLinks = listOf(PlaidLink("txWithAuthorizedDateAndDateTime", PlaidLinkLeg.single, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
                                     date = defaultOffsetNow.minusDays(3),
                                     processDate = defaultOffsetNow.minusDays(1),
                                 ).transactions.first()
@@ -532,7 +542,7 @@ internal class TransactionConverterTest {
                                     amount = "1111.22",
                                     sourceName = "Unknown Transfer Source",
                                     destinationId = "1",
-                                    externalId = "plaid-txWithAuthorizedDate",
+                                    plaidLinks = listOf(PlaidLink("txWithAuthorizedDate", PlaidLinkLeg.single, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
                                     date = defaultOffsetNow.minusDays(2),
                                     processDate = defaultOffsetNow.minusDays(1),
                                 ).transactions.first()
@@ -545,7 +555,7 @@ internal class TransactionConverterTest {
                                     amount = "1111.33",
                                     sourceName = "Unknown Transfer Source",
                                     destinationId = "1",
-                                    externalId = "plaid-txWithPostedDateAndDateTime",
+                                    plaidLinks = listOf(PlaidLink("txWithPostedDateAndDateTime", PlaidLinkLeg.single, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
                                     date = defaultOffsetNow.minusDays(1),
                                     processDate = defaultOffsetNow.minusDays(1),
                                 ).transactions.first()
@@ -558,7 +568,7 @@ internal class TransactionConverterTest {
                                     amount = "1111.44",
                                     sourceName = "Unknown Transfer Source",
                                     destinationId = "1",
-                                    externalId = "plaid-txWithPostedDate",
+                                    plaidLinks = listOf(PlaidLink("txWithPostedDate", PlaidLinkLeg.single, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
                                     date = defaultOffsetNow,
                                     processDate = defaultOffsetNow,
                                 ).transactions.first()
@@ -635,7 +645,7 @@ internal class TransactionConverterTest {
                                     amount = "1111.11",
                                     destinationName = "Test Merchant",
                                     sourceId = "1",
-                                    externalId = "plaid-txWithAllMiscFieldsPopulated",
+                                    plaidLinks = listOf(PlaidLink("txWithAllMiscFieldsPopulated", PlaidLinkLeg.single, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
                                     date = defaultOffsetNow,
                                     processDate = defaultOffsetNow,
                                     latitude = 37.8291789099181,
@@ -936,7 +946,7 @@ internal class TransactionConverterTest {
                 sourceId = "1",
                 destinationName = "Unknown Payment Recipient",
                 tags = listOf("pcat-travel", "dcat-flights"),
-                externalId = "plaid-plaidIdWithCats",
+                plaidLinks = listOf(PlaidLink("plaidIdWithCats", PlaidLinkLeg.single, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             ).transactions.first()
         )
 
@@ -949,7 +959,7 @@ internal class TransactionConverterTest {
                 sourceId = "1",
                 destinationName = "Unknown",
                 tags = listOf(),
-                externalId = "plaid-plaidIdWithoutCats",
+                plaidLinks = listOf(PlaidLink("plaidIdWithoutCats", PlaidLinkLeg.single, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             ).transactions.first()
         )
 
@@ -1015,7 +1025,7 @@ internal class TransactionConverterTest {
                 type = TransactionTypeProperty.withdrawal,
                 amount = "5.0",
                 sourceId = "1",
-                externalId = "plaid-plaidUpdated",
+                plaidLinks = listOf(PlaidLink("plaidUpdated", PlaidLinkLeg.single, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             ), ObjectLink()
         )
         val updated = PlaidFixtures.getPaymentTransaction(
@@ -1111,7 +1121,7 @@ internal class TransactionConverterTest {
                 amount = "123.45",
                 sourceId = "1",
                 destinationName = "Unknown Transfer Recipient",
-                externalId = "plaid-plaidId",
+                plaidLinks = listOf(PlaidLink("plaidId", PlaidLinkLeg.single, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
                 externalUrl = "https://example.org",
             ).transactions.first()
         )
@@ -1196,7 +1206,7 @@ internal class TransactionConverterTest {
                 amount = "123.45",
                 sourceId = "1",
                 destinationName = plaidMerchant ?: "Unknown Transfer Recipient",
-                externalId = "plaid-plaidId",
+                plaidLinks = listOf(PlaidLink("plaidId", PlaidLinkLeg.single, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
             ).transactions.first()
         )
 
