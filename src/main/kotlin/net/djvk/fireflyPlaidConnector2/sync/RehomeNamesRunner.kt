@@ -4,7 +4,6 @@ import kotlinx.coroutines.runBlocking
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.AccountsApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.TransactionsApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.AccountTypeFilter
-import net.djvk.fireflyPlaidConnector2.api.firefly.models.AccountUpdate
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionRead
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionSplitUpdate
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionTypeFilter
@@ -124,7 +123,7 @@ class RehomeNamesRunner(
                 if (left.isEmpty()) fireflyAccountsApi.deleteAccount(from)
                 else println("The ${g.type.value} account ${d.id} \"${d.name}\" still has journals; not deleted.")
             }
-            if (g.rename) fireflyAccountsApi.updateAccount(to, AccountUpdate(name = g.canonical))
+            if (g.rename) fireflyAccountsApi.renameAccount(to, g.canonical)
         }
     }
 

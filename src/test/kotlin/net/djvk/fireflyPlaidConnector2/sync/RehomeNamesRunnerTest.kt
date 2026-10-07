@@ -173,7 +173,7 @@ internal class RehomeNamesRunnerTest {
         order.verify(accountsApi).deleteAccount("1")
         order.verify(txApi).updateTransaction(eq("d"), any())
         order.verify(accountsApi).deleteAccount("3")
-        order.verify(accountsApi).updateAccount(eq("2"), any())
+        order.verify(accountsApi).renameAccount(eq("2"), any())
         assertThat(ff.journals[2]!!.map { it.id }).containsExactlyInAnyOrder("a", "b", "c", "d")
     }
 
@@ -196,7 +196,7 @@ internal class RehomeNamesRunnerTest {
         runBlocking {
             verify(txApi, never()).updateTransaction(any(), any())
             verify(accountsApi, never()).deleteAccount(any())
-            verify(accountsApi, never()).updateAccount(any(), any())
+            verify(accountsApi, never()).renameAccount(any(), any())
         }
     }
 

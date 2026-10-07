@@ -358,4 +358,13 @@ open class AccountsApi(
         )
     }
 
+    /** Renames the account. Hand-written: the generated [AccountUpdate] serializes its nulls, which Firefly rejects (422). */
+    open suspend fun renameAccount(id: kotlin.String, name: kotlin.String) {
+        jsonRequest(
+            RequestConfig<kotlin.Any?>(RequestMethod.PUT, "/api/v1/accounts/$id", query = mutableMapOf(), headers = mutableMapOf()),
+            mapOf("name" to name),
+            listOf("firefly_iii_auth"),
+        )
+    }
+
 }
