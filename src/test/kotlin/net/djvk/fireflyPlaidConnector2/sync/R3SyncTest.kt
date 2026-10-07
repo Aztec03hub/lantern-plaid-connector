@@ -9,9 +9,12 @@ import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.headersOf
 import kotlinx.coroutines.runBlocking
-import net.djvk.fireflyPlaidConnector2.api.firefly.apis.SearchApi
+import net.djvk.fireflyPlaidConnector2.api.firefly.apis.PlaidLinksApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.TransactionsApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.Meta
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.PlaidLink
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.PlaidLinkLeg
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.PlaidLinkLookupResponse
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionArray
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionTypeProperty
 import net.djvk.fireflyPlaidConnector2.config.properties.TransactionStyleConfig
@@ -41,6 +44,10 @@ import java.nio.file.Path
  * polled mode (L5-R3), and the survivors of the R3 mutation run (O5, D4).
  */
 internal class R3SyncTest {
+    /** Touch MockUtil first: its file-level mocks must not be created in the middle of a whenever().thenReturn(). */
+    @Suppress("unused")
+    private val warmMockUtil = net.djvk.fireflyPlaidConnector2.lib.OK_RESPONSE
+
     @TempDir
     lateinit var dir: Path
 
@@ -67,8 +74,8 @@ internal class R3SyncTest {
     )
 
     private val txApi: TransactionsApi = mock()
-    private val helper: SyncHelper = mock()
-    private val searchApi: SearchApi = mock()
+    private val helper: SyncHelper = mock { onBlocking { optimisticInsertBatchIntoFirefly(any()) } doReturn 1 }
+    private val plaidLinksApi: PlaidLinksApi = mock()
     private val syncHelper: SyncHelper = mock()
     private val cursorManager: CursorManager = mock()
     private val plaidSyncService: PlaidSyncService = mock()
@@ -85,9 +92,9 @@ internal class R3SyncTest {
         pendingTag = pendingTag,
     )
 
-    private fun service(store: DeadLetterStore?) = FireflyTransactionService(txApi, helper, 30, "UTC", searchApi, store)
+    private fun service(store: DeadLetterStore?) = FireflyTransactionService(txApi, helper, 30, "UTC", plaidLinksApi, store)
 
-    private fun emptySearch() = createFireflyResponse(mock<TransactionArray> { on { data } doReturn listOf() })
+    private fun emptyLookup() = createFireflyResponse(PlaidLinkLookupResponse(listOf()))
 
     private fun emptyFirefly() = runBlocking<Unit> {
         val meta = mock<Meta> { on { pagination } doReturn null }
@@ -97,18 +104,19 @@ internal class R3SyncTest {
         }
         val response = createFireflyResponse(array)
         whenever(txApi.listTransaction(any(), any(), any(), any())).thenReturn(response)
-        val search = emptySearch()
-        whenever(searchApi.searchTransactions(any(), any())).thenReturn(search)
+        emptyLookup().let { r -> whenever(plaidLinksApi.lookupPlaidLinks(any())).thenReturn(r) }
     }
 
     private fun rejectCreates() = runBlocking<Unit> {
         whenever(helper.optimisticInsertBatchIntoFirefly(any())).doSuspendableAnswer { throw statusError(HttpStatusCode.UnprocessableEntity) }
     }
 
-    private fun create(externalId: String, amount: String = "50.0") = FireflyTransactionDto(
+    private fun create(plaidId: String, amount: String = "50.0") = FireflyTransactionDto(
         null,
-        FireflyFixtures.getTransaction(type = TransactionTypeProperty.withdrawal, sourceId = "1", externalId = externalId, amount = amount)
-            .transactions.first()
+        FireflyFixtures.getTransaction(
+            type = TransactionTypeProperty.withdrawal, sourceId = "1", amount = amount,
+            plaidLinks = listOf(PlaidLink(plaidId, PlaidLinkLeg.single, "plaidAccountA")),
+        ).transactions.first()
     )
 
     private fun orchestrator(
@@ -139,7 +147,7 @@ internal class R3SyncTest {
         whenever(helper.optimisticInsertBatchIntoFirefly(any())).doSuspendableAnswer {
             if (reject) throw statusError(HttpStatusCode.UnprocessableEntity, """{"message":"no such account"}""")
             @Suppress("UNCHECKED_CAST")
-            (it.arguments[0] as List<FireflyTransactionDto>).forEach { dto -> inserted.add(dto.tx.externalId) }
+            (it.arguments[0] as List<FireflyTransactionDto>).onEach { dto -> inserted.add(dto.tx.plaidLinks?.first()?.plaidTransactionId) }.size
         }
         val orchestrator = orchestrator(service(store), store)
         val cursors = mutableMapOf<String, String>()
@@ -149,20 +157,20 @@ internal class R3SyncTest {
         whenever(plaidSyncService.processPlaidTransactions(any(), any()))
             .thenReturn(plaidResult(created = listOf(plaid(accountA, "pend", 50.0, pending = true))))
         orchestrator.processTransactions(accountMap, sequence, cursors)
-        assertThat(store.read().map { it.key }).containsExactly("plaid-pend")
+        assertThat(store.read().map { it.key }).containsExactly("pend")
 
         // poll 2: Plaid removes the pending one and adds the posted one, which is rejected too
         whenever(plaidSyncService.processPlaidTransactions(any(), any()))
             .thenReturn(plaidResult(created = listOf(plaid(accountA, "posted", 50.0, pendingId = "pend")), deleted = listOf("pend")))
         orchestrator.processTransactions(accountMap, sequence, cursors)
-        assertThat(store.read().map { it.key }).describedAs("only the posted create is left").containsExactly("plaid-posted")
+        assertThat(store.read().map { it.key }).describedAs("only the posted create is left").containsExactly("posted")
 
         // the cause is fixed: the next poll's retry inserts the posted one and only that
         reject = false
         whenever(plaidSyncService.processPlaidTransactions(any(), any())).thenReturn(plaidResult())
         orchestrator.processTransactions(accountMap, sequence, cursors)
 
-        assertThat(inserted).containsExactly("plaid-posted")
+        assertThat(inserted).containsExactly("posted")
         assertThat(store.read()).isEmpty()
     }
 
@@ -172,13 +180,13 @@ internal class R3SyncTest {
         emptyFirefly()
         rejectCreates()
         val store = DeadLetterStore(dir.toString())
-        store.add(DeadLetter("create", "plaid-pend", null, create("plaid-pend").tx, false, "x"))
+        store.add(DeadLetter("create", "pend", null, create("pend").tx, false, "x"))
         whenever(plaidSyncService.processPlaidTransactions(any(), any()))
             .thenReturn(plaidResult(created = listOf(plaid(accountA, "posted", 50.0, pendingId = "pend"))))
 
         orchestrator(service(store), store).processTransactions(accountMap, sequenceOf(Pair("tok-12345678", listOf(accountA))), mutableMapOf())
 
-        assertThat(store.read().map { it.key }).containsExactly("plaid-posted")
+        assertThat(store.read().map { it.key }).containsExactly("posted")
     }
 
     @Test
@@ -186,7 +194,7 @@ internal class R3SyncTest {
         emptyFirefly()
         rejectCreates()
         val store = DeadLetterStore(dir.toString())
-        val letter = DeadLetter("create", "plaid-tx1", null, create("plaid-tx1", "50.0").tx, false, "x", attempts = 4, abandoned = true)
+        val letter = DeadLetter("create", "tx1", null, create("tx1", "50.0").tx, false, "x", attempts = 4, abandoned = true)
         store.add(letter)
         whenever(plaidSyncService.processPlaidTransactions(any(), any()))
             .thenReturn(plaidResult(updated = listOf(plaid(accountA, "tx1", 75.0))))
@@ -196,7 +204,7 @@ internal class R3SyncTest {
 
         val revised = store.read().single()
         assertThat(revised.split?.amount).isEqualTo("75.0")
-        assertThat(revised.split?.externalId).isEqualTo("plaid-tx1")
+        assertThat(revised.split?.plaidLinks?.single()?.plaidTransactionId).isEqualTo("tx1")
         assertThat(revised.attempts).describedAs("a revised letter starts over").isEqualTo(0)
         assertThat(revised.abandoned).isFalse()
     }
@@ -206,14 +214,14 @@ internal class R3SyncTest {
         emptyFirefly()
         rejectCreates()
         val store = DeadLetterStore(dir.toString())
-        store.add(DeadLetter("create", "plaid-tx1", null, create("plaid-tx1").tx, false, "x"))
-        store.add(DeadLetter("create", "plaid-other", null, create("plaid-other").tx, false, "x"))
+        store.add(DeadLetter("create", "tx1", null, create("tx1").tx, false, "x"))
+        store.add(DeadLetter("create", "other", null, create("other").tx, false, "x"))
         whenever(plaidSyncService.processPlaidTransactions(any(), any())).thenReturn(plaidResult(deleted = listOf("tx1")))
         val orchestrator = orchestrator(service(store), store)
 
         orchestrator.processTransactions(accountMap, sequenceOf(Pair("tok-12345678", listOf(accountA))), mutableMapOf())
 
-        assertThat(store.read().map { it.key }).containsExactly("plaid-other")
+        assertThat(store.read().map { it.key }).containsExactly("other")
     }
 
     @Test
@@ -221,10 +229,14 @@ internal class R3SyncTest {
         emptyFirefly()
         rejectCreates()
         val store = DeadLetterStore(dir.toString())
-        val transfer = create("plaid-dep").tx.copy(
-            type = TransactionTypeProperty.transfer, sourceId = "1", destinationId = "2", internalReference = "plaid-wd",
+        val transfer = create("dep").tx.copy(
+            type = TransactionTypeProperty.transfer, sourceId = "1", destinationId = "2",
+            plaidLinks = listOf(
+                PlaidLink("dep", PlaidLinkLeg.destination, "plaidAccountB"),
+                PlaidLink("wd", PlaidLinkLeg.source, "plaidAccountA"),
+            ),
         )
-        store.add(DeadLetter("create", "plaid-dep", null, transfer, false, "x"))
+        store.add(DeadLetter("create", "dep", null, transfer, false, "x"))
         whenever(plaidSyncService.processPlaidTransactions(any(), any())).thenReturn(plaidResult(deleted = listOf("dep")))
         val orchestrator = orchestrator(service(store), store)
 
@@ -232,10 +244,10 @@ internal class R3SyncTest {
 
         // the destination leg is gone; the source leg's outflow survives as a withdrawal from account 1
         val kept = store.read().single()
-        assertThat(kept.key).isEqualTo("plaid-wd")
+        assertThat(kept.key).isEqualTo("wd")
         assertThat(kept.split?.type).isEqualTo(TransactionTypeProperty.withdrawal)
         assertThat(kept.split?.sourceId).isEqualTo("1")
-        assertThat(kept.split?.externalId).isEqualTo("plaid-wd")
+        assertThat(kept.split?.plaidLinks).containsExactly(PlaidLink("wd", PlaidLinkLeg.single, "plaidAccountA"))
     }
 
     // endregion
@@ -245,7 +257,7 @@ internal class R3SyncTest {
     @Test
     fun aRetriedUpdateOfAFireflyTransactionThatNoLongerExistsIsDroppedNotRetriedForever() = runBlocking<Unit> {
         val store = DeadLetterStore(dir.toString())
-        store.add(DeadLetter("update", "ff1", "ff1", create("plaid-u").tx, false, "old"))
+        store.add(DeadLetter("update", "ff1", "ff1", create("u").tx, false, "old"))
         whenever(helper.updateBatchInFirefly(any())).doSuspendableAnswer { throw statusError(HttpStatusCode.NotFound) }
 
         service(store).retryDeadLetters()
@@ -258,7 +270,7 @@ internal class R3SyncTest {
         val store = DeadLetterStore(dir.toString())
         whenever(helper.updateBatchInFirefly(any())).doSuspendableAnswer { throw statusError(HttpStatusCode.NotFound) }
 
-        service(store).processFireflyTransactionUpdates(listOf(), listOf(FireflyTransactionDto("ff1", create("plaid-u").tx)), listOf())
+        service(store).processFireflyTransactionUpdates(listOf(), listOf(FireflyTransactionDto("ff1", create("u").tx)), listOf())
 
         assertThat(store.read()).isEmpty()
     }
@@ -266,8 +278,8 @@ internal class R3SyncTest {
     @Test
     fun aSuccessfulDeleteAlsoClearsTheUpdateLettersOfTheSameFireflyTransaction() = runBlocking<Unit> {
         val store = DeadLetterStore(dir.toString())
-        store.add(DeadLetter("update", "ff1", "ff1", create("plaid-u").tx, false, "old"))
-        store.add(DeadLetter("update", "ff2", "ff2", create("plaid-v").tx, false, "old"))
+        store.add(DeadLetter("update", "ff1", "ff1", create("u").tx, false, "old"))
+        store.add(DeadLetter("update", "ff2", "ff2", create("v").tx, false, "old"))
 
         service(store).processFireflyTransactionUpdates(listOf(), listOf(), listOf("ff1"))
 
@@ -278,7 +290,7 @@ internal class R3SyncTest {
     fun aLetterFireflyKeepsRejectingIsAbandonedAfterTheCapAndReported() = runBlocking<Unit> {
         emptyFirefly()
         val store = DeadLetterStore(dir.toString())
-        store.add(DeadLetter("update", "ff1", "ff1", create("plaid-u").tx, false, "old"))
+        store.add(DeadLetter("update", "ff1", "ff1", create("u").tx, false, "old"))
         var calls = 0
         whenever(helper.updateBatchInFirefly(any())).doSuspendableAnswer {
             calls++
@@ -343,10 +355,14 @@ internal class R3SyncTest {
         emptyFirefly()
         rejectCreates()
         val store = DeadLetterStore(dir.toString())
-        val transfer = create("plaid-dep").tx.copy(
-            type = TransactionTypeProperty.transfer, sourceId = "1", destinationId = "2", internalReference = "plaid-wd",
+        val transfer = create("dep").tx.copy(
+            type = TransactionTypeProperty.transfer, sourceId = "1", destinationId = "2",
+            plaidLinks = listOf(
+                PlaidLink("dep", PlaidLinkLeg.destination, "plaidAccountB"),
+                PlaidLink("wd", PlaidLinkLeg.source, "plaidAccountA"),
+            ),
         )
-        store.add(DeadLetter("create", "plaid-dep", null, transfer, false, "x"))
+        store.add(DeadLetter("create", "dep", null, transfer, false, "x"))
         whenever(plaidSyncService.processPlaidTransactions(any(), any()))
             .thenReturn(plaidResult(updated = listOf(plaid(accountB, "dep", -75.0))))
 
@@ -357,7 +373,7 @@ internal class R3SyncTest {
         assertThat(revised.amount).isEqualTo("75.0")
         assertThat(revised.sourceId).isEqualTo("1")
         assertThat(revised.destinationId).isEqualTo("2")
-        assertThat(revised.internalReference).isEqualTo("plaid-wd")
+        assertThat(revised.plaidLinks?.map { it.plaidTransactionId }).containsExactly("dep", "wd")
     }
 
     @Test
@@ -486,7 +502,7 @@ internal class R3SyncTest {
     @Test
     fun aRetriedSignFlipUpdateStillSendsItsType() = runBlocking<Unit> {
         val store = DeadLetterStore(dir.toString())
-        store.add(DeadLetter("update", "ff1", "ff1", create("plaid-u").tx, changesType = true, message = "old"))
+        store.add(DeadLetter("update", "ff1", "ff1", create("u").tx, changesType = true, message = "old"))
         val sent = argumentCaptor<List<FireflyTransactionDto>>()
 
         service(store).retryDeadLetters()

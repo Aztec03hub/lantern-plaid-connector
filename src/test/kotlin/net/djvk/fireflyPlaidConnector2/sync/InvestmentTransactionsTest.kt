@@ -6,6 +6,8 @@ import net.djvk.fireflyPlaidConnector2.api.plaid.models.InvestmentTransaction
 import net.djvk.fireflyPlaidConnector2.api.plaid.models.InvestmentTransactionSubtype
 import net.djvk.fireflyPlaidConnector2.api.plaid.models.InvestmentTransactionType
 import net.djvk.fireflyPlaidConnector2.api.plaid.models.InvestmentsTransactionsGetResponse
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.PlaidLink
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.PlaidLinkLeg
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionTypeProperty
 import net.djvk.fireflyPlaidConnector2.config.AccountConfig
 import net.djvk.fireflyPlaidConnector2.config.properties.AccountConfigs
@@ -71,7 +73,8 @@ internal class InvestmentTransactionsTest {
         assertThat(dto.tx.destinationName).isEqualTo("Investment buy")
         assertThat(dto.tx.amount).isEqualTo("126.0")
         assertThat(dto.tx.description).isEqualTo("BUY ACME CORP")
-        assertThat(dto.tx.externalId).isEqualTo("plaid-inv1")
+        assertThat(dto.tx.plaidLinks).containsExactly(PlaidLink("inv1", PlaidLinkLeg.single, "brokerage"))
+        assertThat(dto.tx.externalId).describedAs("the connector no longer writes external_id").isNull()
         assertThat(dto.tx.currencyCode).isEqualTo("USD")
         assertThat(dto.tx.tags).containsExactly("plaid-investment-buy", "Plaid import")
         assertThat(dto.tx.notes).isEqualTo("buy (buy); quantity 10.0 @ 12.5; fees 1.0; security sec1")
@@ -124,6 +127,7 @@ internal class InvestmentTransactionsTest {
                 )
             ),
             "t", firefly.aboutApi, firefly.transactionsApi, firefly.accountsApi,
+            firefly.plaidLinksApi,
         )
 
         val (accountMap, bank) = helper.getAllPlaidAccessTokenAccountIdSets()
@@ -176,14 +180,10 @@ internal class InvestmentTransactionsTest {
 
     @Test
     fun onlyInvestmentTransactionsNotAlreadyInFireflyAreInserted() = runBlocking<Unit> {
-        val known = net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionRead(
-            "transactions", "ff1",
-            net.djvk.fireflyPlaidConnector2.lib.FireflyFixtures.getTransaction(externalId = "plaid-old", sourceId = "3"),
-            net.djvk.fireflyPlaidConnector2.api.firefly.models.ObjectLink()
-        )
         whenever(syncHelper.getInvestmentAccessTokenAccountIdSets())
             .thenReturn(sequenceOf(Pair("tokBroker", listOf("brokerage"))))
-        whenever(fireflyTransactionService.fetchExistingFireflyTransactions()).thenReturn(listOf(known))
+        // The link lookup says Firefly already holds "old"
+        whenever(fireflyTransactionService.heldPlaidIds(any())).thenReturn(setOf("old"))
         whenever(plaidSyncService.fetchInvestmentTransactions(any(), any(), any(), any())).thenReturn(
             listOf(invTx("old", amount = 5.0), invTx("new", amount = 6.0), invTx("elsewhere", account = "other", amount = 7.0))
         )
@@ -193,9 +193,13 @@ internal class InvestmentTransactionsTest {
         verify(plaidSyncService).fetchInvestmentTransactions(
             eq("tokBroker"), eq(listOf("brokerage")), eq(LocalDate.of(2026, 2, 24)), eq(LocalDate.of(2026, 3, 10))
         )
+        val looked = argumentCaptor<Collection<String>>()
+        verify(fireflyTransactionService).heldPlaidIds(looked.capture())
+        assertThat(looked.firstValue).containsExactlyInAnyOrder("old", "new", "elsewhere")
         val inserted = argumentCaptor<List<FireflyTransactionDto>>()
         verify(syncHelper).optimisticInsertBatchIntoFirefly(inserted.capture())
-        assertThat(inserted.firstValue.map { it.tx.externalId }).containsExactly("plaid-new")
+        assertThat(inserted.firstValue.map { it.tx.plaidLinks?.single()?.plaidTransactionId }).containsExactly("new")
+        verify(fireflyTransactionService, never()).fetchExistingFireflyTransactions()
     }
 
     @Test
@@ -203,7 +207,7 @@ internal class InvestmentTransactionsTest {
         whenever(syncHelper.getInvestmentAccessTokenAccountIdSets()).thenReturn(
             sequenceOf(Pair("tokBad", listOf("a")), Pair("tokGood", listOf("b")))
         )
-        whenever(fireflyTransactionService.fetchExistingFireflyTransactions()).thenReturn(emptyList())
+        whenever(fireflyTransactionService.heldPlaidIds(any())).thenReturn(setOf())
         whenever(plaidSyncService.fetchInvestmentTransactions(eq("tokBad"), any(), any(), any()))
             .doSuspendableAnswer { throw RuntimeException("PRODUCTS_NOT_SUPPORTED") }
         whenever(plaidSyncService.fetchInvestmentTransactions(eq("tokGood"), any(), any(), any()))
@@ -215,18 +219,19 @@ internal class InvestmentTransactionsTest {
 
         val inserted = argumentCaptor<List<FireflyTransactionDto>>()
         verify(syncHelper).optimisticInsertBatchIntoFirefly(inserted.capture())
-        assertThat(inserted.firstValue.map { it.tx.externalId }).containsExactly("plaid-g1")
+        assertThat(inserted.firstValue.map { it.tx.plaidLinks?.single()?.plaidTransactionId }).containsExactly("g1")
     }
 
     @Test
-    fun fireflyWindowIsNotReadWhenPlaidReturnsNothing() = runBlocking<Unit> {
+    fun noFireflyLookupIsMadeWhenPlaidReturnsNothing() = runBlocking<Unit> {
         whenever(syncHelper.getInvestmentAccessTokenAccountIdSets())
             .thenReturn(sequenceOf(Pair("tokBroker", listOf("brokerage"))))
         whenever(plaidSyncService.fetchInvestmentTransactions(any(), any(), any(), any())).thenReturn(emptyList())
 
         orchestrator().syncInvestments(mapOf("brokerage" to 3))
 
-        // L3: no Plaid data, no Firefly window read
+        // L3: no Plaid data, no Firefly lookup
+        verify(fireflyTransactionService, never()).heldPlaidIds(any())
         verify(fireflyTransactionService, never()).fetchExistingFireflyTransactions()
     }
 
@@ -236,7 +241,7 @@ internal class InvestmentTransactionsTest {
             .thenReturn(sequenceOf(Pair("tokBroker", listOf("brokerage"))))
         whenever(plaidSyncService.fetchInvestmentTransactions(any(), any(), any(), any()))
             .thenReturn(listOf(invTx("new", amount = 6.0)))
-        whenever(fireflyTransactionService.fetchExistingFireflyTransactions())
+        whenever(fireflyTransactionService.heldPlaidIds(any()))
             .doSuspendableAnswer { throw java.net.ConnectException("refused") }
 
         val e = runCatching { orchestrator().syncInvestments(mapOf("brokerage" to 3)) }.exceptionOrNull()

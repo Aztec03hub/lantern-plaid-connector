@@ -9,7 +9,13 @@ import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.headersOf
 import kotlinx.coroutines.runBlocking
-import net.djvk.fireflyPlaidConnector2.api.firefly.apis.SearchApi
+import net.djvk.fireflyPlaidConnector2.api.firefly.apis.PlaidLinksApi
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.PlaidLink
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.PlaidLinkLeg
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.PlaidLinkLookupResponse
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.PlaidLinkLookupRow
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionSingle
+import net.djvk.fireflyPlaidConnector2.lib.createFireflyResponse
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.TransactionsApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.infrastructure.HttpResponse as FireflyHttpResponse
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.Meta
@@ -42,6 +48,10 @@ import org.mockito.kotlin.whenever
  * "data changed during pagination" restart.
  */
 internal class SyncCorrectnessTest {
+    /** Touch MockUtil first: its file-level mocks must not be created in the middle of a whenever().thenReturn(). */
+    @Suppress("unused")
+    private val warmMockUtil = net.djvk.fireflyPlaidConnector2.lib.OK_RESPONSE
+
     // region Firefly paging
 
     private val txApi: TransactionsApi = mock()
@@ -96,35 +106,36 @@ internal class SyncCorrectnessTest {
 
     // region out-of-window lookup
 
-    private val searchApi: SearchApi = mock()
+    private val plaidLinksApi: PlaidLinksApi = mock()
 
-    private fun fireflyTx(id: String, externalId: String) = TransactionRead(
+    private fun fireflyTx(id: String, plaidId: String) = TransactionRead(
         "transactions", id,
-        FireflyFixtures.getTransaction(externalId = externalId, sourceId = "1"), ObjectLink()
+        FireflyFixtures.getTransaction(sourceId = "1", plaidLinks = listOf(PlaidLink(plaidId, PlaidLinkLeg.single, "acct"))),
+        ObjectLink()
     )
 
-    private fun searchResult(vararg txs: TransactionRead): FireflyHttpResponse<TransactionArray> {
-        val array = mock<TransactionArray> { on { data } doReturn txs.toList() }
-        return mock { onBlocking { body() } doReturn array }
-    }
+    private fun lookup(vararg rows: PlaidLinkLookupRow) = createFireflyResponse(PlaidLinkLookupResponse(rows.toList()))
 
-    private val service = FireflyTransactionService(txApi, mock(), 5, "America/Chicago", searchApi)
+    private fun row(plaidId: String, group: String) = PlaidLinkLookupRow(plaidId, "j$group", group, PlaidLinkLeg.single, "acct")
+
+    private val service = FireflyTransactionService(txApi, mock(), 5, "America/Chicago", plaidLinksApi)
 
     @Test
-    fun looksUpOnlyTheTransactionsMissingFromTheWindowByExternalId() = runBlocking<Unit> {
-        val inWindow = fireflyTx("ff1", "plaid-inWindow")
-        val oldResult = searchResult(fireflyTx("ff9", "plaid-old1"))
-        whenever(searchApi.searchTransactions(eq("external_id_is:\"plaid-old1\""), any())).thenReturn(oldResult)
+    fun looksUpOnlyTheTransactionsMissingFromTheWindowByPlaidLink() = runBlocking<Unit> {
+        val inWindow = fireflyTx("ff1", "inWindow")
+        lookup(row("old1", "ff9")).let { r -> whenever(plaidLinksApi.lookupPlaidLinks(eq(listOf("old1")))).thenReturn(r) }
+        createFireflyResponse(TransactionSingle(fireflyTx("ff9", "old1"))).let { r -> whenever(txApi.getTransaction("ff9")).thenReturn(r) }
 
         val found = service.fetchMissingByPlaidId(listOf("inWindow", "old1", "old1"), listOf(inWindow))
 
         assertThat(found.map { it.id }).containsExactly("ff9")
-        verify(searchApi, times(1)).searchTransactions(any(), any()) // not for inWindow, not twice for old1
+        verify(plaidLinksApi, times(1)).lookupPlaidLinks(any()) // not for inWindow, not twice for old1
+        verify(txApi, times(1)).getTransaction(any())
     }
 
     @Test
-    fun searchFailuresPropagateSoTheIterationIsRetried() = runBlocking<Unit> {
-        whenever(searchApi.searchTransactions(any(), any())).doSuspendableAnswer { throw java.io.IOException("down") }
+    fun lookupFailuresPropagateSoTheIterationIsRetried() = runBlocking<Unit> {
+        whenever(plaidLinksApi.lookupPlaidLinks(any())).doSuspendableAnswer { throw java.io.IOException("down") }
 
         // M1: swallowing this let the caller commit its cursor over an update or delete that was never applied
         val e = runCatching { service.fetchMissingByPlaidId(listOf("old1"), listOf()) }.exceptionOrNull()
@@ -133,22 +144,34 @@ internal class SyncCorrectnessTest {
     }
 
     @Test
-    fun moreThanOneHundredMissingIdsAreAllLookedUp() = runBlocking<Unit> {
-        val empty = searchResult()
-        whenever(searchApi.searchTransactions(any(), any())).thenReturn(empty)
+    fun aFailedTransactionReadPropagatesToo() = runBlocking<Unit> {
+        lookup(row("old1", "ff9")).let { r -> whenever(plaidLinksApi.lookupPlaidLinks(any())).thenReturn(r) }
+        whenever(txApi.getTransaction(any())).doSuspendableAnswer { throw java.io.IOException("down") }
 
-        service.fetchMissingByPlaidId((1..250).map { "id$it" }, listOf())
+        val e = runCatching { service.fetchMissingByPlaidId(listOf("old1"), listOf()) }.exceptionOrNull()
 
-        // each miss is searched by external id, then by the transfer's internal reference (H1-R2)
-        verify(searchApi, times(500)).searchTransactions(any(), any())
+        assertThat(e).isInstanceOf(java.io.IOException::class.java)
     }
 
     @Test
-    fun searchResultsThatDoNotCarryTheExactExternalIdAreIgnored() = runBlocking<Unit> {
-        val wrongResult = searchResult(fireflyTx("ff7", "plaid-somethingElse"))
-        whenever(searchApi.searchTransactions(any(), any())).thenReturn(wrongResult)
+    fun moreThanOneHundredMissingIdsAreAllLookedUpInOneBatch() = runBlocking<Unit> {
+        val empty = lookup()
+        whenever(plaidLinksApi.lookupPlaidLinks(any())).thenReturn(empty)
+
+        service.fetchMissingByPlaidId((1..250).map { "id$it" }, listOf())
+
+        // one request per 500 ids, no per-id searches (the old scheme made two searches per id)
+        val ids = argumentCaptor<List<String>>()
+        verify(plaidLinksApi, times(1)).lookupPlaidLinks(ids.capture())
+        assertThat(ids.firstValue).hasSize(250)
+    }
+
+    @Test
+    fun aLookupThatFindsNothingReadsNoTransaction() = runBlocking<Unit> {
+        lookup().let { r -> whenever(plaidLinksApi.lookupPlaidLinks(any())).thenReturn(r) }
 
         assertThat(service.fetchMissingByPlaidId(listOf("old1"), listOf())).isEmpty()
+        verify(txApi, org.mockito.kotlin.never()).getTransaction(any())
     }
 
     // endregion
@@ -187,7 +210,7 @@ internal class SyncCorrectnessTest {
 
     @Test
     fun removalOfATransactionOlderThanTheWindowIsLookedUpAndPassedToTheConverter() = runBlocking<Unit> {
-        val old = fireflyTx("ffOld", "plaid-oldId")
+        val old = fireflyTx("ffOld", "oldId")
         whenever(plaidSyncService.processPlaidTransactions(any(), any()))
             .thenReturn(PlaidTransactionResult(listOf(), listOf(), listOf("oldId")))
         whenever(fireflyTransactionService.fetchExistingFireflyTransactions()).thenReturn(listOf())

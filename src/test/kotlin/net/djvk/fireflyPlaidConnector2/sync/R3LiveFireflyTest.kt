@@ -5,6 +5,7 @@ import kotlinx.coroutines.runBlocking
 import net.djvk.fireflyPlaidConnector2.api.ApiConfiguration
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.AboutApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.AccountsApi
+import net.djvk.fireflyPlaidConnector2.api.firefly.apis.PlaidLinksApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.SearchApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.TransactionsApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionRead
@@ -52,8 +53,9 @@ internal class R3LiveFireflyTest {
     private val config = ApiConfiguration().getClientConfig()
     private val txApi = TransactionsApi(url, null, config)
     private val searchApi = SearchApi(url, null, config)
+    private val plaidLinksApi = PlaidLinksApi(url, null, config)
     private val accountsApi = AccountsApi(url, null, config)
-    private val syncHelper = SyncHelper(AccountConfigs(emptyList()), token, AboutApi(url, null, config), txApi, accountsApi, searchApi)
+    private val syncHelper = SyncHelper(AccountConfigs(emptyList()), token, AboutApi(url, null, config), txApi, accountsApi, plaidLinksApi)
     private val mapper = ObjectMapper()
     private val http = HttpClient.newHttpClient()
 
@@ -64,7 +66,7 @@ internal class R3LiveFireflyTest {
     )
 
     private suspend fun creds() {
-        txApi.setAccessToken(token); searchApi.setAccessToken(token); accountsApi.setAccessToken(token)
+        txApi.setAccessToken(token); searchApi.setAccessToken(token); plaidLinksApi.setAccessToken(token); accountsApi.setAccessToken(token)
     }
 
     private fun api(method: String, path: String, body: String? = null): String {
@@ -88,7 +90,7 @@ internal class R3LiveFireflyTest {
     private val cursorManager: CursorManager = mock()
 
     private fun orchestrator(store: DeadLetterStore): PolledSyncOrchestrator {
-        val service = FireflyTransactionService(txApi, syncHelper, 30, "UTC", searchApi, store)
+        val service = FireflyTransactionService(txApi, syncHelper, 30, "UTC", plaidLinksApi, store)
         return PolledSyncOrchestrator(30, syncHelper, cursorManager, plaidSyncService, service, converter, deadLetterStore = store)
     }
 
@@ -103,7 +105,7 @@ internal class R3LiveFireflyTest {
     }
 
     private suspend fun mine(vararg ids: String): List<TransactionRead> =
-        FireflyTransactionService(txApi, syncHelper, 30, "UTC", searchApi).fetchExistingFireflyTransactions().filter { read ->
+        FireflyTransactionService(txApi, syncHelper, 30, "UTC", plaidLinksApi).fetchExistingFireflyTransactions().filter { read ->
             read.attributes.transactions.any { s -> ids.any { id -> s.externalId == "plaid-$id" || s.internalReference == "plaid-$id" } }
         }
 
@@ -219,7 +221,7 @@ internal class R3LiveFireflyTest {
     fun anUpdateOfAFireflyTransactionThatIsGoneIsNotKept() = runBlocking<Unit> {
         creds()
         val store = DeadLetterStore(dir.toString())
-        val service = FireflyTransactionService(txApi, syncHelper, 30, "UTC", searchApi, store)
+        val service = FireflyTransactionService(txApi, syncHelper, 30, "UTC", plaidLinksApi, store)
         val split = PlaidFixturesSplit.of(accountA)
 
         service.processFireflyTransactionUpdates(listOf(), listOf(FireflyTransactionDto("99999999", split)), listOf())

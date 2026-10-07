@@ -11,8 +11,10 @@ import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.headersOf
 import kotlinx.coroutines.runBlocking
-import net.djvk.fireflyPlaidConnector2.api.firefly.apis.SearchApi
+import net.djvk.fireflyPlaidConnector2.api.firefly.apis.PlaidLinksApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.TransactionsApi
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.PlaidLink
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.PlaidLinkLeg
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionTypeProperty
 import net.djvk.fireflyPlaidConnector2.api.plaid.models.TransactionsSyncResponse
 import net.djvk.fireflyPlaidConnector2.api.plaid.models.RemovedTransaction
@@ -47,6 +49,10 @@ import java.time.LocalDate
  * of the R2 mutation run.
  */
 internal class R2SyncTest {
+    /** Touch MockUtil first: its file-level mocks must not be created in the middle of a whenever().thenReturn(). */
+    @Suppress("unused")
+    private val warmMockUtil = net.djvk.fireflyPlaidConnector2.lib.OK_RESPONSE
+
     @TempDir
     lateinit var dir: Path
 
@@ -289,27 +295,23 @@ internal class R2SyncTest {
     // region M3-R2: dead letters
 
     private val txApi: TransactionsApi = mock()
-    private val helper: SyncHelper = mock()
-    private val searchApi: SearchApi = mock()
+    private val helper: SyncHelper = mock { onBlocking { optimisticInsertBatchIntoFirefly(any()) } doReturn 1 }
+    private val plaidLinksApi: PlaidLinksApi = mock()
 
-    /** Built before any stubbing: creating a mock inside thenReturn() breaks Mockito. */
-    private fun searchResult(vararg txs: net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionRead) =
-        net.djvk.fireflyPlaidConnector2.lib.createFireflyResponse(
-            mock<net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionArray> { on { data } doReturn txs.toList() }
-        )
+    private fun service(store: DeadLetterStore?) = FireflyTransactionService(txApi, helper, 30, "UTC", plaidLinksApi, store)
 
-    private fun service(store: DeadLetterStore?) = FireflyTransactionService(txApi, helper, 30, "UTC", searchApi, store)
-
-    private fun create(externalId: String) = FireflyTransactionDto(
-        null, FireflyFixtures.getTransaction(type = TransactionTypeProperty.withdrawal, sourceId = "1", externalId = externalId)
-            .transactions.first()
+    private fun create(plaidId: String) = FireflyTransactionDto(
+        null, FireflyFixtures.getTransaction(
+            type = TransactionTypeProperty.withdrawal, sourceId = "1",
+            plaidLinks = listOf(PlaidLink(plaidId, PlaidLinkLeg.single, "plaidAccountA")),
+        ).transactions.first()
     )
 
     @Test
     fun oneRejectedWriteIsKeptAndTheOthersStillGoThrough() = runBlocking<Unit> {
         val store = DeadLetterStore(dir.toString())
-        val bad = create("plaid-bad")
-        val good = create("plaid-good")
+        val bad = create("bad")
+        val good = create("good")
         whenever(helper.optimisticInsertBatchIntoFirefly(eq(listOf(bad)))).doSuspendableAnswer {
             throw statusError(HttpStatusCode.UnprocessableEntity, """{"message":"The amount is invalid"}""")
         }
@@ -318,16 +320,16 @@ internal class R2SyncTest {
 
         verify(helper).optimisticInsertBatchIntoFirefly(eq(listOf(good)))
         val letters = store.read()
-        assertThat(letters.single().key).isEqualTo("plaid-bad")
+        assertThat(letters.single().key).isEqualTo("bad")
         assertThat(letters.single().operation).isEqualTo("create")
         assertThat(letters.single().message).contains("422").contains("The amount is invalid")
-        assertThat(letters.single().split?.externalId).isEqualTo("plaid-bad")
+        assertThat(letters.single().split?.plaidLinks?.single()?.plaidTransactionId).isEqualTo("bad")
     }
 
     @Test
     fun aRejectedUpdateAndDeleteAreKeptToo() = runBlocking<Unit> {
         val store = DeadLetterStore(dir.toString())
-        val update = FireflyTransactionDto("ff1", create("plaid-u").tx)
+        val update = FireflyTransactionDto("ff1", create("u").tx)
         whenever(helper.updateBatchInFirefly(any())).doSuspendableAnswer { throw statusError(HttpStatusCode.UnprocessableEntity) }
         whenever(helper.deleteBatchInFirefly(any())).doSuspendableAnswer { throw statusError(HttpStatusCode.BadRequest) }
 
@@ -342,13 +344,13 @@ internal class R2SyncTest {
             val store = DeadLetterStore(dir.resolve(status.value.toString()).toString())
             whenever(helper.optimisticInsertBatchIntoFirefly(any())).doSuspendableAnswer { throw statusError(status) }
 
-            val e = runCatching { service(store).processFireflyTransactionUpdates(listOf(create("plaid-x")), listOf(), listOf()) }.exceptionOrNull()
+            val e = runCatching { service(store).processFireflyTransactionUpdates(listOf(create("x")), listOf(), listOf()) }.exceptionOrNull()
 
             assertThat(e).describedAs("$status").isInstanceOf(ClientRequestException::class.java)
             assertThat(store.read()).describedAs("$status").isEmpty()
         }
         whenever(helper.optimisticInsertBatchIntoFirefly(any())).doSuspendableAnswer { throw java.io.IOException("down") }
-        val e = runCatching { service(DeadLetterStore(dir.toString())).processFireflyTransactionUpdates(listOf(create("plaid-x")), listOf(), listOf()) }
+        val e = runCatching { service(DeadLetterStore(dir.toString())).processFireflyTransactionUpdates(listOf(create("x")), listOf(), listOf()) }
             .exceptionOrNull()
         assertThat(e).isInstanceOf(java.io.IOException::class.java)
     }
@@ -357,7 +359,7 @@ internal class R2SyncTest {
     fun withoutADeadLetterStoreARejectedWriteStillFailsTheIteration() = runBlocking<Unit> {
         whenever(helper.optimisticInsertBatchIntoFirefly(any())).doSuspendableAnswer { throw statusError(HttpStatusCode.UnprocessableEntity) }
 
-        val e = runCatching { service(null).processFireflyTransactionUpdates(listOf(create("plaid-x")), listOf(), listOf()) }.exceptionOrNull()
+        val e = runCatching { service(null).processFireflyTransactionUpdates(listOf(create("x")), listOf(), listOf()) }.exceptionOrNull()
 
         assertThat(e).isInstanceOf(ClientRequestException::class.java)
     }
@@ -365,13 +367,11 @@ internal class R2SyncTest {
     @Test
     fun aKeptWriteIsRetriedAndRemovedOnceFireflyAcceptsIt() = runBlocking<Unit> {
         val store = DeadLetterStore(dir.toString())
-        val bad = create("plaid-bad")
+        val bad = create("bad")
         var reject = true
         whenever(helper.optimisticInsertBatchIntoFirefly(any())).doSuspendableAnswer {
-            if (reject) throw statusError(HttpStatusCode.UnprocessableEntity) else Unit
+            if (reject) throw statusError(HttpStatusCode.UnprocessableEntity) else 1
         }
-        val nothing = searchResult()
-        whenever(searchApi.searchTransactions(any(), any())).thenReturn(nothing)
         val service = service(store)
         service.processFireflyTransactionUpdates(listOf(bad), listOf(), listOf())
         assertThat(store.read()).hasSize(1)
@@ -384,26 +384,22 @@ internal class R2SyncTest {
         assertThat(store.read()).isEmpty()
     }
 
+    /** Firefly's link table refuses the id again (409): that is "already imported", so the letter goes and nothing is lost. */
     @Test
-    fun aKeptCreateThatFireflyAlreadyHasIsDroppedNotInsertedAgain() = runBlocking<Unit> {
+    fun aKeptCreateThatFireflyAlreadyHasIsDroppedNotKeptAgain() = runBlocking<Unit> {
         val store = DeadLetterStore(dir.toString())
-        store.add(DeadLetter("create", "plaid-there", null, create("plaid-there").tx, false, "x"))
-        val there = net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionRead(
-            "transactions", "ff9", FireflyFixtures.getTransaction(externalId = "plaid-there"), net.djvk.fireflyPlaidConnector2.api.firefly.models.ObjectLink()
-        )
-        val found = searchResult(there)
-        whenever(searchApi.searchTransactions(any(), any())).thenReturn(found)
+        store.add(DeadLetter("create", "there", null, create("there").tx, false, "x"))
+        whenever(helper.optimisticInsertBatchIntoFirefly(any())).doSuspendableAnswer { throw statusError(HttpStatusCode.Conflict) }
 
         service(store).retryDeadLetters()
 
-        verify(helper, never()).optimisticInsertBatchIntoFirefly(any())
         assertThat(store.read()).isEmpty()
     }
 
     @Test
     fun aNewerSuccessfulWriteForTheSameTransactionClearsItsOldDeadLetter() = runBlocking<Unit> {
         val store = DeadLetterStore(dir.toString())
-        val update = FireflyTransactionDto("ff1", create("plaid-u").tx)
+        val update = FireflyTransactionDto("ff1", create("u").tx)
         store.add(DeadLetter("update", "ff1", "ff1", update.tx, false, "old"))
 
         service(store).processFireflyTransactionUpdates(listOf(), listOf(update), listOf())
@@ -450,7 +446,7 @@ internal class R2SyncTest {
 
     @Test
     fun theWindowStartIsTheConfiguredNumberOfDaysBeforeToday() {
-        val service = FireflyTransactionService(txApi, helper, 30, "America/Chicago", searchApi)
+        val service = FireflyTransactionService(txApi, helper, 30, "America/Chicago", plaidLinksApi)
 
         assertThat(service.windowStart()).isEqualTo(LocalDate.now(java.time.ZoneId.of("America/Chicago")).minusDays(30))
     }

@@ -4,6 +4,7 @@ import kotlinx.coroutines.runBlocking
 import net.djvk.fireflyPlaidConnector2.api.ApiConfiguration
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.AboutApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.AccountsApi
+import net.djvk.fireflyPlaidConnector2.api.firefly.apis.PlaidLinksApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.SearchApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.TransactionsApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionRead
@@ -43,9 +44,10 @@ internal class R2LiveFireflyTest {
     private val config = ApiConfiguration().getClientConfig()
     private val txApi = TransactionsApi(url, null, config)
     private val searchApi = SearchApi(url, null, config)
+    private val plaidLinksApi = PlaidLinksApi(url, null, config)
     private val accountsApi = AccountsApi(url, null, config)
-    private val syncHelper = SyncHelper(AccountConfigs(emptyList()), token, AboutApi(url, null, config), txApi, accountsApi, searchApi)
-    private val service = FireflyTransactionService(txApi, syncHelper, 30, "UTC", searchApi)
+    private val syncHelper = SyncHelper(AccountConfigs(emptyList()), token, AboutApi(url, null, config), txApi, accountsApi, plaidLinksApi)
+    private val service = FireflyTransactionService(txApi, syncHelper, 30, "UTC", plaidLinksApi)
     private val converter = TransactionConverter(
         useNameForDestination = true, enablePrimaryCategorization = false, primaryCategoryPrefix = "p-",
         enableDetailedCategorization = false, detailedCategoryPrefix = "d-", timeZoneString = "UTC",
@@ -53,7 +55,7 @@ internal class R2LiveFireflyTest {
     )
 
     private suspend fun creds() {
-        txApi.setAccessToken(token); searchApi.setAccessToken(token); accountsApi.setAccessToken(token)
+        txApi.setAccessToken(token); searchApi.setAccessToken(token); plaidLinksApi.setAccessToken(token); accountsApi.setAccessToken(token)
     }
 
     private fun today(): OffsetDateTime = LocalDate.now().atStartOfDay().atOffset(ZoneOffset.UTC)
