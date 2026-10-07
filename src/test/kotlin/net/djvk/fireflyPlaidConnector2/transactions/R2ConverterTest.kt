@@ -134,19 +134,19 @@ internal class R2ConverterTest {
     }
 
     /**
-     * A retried pair: the transfer already holds a link for each of the two legs, so re-pairing the same two legs
-     * creates nothing.
+     * A retried pair whose transfer already holds both legs is NOT skipped here: a two-link create is left to Firefly's
+     * 409 (the whole write conflicts, nothing is written), so the converter still emits it with both links.
      */
     @Test
-    fun aRetriedPairIsSkippedWhenATransferAlreadyHoldsBothLegs() = runBlocking<Unit> {
+    fun aTwoLinkCreateIsNotSkippedEvenWhenATransferAlreadyHoldsBothLegs() = runBlocking<Unit> {
         val older = existing("ff1", TransactionTypeProperty.transfer, transferLinks)
 
         val result = converter().convertPollSync(
             accountMap, listOf(plaid(accountA, "wd", 50.0), plaid(accountB, "dep", -50.0)), listOf(), listOf(), listOf(older)
         )
 
-        assertThat(result.creates).isEmpty()
         assertThat(result.updates).isEmpty()
+        assertThat(result.creates.single().tx.plaidLinks).containsExactly(wdLink, depLink)
     }
 
     @Test
