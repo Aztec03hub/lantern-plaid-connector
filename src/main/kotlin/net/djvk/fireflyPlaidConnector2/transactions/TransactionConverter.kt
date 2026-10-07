@@ -105,11 +105,17 @@ class TransactionConverter(
     /** Optional JSON file of payee display names (`{"RAW OR KEY": "Display"}`); blank or missing means no aliases. */
     @Value("\${fireflyPlaidConnector2.names.aliasFile:}")
     aliasFile: String = "",
+
+    /** The pair config JSON; its `ownAccountPayments` rules route one-sided payments between own accounts. */
+    @Value("\${fireflyPlaidConnector2.pair.configFile:}")
+    pairConfigFile: String = "",
 ) {
     private val logger = LoggerFactory.getLogger(this::class.java)
 
     /** One name per payee: every spelling Plaid sends for the same payee lands in one Firefly account. */
     val namer: CounterpartyNamer = CounterpartyNamer.fromFile(aliasFile)
+
+    val ownAccounts: OwnAccountConfig = OwnAccountConfig.load(pairConfigFile)
 
     /**
      * Firefly account id (as a string) to its kind, which decides the type of a paired transaction (see
@@ -897,8 +903,9 @@ class TransactionConverter(
 
         val sourceId: String?
         val sourceName: String?
-        val destinationId: String?
-        val destinationName: String?
+        var destinationId: String?
+        var destinationName: String?
+        var leg = PlaidLinkLeg.single
         if (getTransactionDirection(tx) == Direction.IN) {
             destinationId = fireflyAccountId
             destinationName = null
@@ -911,6 +918,17 @@ class TransactionConverter(
 
             destinationId = null
             destinationName = if (disableAccountAssignment) null else getSourceOrDestinationName(tx, false)
+
+            // A payment to one of our own accounts that Plaid has no other side for: ONE link, leg source (never a pairing candidate)
+            val routed = fireflyAccountId.toIntOrNull()?.let {
+                ownAccounts.target(it, tx.originalDescription ?: tx.name, Math.round(tx.amount * 100), tx.date)
+            }
+            if (routed != null) {
+                logger.info("Routing ${tx.transactionId} (${tx.amount} on ${tx.date}) from account $fireflyAccountId to own account $routed")
+                destinationId = routed.toString()
+                destinationName = null
+                leg = PlaidLinkLeg.source
+            }
         }
         return convert(
             tx = tx,
@@ -920,7 +938,7 @@ class TransactionConverter(
             destinationId = destinationId,
             destinationName = destinationName,
             importTag = importTag,
-            plaidLinks = if (link) listOf(PlaidLink(tx.transactionId, PlaidLinkLeg.single, tx.accountId)) else null,
+            plaidLinks = if (link) listOf(PlaidLink(tx.transactionId, leg, tx.accountId)) else null,
         )
     }
 
