@@ -89,6 +89,23 @@ internal class RehomeNamesRunnerTest {
         assertThat(groups).isEmpty()
     }
 
+    @Test
+    fun cardLinesAndLoanInterestMergeOnlyWhenTheyAreTheSameMerchant() {
+        val names = listOf(
+            "DBT CRD 0514 DJVU7XEK ADVOCATE PATIENT PAYME DOWNERS GROVE IL C#7221",
+            "DBT CRD 1404 DJLLB57N CHECKR PERSO BY CHECKR SAN FRANCISCO CA C#7221",
+            "DBT CRD 1738 DJOA7MF5 SUNDAE FUNDAY CROWN PO CROWN POINT IN C#7221",
+            "DBT CRD 1822 DJZ9OQLI 07264 - 31ST STREET HA CHICAGO IL C#7221",
+            "DBT CRD 1913 DJJXSP49 07264 - 31ST STREET HA CHICAGO IL C#7221",
+            "DBT CRD 0613 DJHH1TSK ABC274-CFX WILLOWBROOK IL C#7221",
+            "DBT CRD 0305 DJBXFJ60 ABC274-CFX WILLOWBROOK IL C#7221",
+            "Interest: DCU Lexus NX loan",
+            "Interest: DCU personal loan",
+        )
+        val groups = planNameGroups(names.mapIndexed { i, n -> acct(i + 1, n, 1, AccountTypeFilter.expense) }, namer)
+        assertThat(groups.map { g -> (listOf(g.survivor) + g.duplicates).map { it.id }.sorted() }).containsExactlyInAnyOrder(listOf(4, 5), listOf(6, 7))
+    }
+
     // endregion
 
     // region apply against an in-memory Firefly

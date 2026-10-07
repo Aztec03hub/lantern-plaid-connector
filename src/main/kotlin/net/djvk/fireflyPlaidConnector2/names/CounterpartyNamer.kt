@@ -29,7 +29,13 @@ class CounterpartyNamer(private val aliases: Map<String, String> = mapOf()) {
         // "Type: Payroll ID: XX2465 CO: Evolv Consulting": the company is after CO:
         Regex("(?i)\\bCO:\\s*(.+)$").find(s)?.let { s = it.groupValues[1] }
         // a leading "merchant: original text" join made by the connector keeps the merchant half
-        s = s.substringBefore(": ").takeIf { raw.contains(": ") && !Regex("(?i)\\b(type|id|co):").containsMatchIn(raw) } ?: s
+        // (only when the rest is the same text or all caps; "Interest: DCU Lexus NX loan" keeps its whole name)
+        s = s.substringBefore(": ").takeIf {
+            val after = s.substringAfter(": ", "")
+            raw.contains(": ") && !Regex("(?i)\\b(type|id|co):").containsMatchIn(raw) &&
+                (after.startsWith(s.substringBefore(": "), ignoreCase = true) || after.none { c -> c.isLowerCase() })
+        } ?: s
+        cardLine(s)?.let { return it }
         s = s.replace(Regex("(?i)\\b(type|id|co|ind id|ind name|trace|orig id):.*$"), "")
         s = s.replace(Regex("^(?i)((ac|ach|ppd|web|ccd|pos|sq \\*|tst\\* |paypal \\*|debit card purchase|purchase authorized on \\d{2}/\\d{2})\\s+)+"), "")
         // a masked account number ("XXXX0373W") and whatever follows it
@@ -42,6 +48,17 @@ class CounterpartyNamer(private val aliases: Map<String, String> = mapOf()) {
         Regex("\\s+[A-Za-z.]+\\s+[A-Z]{2}$").find(s)?.let { if (s.substring(0, it.range.first).trim().contains(' ')) s = s.substring(0, it.range.first) }
         s = s.replace(Regex("(?i)(\\s+(payroll|ppd|web|ccd|pmt|payment|autopay|direct dep|dir dep|des|inc\\.?|llc\\.?))+$"), "")
         return s.replace(Regex("\\s+"), " ").trim(' ', '*', '-', ',', '.')
+    }
+
+    /**
+     * Debit-card and card-credit lines: "DBT CRD 0514 DJVU7XEK ADVOCATE PATIENT PAYME DOWNERS GROVE IL C#7221".
+     * Drops the time and ref, the trailing "ST C#nnnn" and the city; the merchant field is 22 characters wide.
+     */
+    private fun cardLine(s: String): String? {
+        val m = Regex("^(?:DBT CRD|CRE) \\d{4} \\w{8} (.+?)\\s+[A-Z]{2} C#\\d+$").find(s) ?: return null
+        val rest = m.groupValues[1]
+        val merchant = if (rest.length > 22 && rest[22] == ' ') rest.substring(0, 22) else rest.substringBeforeLast(' ', rest)
+        return merchant.trim()
     }
 
     private fun titleCase(s: String): String =
