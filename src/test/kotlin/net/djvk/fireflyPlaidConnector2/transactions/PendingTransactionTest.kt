@@ -237,13 +237,19 @@ internal class PendingTransactionTest {
     @Test
     fun aPendingTransactionIsNotPromotedWhenThePostedIdIsAlreadyIndexed() = runBlocking<Unit> {
         val pending = existingFirefly("ff1", single("pendingId"))
-        val alreadyPosted = existingFirefly("ff2", single("postedId"))
+        // held by a transfer (not a pairing candidate, so nothing else skips the posted create first)
+        val alreadyPosted = existingFirefly(
+            "ff2",
+            listOf(PlaidLink("postedId", PlaidLinkLeg.source, plaidAccount), PlaidLink("otherLeg", PlaidLinkLeg.destination, "x")),
+            type = TransactionTypeProperty.transfer,
+        )
 
         val result = converter().convertPollSync(
             accountMap, listOf(posted()), listOf(), listOf("pendingId"), listOf(pending, alreadyPosted)
         )
 
         assertThat(result.updates).describedAs("replacing the link would be refused (409), so no promotion").isEmpty()
+        assertThat(result.creates).describedAs("the posted money is already on the transfer").isEmpty()
         assertThat(result.deletes).describedAs("the pending group goes with Plaid's removal").containsExactly("ff1")
     }
 
