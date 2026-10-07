@@ -254,20 +254,12 @@ class BatchSyncRunner(
                     logger.error("Error fetching Firefly account $fireflyAccountId", e)
                     continue
                 }
-                val isCreditCard = fireflyAccount.attributes.accountRole?.value == "ccAsset"
+                val owedIsNegative = carriesOwedAsNegative(fireflyAccount)
 
                 val txs = plaidTxsByAccountId[accountId] ?: listOf()
                 val total = txs.fold(0.0) { acc, tx -> acc + tx.amount }
 
-                /**
-                 * Plaid returns positive balances regardless, even though they're functionally negative for
-                 *  credit card accounts.
-                 */
-                val initialBalance = if (isCreditCard) {
-                    total - currentBalance
-                } else {
-                    total + currentBalance
-                }
+                val initialBalance = initialBalanceFor(total, currentBalance, owedIsNegative)
 
                 val earliestTimestamp = txs.fold(OffsetDateTime.now()) { acc, tx ->
                     val ts = converter.getTxPostedTimestamp(tx)
@@ -305,5 +297,26 @@ class BatchSyncRunner(
                 )
             }
         }
+    }
+
+    companion object {
+        /**
+         * True when Firefly shows what the account owes as a NEGATIVE balance: a credit card asset, or a liability whose
+         * direction is "debit" (I owe it; AccountServiceTrait). A "credit" liability (owed to me) is positive.
+         * Plaid reports `current` as the positive amount owed for cards and loans, so this decides its sign.
+         */
+        fun carriesOwedAsNegative(account: AccountRead): Boolean {
+            if (account.attributes.accountRole?.value == "ccAsset") return true
+            return account.attributes.type.value.startsWith("liabilit") &&
+                    account.attributes.liabilityDirection != net.djvk.fireflyPlaidConnector2.api.firefly.models.LiabilityDirection.credit
+        }
+
+        /**
+         * The opening balance (Firefly sign) that makes the account end at Plaid's `current`: the target balance is
+         * +current, or -current when [owedIsNegative], and the imported transactions move the balance by -[total]
+         * (Plaid counts money out as positive), so opening = target + total.
+         */
+        fun initialBalanceFor(total: Double, current: Double, owedIsNegative: Boolean): Double =
+            if (owedIsNegative) total - current else total + current
     }
 }
