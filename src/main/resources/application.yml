@@ -45,16 +45,9 @@ fireflyPlaidConnector2:
   #   Every pass is a DRY RUN (prints the plan, writes nothing) until dryRun is false. afterRun adds a pass after every
   #   batch run and poll (off by default). Account mask / roles / institutionName in the accounts list feed its
   #   named-destination rules. configFile is an optional JSON file with externalPayees, hints and scheduled flows.
-  pair:
-    dryRun: true
-    afterRun: false
-    lookbackDays: 3650
-    markerDays: 5
-    fallbackDays: 10
-    autoMin: 6
-    reviewMin: 3
-    useWatermark: false
-    # unmerge: <pair_merge_id>
+  # The pair settings (dryRun, lookbackDays, markerDays, fallbackDays, autoMin, reviewMin, useWatermark, afterRun) have ONE
+  #   source of truth: the defaults in PairSettings (pairing/PairPass.kt), which are what the nightly runs. Set one here or in
+  #   your own config only to change it on purpose; every run prints the values in effect. unmerge: <pair_merge_id>.
   polled:
     # How often to run the poll sync process
     syncFrequencyMinutes: 10

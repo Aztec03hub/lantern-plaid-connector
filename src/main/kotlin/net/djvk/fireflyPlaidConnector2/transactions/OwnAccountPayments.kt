@@ -47,6 +47,13 @@ data class OwnAccountConfig(val rules: List<OwnAccountRule> = emptyList(), val s
     }
 }
 
+/** True when [date] is within [tolerance] days of day [dayOfMonth] of this, the previous or the next month (the 30th and the 2nd meet). */
+fun dayOfMonthWithin(date: LocalDate, dayOfMonth: Int, tolerance: Int): Boolean = (-1L..1L).any { m ->
+    val month = date.withDayOfMonth(1).plusMonths(m)
+    val due = month.withDayOfMonth(minOf(dayOfMonth, month.lengthOfMonth()))
+    kotlin.math.abs(java.time.temporal.ChronoUnit.DAYS.between(due, date)) <= tolerance
+}
+
 /**
  * The account a payment goes to: the rule's fixed [OwnAccountRule.toAccount], or the ONE candidate whose scheduled flow
  * from [fromAccount] has the same [cents] and a day of month within its tolerance of [date] (this, previous and next month
@@ -57,11 +64,7 @@ fun route(rule: OwnAccountRule, fromAccount: Int, cents: Long, date: LocalDate, 
     if (!rule.scheduled) return null
     val hits = scheduled.filter { f ->
         f.from == fromAccount && f.to in rule.candidates && f.cents == cents && f.dayOfMonth != null &&
-            (-1L..1L).any { m ->
-                val month = date.withDayOfMonth(1).plusMonths(m)
-                val due = month.withDayOfMonth(minOf(f.dayOfMonth, month.lengthOfMonth()))
-                kotlin.math.abs(java.time.temporal.ChronoUnit.DAYS.between(due, date)) <= f.toleranceDays
-            }
+            dayOfMonthWithin(date, f.dayOfMonth, f.toleranceDays)
     }.map { it.to }.distinct()
     return hits.singleOrNull()
 }

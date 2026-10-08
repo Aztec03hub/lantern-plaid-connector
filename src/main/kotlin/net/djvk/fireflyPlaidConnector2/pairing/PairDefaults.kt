@@ -23,13 +23,13 @@ object PairDefaults {
     /** A statement carry-over is not money moving: never a pairing candidate. */
     val carryOver = Regex("LAST STATEMENT BAL FROM ACCT ENDING")
     val p2p = Regex("(?i)zelle|venmo|paypal|cash ?app")
-    val income = Regex("(?i)payroll|direct dep|interest|refund|tax|ides|promo bonus|^0\\.050%|loan adv|fidelity|merrill|robinhood")
+    val income = Regex("(?i)payroll|direct dep|interest|refund|\\btax(es)?\\b|\\bides\\b|promo bonus|^0\\.050%|loan adv|fidelity|merrill|robinhood")
 
     val destinations = listOf(
         DestRule(Regex("CHASE CREDIT CRD"), DestTarget.Institution("Chase")),
         DestRule(Regex("(?i)withdrawal onlin old second"), DestTarget.Institution("Old Second")),
         DestRule(Regex("^(To Emergency Fund Vault|Roundup \\*)"), DestTarget.Role("vault")),
         DestRule(Regex("BALANCE CONSOLIDATION"), DestTarget.Role("card")),
-        DestRule(Regex("(?i)best buy|home depot|lowes|nordstrom|\\batt\\b|comed|bilt|affirm|klarna|coinbase|IBTRANSFER"), DestTarget.Unlinked),
+        DestRule(Regex("(?i)best buy|home depot|lowes|nordstrom|\\batt\\b|\\bcomed\\b|\\bbilt\\b|\\baffirm\\b|klarna|coinbase|IBTRANSFER"), DestTarget.Unlinked),
     )
 }

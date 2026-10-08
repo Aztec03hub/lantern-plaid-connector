@@ -1,5 +1,6 @@
 package net.djvk.fireflyPlaidConnector2.pairing
 
+import net.djvk.fireflyPlaidConnector2.transactions.dayOfMonthWithin
 import java.time.temporal.ChronoUnit
 import kotlin.math.abs
 
@@ -7,7 +8,12 @@ import kotlin.math.abs
  * The matching rule of the transfer pairer (design section 4): candidates, compatibility, scoring and assignment.
  * Pure: the result is a function of the legs, the accounts and the configuration, never of the order they arrive in.
  */
-class PairEngine(private val accounts: List<PairAccount>, private val config: PairingConfig = PairingConfig()) {
+class PairEngine(
+    private val accounts: List<PairAccount>,
+    private val config: PairingConfig = PairingConfig(),
+    /** Pairs (out leg id, in leg id) a person unmerged: never proposed again (H1). */
+    private val rejected: Set<Pair<String, String>> = setOf(),
+) {
     private val byId = accounts.associateBy { it.id }
 
     /**
@@ -54,6 +60,7 @@ class PairEngine(private val accounts: List<PairAccount>, private val config: Pa
     /** Scores one candidate: the pair requirements R1 to R4 and the rules of 4.3.5. Null if it is not even a candidate. */
     fun evaluate(out: Leg, inn: Leg): Edge? {
         if (out.dir != Dir.OUT || inn.dir != Dir.IN) return null
+        if ((out.id to inn.id) in rejected) return null
         if (out.account == inn.account || out.cents != inn.cents) return null
         if (out.currency != inn.currency) return null
         if (isCarryOver(out) || isCarryOver(inn)) return null
@@ -71,7 +78,6 @@ class PairEngine(private val accounts: List<PairAccount>, private val config: Pa
         val outMarked = outMarkers.isNotEmpty() || outHints.isNotEmpty()
         val inMarked = inMarkers.isNotEmpty() || inHints.isNotEmpty()
         val layer = if (outMarked && inMarked && gap <= config.markerDays) 2 else 3
-        if (layer == 3 && gap > config.fallbackDays) return null
 
         // R4: compatibility. A round-up pairs only with the leg of the identical text, and that check runs before the
         // P2P veto (the round-up of a PayPal purchase is still a vault move).
@@ -117,7 +123,7 @@ class PairEngine(private val accounts: List<PairAccount>, private val config: Pa
         // scheduled flow
         val flows = config.scheduled.filter { f ->
             f.from == out.account && f.cents == out.cents &&
-                    (f.dayOfMonth == null || abs(out.date.dayOfMonth - f.dayOfMonth) <= f.toleranceDays)
+                    (f.dayOfMonth == null || dayOfMonthWithin(out.date, f.dayOfMonth, f.toleranceDays))
         }
         if (flows.isNotEmpty()) {
             if (flows.any { it.to == inn.account }) points.add(RulePoints("scheduled", 3, "schedule"))
@@ -155,7 +161,7 @@ class PairEngine(private val accounts: List<PairAccount>, private val config: Pa
                 if (rule.target is DestTarget.Mask && partners.size == 1) out.add(RulePoints("destination-exact", 4, "destination", byId[partners.single()]?.name))
                 else if (partners.size == 1) out.add(RulePoints("destination-institution", 3, "destination", byId[partners.single()]?.name))
             }
-            if (config.scheduled.any { f -> f.from == leg.account && f.cents == leg.cents && (f.dayOfMonth == null || abs(leg.date.dayOfMonth - f.dayOfMonth) <= f.toleranceDays) })
+            if (config.scheduled.any { f -> f.from == leg.account && f.cents == leg.cents && (f.dayOfMonth == null || dayOfMonthWithin(leg.date, f.dayOfMonth, f.toleranceDays)) })
                 out.add(RulePoints("scheduled", 3, "schedule"))
         }
         return out

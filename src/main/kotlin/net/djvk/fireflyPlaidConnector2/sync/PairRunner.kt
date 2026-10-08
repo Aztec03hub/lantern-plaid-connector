@@ -3,6 +3,8 @@ package net.djvk.fireflyPlaidConnector2.sync
 import kotlinx.coroutines.runBlocking
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.PairApi
 import net.djvk.fireflyPlaidConnector2.pairing.PairPass
+import net.djvk.fireflyPlaidConnector2.pairing.PairStateFile
+import net.djvk.fireflyPlaidConnector2.pairing.RejectedPair
 import net.djvk.fireflyPlaidConnector2.pairing.PairSettings
 import net.djvk.fireflyPlaidConnector2.transactions.TransactionConverter
 import org.slf4j.LoggerFactory
@@ -37,11 +39,24 @@ class PairRunner(
             pairApi.setAccessToken(settings.fireflyAccessToken)
             pairApi.unmerge(unmerge.trim(), unmergeForce)
             logger.info("Unmerged pair_merge_id {}", unmerge.trim())
+            // H1: remember that a person rejected this pair, or the next pass would merge it again
+            val state = PairStateFile.read(settings.directory)
+            val gone = state.merges.firstOrNull { it.pairMergeId == unmerge.trim() }
+            if (gone == null) logger.warn("pair_merge_id {} is not in pair-state.json; the next pass records it when it sees both legs single again", unmerge.trim())
+            else PairStateFile.write(
+                settings.directory,
+                state.copy(
+                    merges = state.merges - gone,
+                    rejected = (state.rejected + RejectedPair(gone.out.id, gone.inn.id, gone.pairMergeId, LocalDate.now().toString())).distinctBy { it.out to it.inn },
+                ),
+            )
             return@runBlocking
         }
         converter.accountKinds = syncHelper.fetchAccountKinds()
         val today = LocalDate.now()
         val report = pass.run(today.minusDays(settings.lookbackDays), today)
         logger.info("Pairing finished: {} proposed, {} merged", report.result.proposals.count { it.auto }, report.merged.size)
+        // A2: the pass went on past a failed pair and saved what it merged; now say so with a non-zero exit
+        check(report.failed.isEmpty()) { "${report.failed.size} pair(s) failed to merge: " + report.failed.joinToString("; ") { "${it.out}+${it.inn}: ${it.error}" } }
     }
 }
