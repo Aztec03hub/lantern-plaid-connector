@@ -247,6 +247,13 @@ internal class LoanInterestRunnerTest {
     }
 
     @Test
+    fun aDepositCarryingTheUnexplainedTagIsNotAPaymentWhateverItsWording() = runBlocking<Unit> {  // M1, tag alone
+        owedBefore[d(8, 31)] = "23817.37"
+        val rows = chargedThenNew + journal("u", "2.00", d(8, 20), "hand edited", deposit = true, tags = listOf("lantern-unexplained"))
+        assertThat(runner("23491.66", rows, apply = false).runOnce().single().lines).hasSize(1)
+    }
+
+    @Test
     fun aSameDaySecondPaymentGivesTheNegativeRemainderToTheBiggestLine() = runBlocking<Unit> {  // M2
         owedBefore[d(8, 31)] = "23817.37"
         val rows = chargedThenNew + payment("c", "50.00", d(9, 1))
