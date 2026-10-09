@@ -33,7 +33,8 @@ class CounterpartyNamer(private val aliases: Map<String, String> = mapOf()) {
         s = s.substringBefore(": ").takeIf {
             val after = s.substringAfter(": ", "")
             raw.contains(": ") && !Regex("(?i)\\b(type|id|co):").containsMatchIn(raw) &&
-                (after.startsWith(s.substringBefore(": "), ignoreCase = true) || after.none { c -> c.isLowerCase() })
+                (after.startsWith(s.substringBefore(": "), ignoreCase = true) ||
+                    (after.none { c -> c.isLowerCase() } && key(s.substringBefore(": ")) !in PERSON_TO_PERSON))
         } ?: s
         cardLine(s)?.let { return it }
         s = s.replace(Regex("(?i)\\b(type|id|co|ind id|ind name|trace|orig id):.*$"), "")
@@ -42,8 +43,10 @@ class CounterpartyNamer(private val aliases: Map<String, String> = mapOf()) {
         s = s.replace(Regex("\\s+[Xx*]{2,}\\d+\\w*.*$"), "")
         // from the first long digit run (trace and id numbers) on, drop everything
         s = s.replace(Regex("\\s*[Xx*#]*\\d{5,}.*$"), "")
-        // store numbers, locations and terminal words: "TARGET T-1234 CHICAGO IL"
-        s = s.replace(Regex("\\s+(#|no\\.?\\s*)?\\d{1,5}\\b.*$"), "")
+        // store numbers, locations and terminal words: "TARGET #12 CHICAGO IL", "ATM W/D 1234 MAIN ST". A 1-2 digit number
+        // without a # is part of the name ("Pier 39 Parking", "Route 66 Diner", "Studio 54") and stays.
+        s = s.replace(Regex("\\s+(#|(?i:no)\\.?\\s*)\\d{1,5}\\b.*$"), "")
+        s = s.replace(Regex("\\s+\\d{3,5}\\b.*$"), "")
         // a trailing "CITY ST" location, only when a name of at least two words is left
         Regex("\\s+[A-Za-z.]+\\s+[A-Z]{2}$").find(s)?.let { if (s.substring(0, it.range.first).trim().contains(' ')) s = s.substring(0, it.range.first) }
         s = s.replace(Regex("(?i)(\\s+(payroll|ppd|web|ccd|pmt|payment|autopay|direct dep|dir dep|des|inc\\.?|llc\\.?))+$"), "")
@@ -63,9 +66,12 @@ class CounterpartyNamer(private val aliases: Map<String, String> = mapOf()) {
 
     private fun titleCase(s: String): String =
         if (s.any { it.isLowerCase() } && s.any { it.isUpperCase() }) s
-        else s.lowercase().split(' ').joinToString(" ") { w -> w.replaceFirstChar { it.uppercase() } }
+        else s.lowercase().split(' ').joinToString(" ") { w -> if ('&' in w && w.length <= 4) w.uppercase() else w.replaceFirstChar { it.uppercase() } }
 
     companion object {
+        /** Prefixes whose text after the colon is a person, not a bank spelling of the prefix ("Zelle: JOHN SMITH"). */
+        private val PERSON_TO_PERSON = setOf("zelle", "venmo", "cash app", "paypal", "apple cash")
+
         /** `{"EVOLV CONSULTING": "Evolv Consulting", ...}`; keys are compared by [key]. A missing file is no aliases. */
         fun fromFile(path: String): CounterpartyNamer {
             if (path.isBlank() || !File(path).exists()) return CounterpartyNamer()
