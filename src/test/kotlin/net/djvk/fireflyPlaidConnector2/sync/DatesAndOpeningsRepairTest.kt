@@ -264,6 +264,57 @@ internal class DatesAndOpeningsRepairTest {
         assertThat(plan(listOf(single), listOf(plaid("w1", day))).redates).isEmpty()
     }
 
+    private fun mergedAt(date: OffsetDateTime, book: OffsetDateTime? = date) = TransactionRead(
+        "transactions", "gm",
+        FireflyFixtures.getTransaction(
+            type = TransactionTypeProperty.transfer, date = date, amount = "10.00", sourceId = "1", destinationId = "2", processDate = date,
+            bookDate = book,
+            plaidLinks = listOf(PlaidLink("src", PlaidLinkLeg.source, plaidAccount), PlaidLink("dst", PlaidLinkLeg.destination, plaidAccount)),
+            transactionJournalId = "jgm",
+        ), ObjectLink(),
+    )
+
+    @Test
+    fun anAuthorizedDateAfterThePostedDateIsNeverProposedAsBookDate() {
+        val day = LocalDate.of(2026, 9, 23)
+        // the 2896 shape: both legs post on the same instant, the destination leg is "authorized" 9 days later
+        val p = plan(
+            listOf(mergedAt(midnight(day))),
+            listOf(plaid("src", day, authorizedDate = day), plaid("dst", day, authorizedDate = day.plusDays(9),
+                authorizedDatetime = OffsetDateTime.of(2026, 10, 2, 23, 29, 14, 0, ZoneOffset.UTC))),
+        )
+        assertThat(p.redates).isEmpty()
+        // a single-link journal with a later authorized date keeps its book date too
+        val single = journal("gs", midnight(day), "w1")
+        val r = plan(listOf(single), listOf(plaid("w1", day, authorizedDate = day.plusDays(3)))).redates.singleOrNull()
+        assertThat(r?.newBookDate).isNull()
+    }
+
+    @Test
+    fun whenBothLegsMatchTheBookDateComesFromTheSourceLeg() {
+        val day = LocalDate.of(2026, 9, 23)
+        val r = plan(
+            listOf(mergedAt(midnight(day), book = null)),
+            listOf(plaid("src", day, authorizedDate = day.minusDays(1)), plaid("dst", day, authorizedDate = day)),
+        ).redates.single()
+        assertThat(r.newBookDate).isEqualTo(midnight(day.minusDays(1)))
+    }
+
+    @Test
+    fun theDryRunNamesTheFieldsThatChange() {
+        val d1 = midnight(LocalDate.of(2026, 9, 23))
+        val d2 = midnight(LocalDate.of(2026, 9, 22))
+        val bookOnly = Redate("1", "j1", "x", d1, d1, d2, d1, oldBookDate = d1, oldProcessDate = d1)
+        val dateOnly = Redate("2", "j2", "x", d2, d1, null, d1, oldProcessDate = d1)
+        val processOnly = Redate("3", "j3", "x", d1, d1, null, d1, oldProcessDate = d2)
+        assertThat(bookOnly.fields).containsExactly("book")
+        assertThat(bookOnly.describeChange()).isEqualTo("book $d1 -> $d2")
+        assertThat(dateOnly.fields).containsExactly("date")
+        assertThat(processOnly.fields).containsExactly("process")
+        assertThat(processOnly.describeChange()).isEqualTo("process $d2 -> $d1")
+        assertThat(summarizeFields(listOf(bookOnly, dateOnly, processOnly))).isEqualTo("date 1, book 1, process 1")
+    }
+
     @Test
     fun aMergedTransferMatchingNeitherLegStillGetsTheDestinationLegDate() {
         val day = LocalDate.of(2024, 12, 6)
@@ -447,15 +498,34 @@ internal class DatesAndOpeningsRepairTest {
     fun aPendingJournalIsExcludedFromTheSumAndBackedOutOfTheAnchor() {
         val day = LocalDate.of(2024, 12, 6)
         val pendingTx = plaid("p1", day.plusDays(1), amount = 36.0, pending = true)
+        // RD1: the account is listed in repair.reanchor, since pending items otherwise keep the old amount
         val p = plan(
+            setOf(1),
             listOf(journal("g1", midnight(day), "w1"), journal("g2", midnight(day.plusDays(1)), "p1", amount = "36.00")),
             listOf(plaid("w1", day), pendingTx),
-            current = mapOf(1 to 500.0),
-            accounts = mapOf(1 to account(ShortAccountTypeProperty.asset, "Checking", opening = "540.00", openingDate = midnight(day.minusDays(1)))),
+            mapOf(1 to 500.0),
+            mapOf(1 to account(ShortAccountTypeProperty.asset, "Checking", opening = "540.00", openingDate = midnight(day.minusDays(1)))),
         )
         // anchor = 500 + 36 pending = 536; posted journals spent 10; opening 546; the pending journal does not count
         assertThat(p.openings.single().newOpening!!.toPlainString()).isEqualTo("546.00")
         assertThat(p.openings.single().sanityNote).isNull()
+    }
+
+    @Test
+    fun pendingItemsListedKeepTheOpeningAmountUnlessTheAccountIsListed() {
+        val day = LocalDate.of(2024, 12, 6)
+        fun run(reanchor: Set<Int>) = plan(
+            reanchor,
+            listOf(journal("g1", midnight(day), "w1")),
+            listOf(plaid("w1", day), plaid("p1", day.plusDays(1), amount = 36.0, pending = true)),
+            mapOf(1 to 500.0),
+            mapOf(1 to account(ShortAccountTypeProperty.asset, "Checking", opening = "540.00", openingDate = midnight(day.minusDays(1)))),
+        ).openings.single()
+        // anchor 536 + 10 spent = 546 would move the opening by 6, less than the pending total 36: still kept
+        val kept = run(setOf())
+        assertThat(kept.newOpening!!.toPlainString()).isEqualTo("540.00")
+        assertThat(kept.keptAmount).isEqualTo("KEPT AMOUNT 540.00: 1 pending items listed; re-run when they post (or list the account in repair.reanchor)")
+        assertThat(run(setOf(1)).newOpening!!.toPlainString()).isEqualTo("546.00")
     }
 
     private fun unlisted(reanchor: Set<Int>): OpeningFix {

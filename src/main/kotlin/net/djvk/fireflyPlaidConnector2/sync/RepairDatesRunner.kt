@@ -64,7 +64,28 @@ data class Redate(
      * merge keeps the OUT leg's, and the links look the same; the dry run flags these so a person reads them before applying.
      */
     val ambiguous: Boolean = false,
-)
+    val oldBookDate: OffsetDateTime? = null,
+    val oldProcessDate: OffsetDateTime? = null,
+) {
+    /** The fields this repair changes, as "date", "book", "process" (RD1: the dry run names them). */
+    val fields: List<String> get() = listOfNotNull(
+        "date".takeIf { oldDate.toInstant() != newDate.toInstant() },
+        "book".takeIf { newBookDate != null },
+        "process".takeIf { oldProcessDate?.toInstant() != newProcessDate.toInstant() },
+    )
+
+    fun describeChange(): String = fields.joinToString("; ") {
+        when (it) {
+            "date" -> "date $oldDate -> $newDate"
+            "book" -> "book ${oldBookDate ?: "-"} -> $newBookDate"
+            else -> "process ${oldProcessDate ?: "-"} -> $newProcessDate"
+        }
+    }
+}
+
+/** How many re-dates change each field, e.g. "date 3, book 40, process 1". */
+fun summarizeFields(redates: List<Redate>): String =
+    listOf("date", "book", "process").joinToString(", ") { f -> "$f ${redates.count { f in it.fields }}" }
 
 /** An account's opening balance, before and after the repair. */
 data class OpeningFix(
@@ -139,8 +160,11 @@ class RepairPlanner(
             //  when that leg is not in Plaid's history the source leg's record is used
             // A merged transfer (core's pair merge) keeps the OUT leg's date, and the merged journal has the same two links as a
             //  connector-made pair; so a pair whose stored date is already one of its own legs' posted instants is left on that leg.
-            val known = links.sortedBy { it.leg != PlaidLinkLeg.destination }.mapNotNull { input.plaidTxs[it.plaidTransactionId] }
-            val matching = known.firstOrNull { converter.getTxPostedTimestamp(it).toInstant() == split.date.toInstant() }
+            val knownLegs = links.sortedBy { it.leg != PlaidLinkLeg.destination }.mapNotNull { l -> input.plaidTxs[l.plaidTransactionId]?.let { l to it } }
+            val known = knownLegs.map { it.second }
+            // When both legs match, the OUT (source) leg supplies the book date: a core merge keeps the OUT leg
+            val matchingLegs = knownLegs.filter { converter.getTxPostedTimestamp(it.second).toInstant() == split.date.toInstant() }
+            val matching = (matchingLegs.firstOrNull { it.first.leg == PlaidLinkLeg.source } ?: matchingLegs.firstOrNull())?.second
             val plaid = matching ?: known.firstOrNull()
             val ambiguous = matching == null && known.size > 1
             if (plaid == null) {
@@ -150,13 +174,17 @@ class RepairPlanner(
                 continue
             }
             val newDate = converter.getTxPostedTimestamp(plaid)
-            val newBook = converter.getTxAuthorizedTimestamp(plaid)
+            // An authorized date after the posted day is not a real authorization (an institution can report the processing time of an
+            //  incoming payment there): never a book date
+            val newBook = converter.getTxAuthorizedTimestamp(plaid)?.takeUnless {
+                it.atZoneSameInstant(zoneId).toLocalDate() > newDate.atZoneSameInstant(zoneId).toLocalDate()
+            }
             newDates[group.id] = newDate
             val bookDiffers = newBook != null &&
                     split.bookDate?.atZoneSameInstant(zoneId)?.toLocalDate() != newBook.atZoneSameInstant(zoneId).toLocalDate()
             val processDiffers = split.processDate?.toInstant() != newDate.toInstant()
             if (!split.date.toInstant().equals(newDate.toInstant()) || bookDiffers || processDiffers) {
-                redates.add(Redate(group.id, split.transactionJournalId, split.description, split.date, newDate, if (bookDiffers) newBook else null, newDate, ambiguous))
+                redates.add(Redate(group.id, split.transactionJournalId, split.description, split.date, newDate, if (bookDiffers) newBook else null, newDate, ambiguous, split.bookDate, split.processDate))
             }
         }
 
@@ -217,6 +245,7 @@ class RepairPlanner(
 
         val current = input.plaidCurrent[id]
         var pendingTotal = BigDecimal.ZERO
+        var pendingCount = 0
         var hasOwnJournals = true
         val (opening, date) = if (current != null) {
             // Anchored to Plaid: the posted balance (Plaid's current with its listed pending items backed out) must be
@@ -226,6 +255,7 @@ class RepairPlanner(
             val target = BigDecimal.valueOf(current).let { if (owedNegative) it.negate() else it }
             val pendingHere = input.plaidTxs.values.filter { it.pending && input.fireflyAccountOfPlaid[it.accountId] == id }
             val pendingSigned = pendingHere.fold(BigDecimal.ZERO) { a, t -> a + BigDecimal.valueOf(t.amount) }
+            pendingCount = pendingHere.size
             pendingTotal = pendingHere.fold(BigDecimal.ZERO) { a, t -> a + BigDecimal.valueOf(t.amount).abs() }
             val anchor = target + pendingSigned
             fun isPending(g: TransactionRead) = g.attributes.transactions.any { t ->
@@ -255,7 +285,7 @@ class RepairPlanner(
                     "total ${pendingTotal.setScale(2, RoundingMode.HALF_UP)} + 1.00: check it" else null
         // Plaid's balance can include money its transaction list has not caught up with yet (a deposit that posted
         //  today). A move the pending items do not explain keeps the old amount; the date still moves.
-        val keep = sanity != null && id !in reanchor && (oldOpening != null || legacy.isNotEmpty())
+        val keep = (sanity != null || pendingCount > 0) && id !in reanchor && (oldOpening != null || legacy.isNotEmpty())
         val finalOpening = if (keep) previous else opening
         val badSign = isLiability && ((direction == "credit" && finalOpening.signum() < 0) || (direction != "credit" && finalOpening.signum() > 0))
         val skip = when {
@@ -269,7 +299,9 @@ class RepairPlanner(
                 "this liability needs an opening of ${finalOpening.toPlainString()}, which Firefly forces to the other sign (${direction ?: "debit"}); set it by hand"
             else -> null
         }
-        val kept = if (keep) "KEPT AMOUNT ${previous.toPlainString()}: balance moved by ${moved.setScale(2, RoundingMode.HALF_UP)} " +
+        // RD1: Plaid's current holds the bank's own holds, which its pending list need not match, so no re-anchoring while any are listed
+        val kept = if (keep && pendingCount > 0) "KEPT AMOUNT ${previous.toPlainString()}: $pendingCount pending items listed; re-run when they post (or list the account in repair.reanchor)"
+        else if (keep) "KEPT AMOUNT ${previous.toPlainString()}: balance moved by ${moved.setScale(2, RoundingMode.HALF_UP)} " +
                 "that Plaid's transactions don't explain yet; re-run after the next sync (or list the account in repair.reanchor)" else null
         return OpeningFix(id, name, oldOpening, oldDate, legacySum, legacyIds, finalOpening, date, direction, skip, missing, sanity, kept)
     }
@@ -400,14 +432,14 @@ class RepairDatesRunner(
     }
 
     private fun print(plan: RepairPlan, input: RepairInput, pending: Map<Int, BigDecimal>) {
-        println("== Dates: ${plan.redates.size} journals to re-date; ${plan.unmatchedJournals} Plaid journals not found in Plaid's history are reported only, never moved")
-        plan.redates.take(20).forEach { println("   ${it.groupId} ${it.description.take(40)}: ${it.oldDate} -> ${it.newDate}" + if (it.ambiguous) "  (?) matches neither leg" else "") }
+        println("== Dates: ${plan.redates.size} journals to re-date (${summarizeFields(plan.redates)}); ${plan.unmatchedJournals} Plaid journals not found in Plaid's history are reported only, never moved")
+        plan.redates.take(20).forEach { println("   ${it.groupId} ${it.description.take(40)}: ${it.describeChange()}" + if (it.ambiguous) "  (?) matches neither leg" else "") }
         plan.redates.count { it.ambiguous }.takeIf { it > 0 }?.let { println("   (?) $it of them are two-leg journals whose date matches neither leg: they get the destination leg's date, but a core merge keeps the OUT leg's. Read them before applying.") }
         if (plan.redates.size > 20) println("   ... and ${plan.redates.size - 20} more")
         val winter = plan.redates.filter { it.newDate.monthValue in listOf(12, 1, 2) }
         println("   winter samples (Dec-Feb), ${winter.size} in total:")
         listOf(winter.firstOrNull(), winter.getOrNull(winter.size / 2), winter.lastOrNull()).filterNotNull().distinct().forEach {
-            println("   ${it.groupId} ${it.description.take(40)}: ${it.oldDate} -> ${it.newDate}")
+            println("   ${it.groupId} ${it.description.take(40)}: ${it.describeChange()}")
         }
         println("== Opening balances (anchor = Plaid current with its listed pending items backed out; pending journals are excluded from the sum of the account's other journals)")
         for (o in plan.openings) {
