@@ -83,6 +83,19 @@ data class Redate(
     }
 }
 
+/** One printed dry-run line of a re-date. */
+fun redateLine(r: Redate): String =
+    "   ${r.groupId} ${r.description.take(40)}: ${r.describeChange()}" + if (r.ambiguous) "  (?) matches neither leg" else ""
+
+/** The dry run's header for the re-dates. */
+fun redatesHeader(plan: RepairPlan): String =
+    "== Dates: ${plan.redates.size} journals to re-date (${summarizeFields(plan.redates)}); ${plan.unmatchedJournals} Plaid journals not found in Plaid's history are reported only, never moved"
+
+/** One printed line of the balance block; the gap is Firefly minus Plaid's current (the listed pending items cancel out of it). */
+fun balanceLine(id: Int, name: String, firefly: BigDecimal, plaidCurrent: BigDecimal, pending: BigDecimal): String =
+    "   account $id ($name): firefly now $firefly, plaid current $plaidCurrent, listed pending $pending, " +
+            "gap ${(firefly - plaidCurrent).setScale(2, RoundingMode.HALF_UP)} (Firefly minus Plaid current)"
+
 /** How many re-dates change each field, e.g. "date 3, book 40, process 1". */
 fun summarizeFields(redates: List<Redate>): String =
     listOf("date", "book", "process").joinToString(", ") { f -> "$f ${redates.count { f in it.fields }}" }
@@ -300,8 +313,11 @@ class RepairPlanner(
             else -> null
         }
         // RD1: Plaid's current holds the bank's own holds, which its pending list need not match, so no re-anchoring while any are listed
-        val kept = if (keep && pendingCount > 0) "KEPT AMOUNT ${previous.toPlainString()}: $pendingCount pending items listed; re-run when they post (or list the account in repair.reanchor)"
-        else if (keep) "KEPT AMOUNT ${previous.toPlainString()}: balance moved by ${moved.setScale(2, RoundingMode.HALF_UP)} " +
+        //  Printed only when keeping made a difference: the computed amount or the date differs from what is stored.
+        val keptMatters = keep && (opening.compareTo(previous) != 0 || date != oldDate)
+        val kept = if (keptMatters && pendingCount > 0) "KEPT AMOUNT ${previous.toPlainString()}: $pendingCount pending ${if (pendingCount == 1) "item" else "items"} listed " +
+                "(computed opening would move by ${moved.setScale(2, RoundingMode.HALF_UP)}); re-run when they post (or list the account in repair.reanchor)"
+        else if (keptMatters) "KEPT AMOUNT ${previous.toPlainString()}: balance moved by ${moved.setScale(2, RoundingMode.HALF_UP)} " +
                 "that Plaid's transactions don't explain yet; re-run after the next sync (or list the account in repair.reanchor)" else null
         return OpeningFix(id, name, oldOpening, oldDate, legacySum, legacyIds, finalOpening, date, direction, skip, missing, sanity, kept)
     }
@@ -432,14 +448,14 @@ class RepairDatesRunner(
     }
 
     private fun print(plan: RepairPlan, input: RepairInput, pending: Map<Int, BigDecimal>) {
-        println("== Dates: ${plan.redates.size} journals to re-date (${summarizeFields(plan.redates)}); ${plan.unmatchedJournals} Plaid journals not found in Plaid's history are reported only, never moved")
-        plan.redates.take(20).forEach { println("   ${it.groupId} ${it.description.take(40)}: ${it.describeChange()}" + if (it.ambiguous) "  (?) matches neither leg" else "") }
+        println(redatesHeader(plan))
+        plan.redates.take(20).forEach { println(redateLine(it)) }
         plan.redates.count { it.ambiguous }.takeIf { it > 0 }?.let { println("   (?) $it of them are two-leg journals whose date matches neither leg: they get the destination leg's date, but a core merge keeps the OUT leg's. Read them before applying.") }
         if (plan.redates.size > 20) println("   ... and ${plan.redates.size - 20} more")
         val winter = plan.redates.filter { it.newDate.monthValue in listOf(12, 1, 2) }
         println("   winter samples (Dec-Feb), ${winter.size} in total:")
         listOf(winter.firstOrNull(), winter.getOrNull(winter.size / 2), winter.lastOrNull()).filterNotNull().distinct().forEach {
-            println("   ${it.groupId} ${it.description.take(40)}: ${it.describeChange()}")
+            println(redateLine(it).replace("  (?) matches neither leg", ""))
         }
         println("== Opening balances (anchor = Plaid current with its listed pending items backed out; pending journals are excluded from the sum of the account's other journals)")
         for (o in plan.openings) {
@@ -455,18 +471,13 @@ class RepairDatesRunner(
             o.sanityNote?.let { println("      ANCHOR SANITY: $it") }
             o.keptAmount?.let { println("      $it") }
         }
-        println("== Firefly balance vs Plaid posted balance (Plaid current with its listed pending items backed out)")
+        println("== Firefly balance vs Plaid current balance (gap = Firefly minus Plaid current; the listed pending items are shown, not part of the gap)")
         for ((id, current) in input.plaidCurrent.toSortedMap()) {
             val account = input.accounts[id] ?: continue
             val owedNegative = BatchSyncRunner.carriesOwedAsNegative(account)
             val target = BigDecimal.valueOf(current).let { if (owedNegative) it.negate() else it }
-            val postedAnchor = target + (pending[id] ?: BigDecimal.ZERO)
             val firefly = account.attributes.currentBalance?.toBigDecimalOrNull() ?: BigDecimal.ZERO
-            val fireflyPosted = firefly + (pending[id] ?: BigDecimal.ZERO)
-            println(
-                "   account $id (${account.attributes.name}): firefly now $firefly, plaid posted $postedAnchor, " +
-                        "gap ${(fireflyPosted - postedAnchor).setScale(2, RoundingMode.HALF_UP)}"
-            )
+            println(balanceLine(id, account.attributes.name, firefly, target, pending[id] ?: BigDecimal.ZERO))
         }
         println("   (a non-zero gap after the repair means Plaid's balance holds something it never lists as a transaction)")
     }

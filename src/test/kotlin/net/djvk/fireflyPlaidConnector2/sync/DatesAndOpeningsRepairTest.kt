@@ -298,6 +298,17 @@ internal class DatesAndOpeningsRepairTest {
     }
 
     @Test
+    fun aMergedTransferWithBothLegsAuthorizedLateIsKeptOutByB1Alone() {
+        val day = LocalDate.of(2026, 9, 23)
+        // R1-M1: the source leg (the one B2 picks) is authorized late too, so only B1 keeps this journal out of the plan
+        val p = plan(
+            listOf(mergedAt(midnight(day))),
+            listOf(plaid("src", day, authorizedDate = day.plusDays(2)), plaid("dst", day, authorizedDate = day.plusDays(9))),
+        )
+        assertThat(p.redates).isEmpty()
+    }
+
+    @Test
     fun whenBothLegsMatchTheBookDateComesFromTheSourceLeg() {
         val day = LocalDate.of(2026, 9, 23)
         val r = plan(
@@ -531,8 +542,36 @@ internal class DatesAndOpeningsRepairTest {
         // anchor 536 + 10 spent = 546 would move the opening by 6, less than the pending total 36: still kept
         val kept = run(setOf())
         assertThat(kept.newOpening!!.toPlainString()).isEqualTo("540.00")
-        assertThat(kept.keptAmount).isEqualTo("KEPT AMOUNT 540.00: 1 pending items listed; re-run when they post (or list the account in repair.reanchor)")
+        assertThat(kept.keptAmount).isEqualTo("KEPT AMOUNT 540.00: 1 pending item listed (computed opening would move by 6.00); re-run when they post (or list the account in repair.reanchor)")
         assertThat(run(setOf(1)).newOpening!!.toPlainString()).isEqualTo("546.00")
+    }
+
+    @Test
+    fun theKeptLineIsPrintedOnlyWhenKeepingChangesSomething() {
+        val day = LocalDate.of(2024, 12, 6)
+        fun run(opening: String, vararg pendingIds: String) = plan(
+            setOf(),
+            listOf(journal("g1", midnight(day), "w1")),
+            listOf(plaid("w1", day)) + pendingIds.map { plaid(it, day.plusDays(1), amount = 18.0, pending = true) },
+            mapOf(1 to 500.0),
+            mapOf(1 to account(ShortAccountTypeProperty.asset, "Checking", opening = opening, openingDate = midnight(day.minusDays(1)))),
+        ).openings.single()
+        // 500 + 36 pending + 10 spent = 546: already stored, so nothing is kept back
+        assertThat(run("546.00", "p1", "p2").keptAmount).isNull()
+        assertThat(run("540.00", "p1", "p2").keptAmount).contains("2 pending items listed")
+    }
+
+    @Test
+    fun theDryRunTextNamesFieldsAndTheBalanceGap() {
+        val d1 = midnight(LocalDate.of(2026, 9, 23))
+        val d2 = midnight(LocalDate.of(2026, 9, 22))
+        val r = Redate("2896", "j", "AC PHILLIP", d1, d1, d2, d1, ambiguous = true, oldBookDate = d1, oldProcessDate = null)
+        assertThat(r.fields).containsExactly("book", "process")
+        assertThat(redateLine(r)).isEqualTo("   2896 AC PHILLIP: book $d1 -> $d2; process - -> $d1  (?) matches neither leg")
+        val plan = RepairPlan(listOf(r), 3, listOf())
+        assertThat(redatesHeader(plan)).startsWith("== Dates: 1 journals to re-date (date 0, book 1, process 1); 3 Plaid journals")
+        assertThat(balanceLine(7, "Old Second", java.math.BigDecimal("1000.00"), java.math.BigDecimal("1017.49"), java.math.BigDecimal("884.48")))
+            .isEqualTo("   account 7 (Old Second): firefly now 1000.00, plaid current 1017.49, listed pending 884.48, gap -17.49 (Firefly minus Plaid current)")
     }
 
     private fun unlisted(reanchor: Set<Int>): OpeningFix {
