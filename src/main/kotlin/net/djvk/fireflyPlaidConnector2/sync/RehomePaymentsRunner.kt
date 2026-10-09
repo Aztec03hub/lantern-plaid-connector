@@ -143,8 +143,13 @@ class RehomePaymentsRunner(
     internal suspend fun reverseLog() {
         val lines = if (logFile.exists()) logFile.readLines().filter { it.isNotBlank() }.map { mapper.readTree(it) } else listOf()
         // N11: a `reversed` line names the `done` line it undid by that line's `at`, so a move made AFTER a reverse is reversed next time
-        val undone = lines.filter { it["status"]?.asText() == "reversed" }.mapNotNull { it["undoes"]?.asText() }.toSet()
-        val todo = lines.filter { it["status"]?.asText() == "done" && it["at"]?.asText() !in undone }.reversed()
+        // W5: an old `reversed` line (no `undoes`) covers every earlier `done` line of the same journal and split, the old rule
+        val reversedLines = lines.withIndex().filter { it.value["status"]?.asText() == "reversed" }
+        val undone = reversedLines.mapNotNull { it.value["undoes"]?.asText() }.toSet()
+        fun coveredByOldReverse(i: Int, l: com.fasterxml.jackson.databind.JsonNode) = reversedLines.any { (j, r) ->
+            j > i && r["undoes"] == null && r["journal"]?.asText() == l["journal"]?.asText() && r["split"]?.asText() == l["split"]?.asText()
+        }
+        val todo = lines.withIndex().filter { (i, l) -> l["status"]?.asText() == "done" && l["at"]?.asText() !in undone && !coveredByOldReverse(i, l) }.map { it.value }.reversed()
         println("== Reverse: ${todo.size} moves to put back")
         todo.forEach { println("   journal ${it["journal"].asText()}: back to destination ${it["oldDestination"].asText()} and leg ${it["oldLeg"].asText()}") }
         if (!apply) { println("DRY RUN: nothing was changed. Add --fireflyPlaidConnector2.repair.apply=true to apply."); return }

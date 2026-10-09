@@ -102,6 +102,10 @@ internal class CounterpartyNamerTest {
         assertThat(namer.canonical(null, "WALMART SUPERCENTER 47")).isEqualTo("Walmart Supercenter")
         listOf("KROGER 12" to "Kroger", "STARBUCKS 12" to "Starbucks", "HOME DEPOT 12" to "Home Depot", "SHELL OIL 12" to "Shell Oil", "TRADER JOES 12" to "Trader Joes")
             .forEach { (raw, shown) -> assertThat(namer.canonical(null, raw)).describedAs(raw).isEqualTo(shown) }
+        // W6: apostrophe spellings and the longer chain names
+        listOf("LOWE'S 12" to "Lowe's", "MCDONALD'S 12" to "Mcdonald's", "TRADER JOE'S 12" to "Trader Joe's", "DUNKIN DONUTS 12" to "Dunkin Donuts", "CVS/PHARMACY 12" to "Cvs/pharmacy")
+            .forEach { (raw, shown) -> assertThat(namer.canonical(null, raw)).describedAs(raw).isEqualTo(shown) }
+        assertThat(k("LOWE'S 12")).isEqualTo(k("LOWE'S 31"))
         // not a chain store number: a check number, and the names that carry a number
         assertThat(namer.canonical(null, "CHECK 12")).isEqualTo("Check 12")
         assertThat(k("Pier 1 Imports")).isNotEqualTo(k("Pier 39 Parking"))

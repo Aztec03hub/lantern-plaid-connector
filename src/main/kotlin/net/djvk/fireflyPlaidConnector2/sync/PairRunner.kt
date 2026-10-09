@@ -58,8 +58,16 @@ class PairRunner(
             val state = PairStateFile.read(settings.directory)
             val gone = state.merges.firstOrNull { it.pairMergeId == id }
             val rejection = gone?.let { RejectedPair(it.out.id, it.inn.id, id, LocalDate.now().toString()) }
-                ?: if (unmergeOut.isNotBlank() && unmergeInn.isNotBlank()) RejectedPair(unmergeOut.trim(), unmergeInn.trim(), id, LocalDate.now().toString())
-                else error(
+                ?: if (unmergeOut.isNotBlank() && unmergeInn.isNotBlank()) {
+                    val out = unmergeOut.trim()
+                    val inn = unmergeInn.trim()
+                    // W1: a typo or swapped ids would record a rejection that never matches; only ids that really are the two legs of one merged journal are accepted
+                    val today = LocalDate.now()
+                    check(pass.isMergedInFirefly(out, inn, today.minusDays(settings.lookbackDays), today)) {
+                        "No merged journal in Firefly has outflow $out and inflow $inn as its two legs. Nothing was unmerged. Check the ids and their order: <outflow plaid id> then <inflow plaid id>."
+                    }
+                    RejectedPair(out, inn, id, LocalDate.now().toString())
+                } else error(
                     "pair_merge_id $id is not in pair-state.json, so the next pass would merge the pair again. Nothing was unmerged. " +
                         "Pass fireflyPlaidConnector2.pair.unmergeOut=<outflow plaid id> and pair.unmergeInn=<inflow plaid id> as well.",
                 )

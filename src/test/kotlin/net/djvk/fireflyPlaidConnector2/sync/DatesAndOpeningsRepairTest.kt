@@ -282,6 +282,17 @@ internal class DatesAndOpeningsRepairTest {
         // a single-link journal, and a pair with one leg unknown to Plaid, are not ambiguous
         assertThat(plan(listOf(journal("gs", midnight(day.minusDays(3)), "w1")), listOf(plaid("w1", day))).redates.single().ambiguous).isFalse()
         assertThat(plan(listOf(merged), listOf(plaid("dst", day))).redates.single().ambiguous).isFalse()
+        // a pair whose date is its OUT leg's, with a stale process date, is redated but is not ambiguous (it matches one leg)
+        val matchesOut = TransactionRead(
+            "transactions", "gm2",
+            FireflyFixtures.getTransaction(
+                type = TransactionTypeProperty.transfer, date = midnight(day.plusDays(1)), amount = "10.00", sourceId = "1", destinationId = "2",
+                processDate = midnight(day.minusDays(3)),
+                plaidLinks = listOf(PlaidLink("src", PlaidLinkLeg.source, plaidAccount), PlaidLink("dst", PlaidLinkLeg.destination, plaidAccount)),
+                transactionJournalId = "jgm2",
+            ), ObjectLink(),
+        )
+        assertThat(plan(listOf(matchesOut), listOf(plaid("src", day.plusDays(1)), plaid("dst", day))).redates.single().ambiguous).isFalse()
     }
 
     @Test

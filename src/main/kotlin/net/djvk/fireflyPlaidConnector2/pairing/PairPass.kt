@@ -158,7 +158,7 @@ class PairPass(
         val result = engine.decide(settled)
 
         val lateFlags = engine.lateCompetitors(
-            stillMerged.mapNotNull { engine.evaluate(it.out, it.inn) },
+            lateCheckable(stillMerged).mapNotNull { engine.evaluate(it.out, it.inn) },
             settled.filter { !it.pending && it.id !in result.proposals.flatMap { p -> listOf(p.edge.out.id, p.edge.inn.id) } },
         )
 
@@ -227,9 +227,10 @@ class PairPass(
      * N1: a merge that core committed although the call failed (5xx, timeout) sits in `failures`, never in `merges`. When both of
      * its Plaid ids now are the source and destination links of one journal, it counts as merged, so a later unmerge is noticed.
      * The inflow leg only has the outflow's date and amount here (core keeps the OUT leg's journal); ids and accounts are exact.
+     * W4: such a merge carries [RECOVERED_ID] and is never fed to the late-competitor check, which would score the made-up leg.
      */
     internal fun recoverCommittedMerges(state: PairState, journals: List<TransactionRead>): List<StoredMerge> =
-        state.failures.filter { f -> state.merges.none { it.out.id == f.out && it.inn.id == f.inn } }.mapNotNull { f ->
+        state.failures.mapNotNull { f ->
             journals.firstNotNullOfOrNull { g ->
                 val s = g.attributes.transactions.singleOrNull() ?: return@firstNotNullOfOrNull null
                 val links = s.plaidLinks.orEmpty()
@@ -241,12 +242,16 @@ class PairPass(
                 if (!merged || src == null || dst == null || cents == null) return@firstNotNullOfOrNull null
                 val date = s.date.atZoneSameInstant(zone).toLocalDate()
                 StoredMerge(
-                    "unknown",
+                    RECOVERED_ID,
                     Leg(f.out, src, Dir.OUT, date, cents, s.description, currency = s.currencyCode, groupId = g.id),
                     Leg(f.inn, dst, Dir.IN, date, cents, s.description, currency = s.currencyCode, groupId = g.id),
                 )
             }
         }
+
+    /** W1: whether one journal in [from]..[to] carries [out] as its source link and [inn] as its destination link (a merged pair). */
+    suspend fun isMergedInFirefly(out: String, inn: String, from: LocalDate, to: LocalDate): Boolean =
+        recoverCommittedMerges(PairState(failures = listOf(PairFailure(out, inn, "", ""))), service.fetchFireflyTransactionsStrictly(from, to, MAX_PAGES)).isNotEmpty()
 
     private fun watermarks(now: Instant): Map<Int, LocalDate?> {
         val statuses = kotlinx.coroutines.runBlocking { itemStatusStore.read() }
@@ -296,6 +301,11 @@ class PairPass(
 
     companion object {
         const val MAX_PAGES = 5000
+        /** The `pairMergeId` of a merge found again in Firefly rather than made by this pass: its inflow leg is not the real one (W4). */
+        const val RECOVERED_ID = "unknown"
+
+        /** The stored merges whose two legs are real, i.e. fit for the late-competitor check (W4). */
+        internal fun lateCheckable(merges: List<StoredMerge>): List<StoredMerge> = merges.filter { it.pairMergeId != RECOVERED_ID }
         private val STAMP = java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ssxxx")
 
         /** N0: the one place a version stamp is built: always seconds, an offset like `+00:00`, never `Z` (lowercase xxx) and never a dropped `:00`. */
@@ -356,7 +366,7 @@ object PairStateFile {
         // N4: v2 is a one-way format (an old jar fails on it and starts empty); keep the v1 file the first time it is upgraded
         val current = dir.resolve("pair-state.json")
         val bak = dir.resolve("pair-state.json.v1.bak")
-        if (Files.exists(current) && !Files.exists(bak) && !Files.readString(current).contains("\"version\"")) Files.copy(current, bak)
+        if (Files.exists(current) && !Files.exists(bak) && !mapper.readTree(current.toFile()).has("version")) Files.copy(current, bak)
         val tmp = dir.resolve("pair-state.json.tmp")
         Files.writeString(tmp, mapper.writeValueAsString(state))
         Files.move(tmp, dir.resolve("pair-state.json"), java.nio.file.StandardCopyOption.ATOMIC_MOVE, java.nio.file.StandardCopyOption.REPLACE_EXISTING)

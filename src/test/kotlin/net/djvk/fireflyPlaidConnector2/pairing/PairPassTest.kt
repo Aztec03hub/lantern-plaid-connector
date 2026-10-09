@@ -512,10 +512,10 @@ internal class PairPassTest {
         assertThat(w.merges).hasSize(2)
     }
 
-    private fun runnerFor(w: World, api: PairApi, unmerge: String, out: String = "", inn: String = "") =
+    private fun runnerFor(w: World, api: PairApi, unmerge: String, out: String = "", inn: String = "", force: Boolean = false) =
         PairRunner(
             mock<SyncHelper>(), mock<TransactionConverter>(), pass(w, dryRun = false),
-            PairSettings(dryRun = false, directory = dir.toString(), timeZone = "UTC", pendingTag = "pending"), api, unmerge = unmerge, unmergeOut = out, unmergeInn = inn,
+            PairSettings(dryRun = false, directory = dir.toString(), timeZone = "UTC", pendingTag = "pending"), api, unmerge = unmerge, unmergeForce = force, unmergeOut = out, unmergeInn = inn,
         )
 
     private fun passWith(w: World, api: PairApi): PairPass {
@@ -530,9 +530,8 @@ internal class PairPassTest {
         val w = World().also { it.payment(1) }
         pass(w, dryRun = false).run(d.minusDays(5), today, now = now)
         Files.delete(stateFile()) // the merge was never recorded
-        w.unmerge("m1")
         val calls = mutableListOf<String>()
-        val api = object : PairApi() { override suspend fun unmerge(pairMergeId: String, force: Boolean) { calls.add(pairMergeId) } }
+        val api = object : PairApi() { override suspend fun unmerge(pairMergeId: String, force: Boolean) { calls.add(pairMergeId); w.unmerge(pairMergeId) } }
         org.assertj.core.api.Assertions.assertThatThrownBy { runnerFor(w, api, "m1").run() }.hasMessageContaining("not in pair-state.json").hasMessageContaining("unmergeOut")
         assertThat(calls).isEmpty() // core was not touched
         runnerFor(w, api, "m1", "out1", "in1").run()
@@ -540,6 +539,69 @@ internal class PairPassTest {
         pass(w, dryRun = false).run(d.minusDays(5), today, now = now)
         assertThat(w.merges).hasSize(1) // not merged again
         assertThat(PairStateFile.read(dir.toString()).rejected.single().out).isEqualTo("out1")
+    }
+
+    @Test
+    fun anUnmergeWithIdsThatAreNotTheTwoLegsOfAMergedJournalStopsBeforeCore() = runBlocking<Unit> {  // W1
+        val w = World().also { it.payment(1); it.payment(2, 20_000, d.plusDays(3)) }
+        pass(w, dryRun = false).run(d.minusDays(5), today, now = now)
+        Files.delete(stateFile())
+        val calls = mutableListOf<Pair<String, Boolean>>()
+        val api = object : PairApi() { override suspend fun unmerge(pairMergeId: String, force: Boolean) { calls.add(pairMergeId to force) } }
+        for ((o, i) in listOf("in1" to "out1", "out1" to "in2", "oot1" to "in1")) { // swapped, another pair's inflow, a typo
+            org.assertj.core.api.Assertions.assertThatThrownBy { runnerFor(w, api, "m1", o, i).run() }.hasMessageContaining("No merged journal")
+        }
+        assertThat(calls).isEmpty()
+        // the ids of the real pair pass, and --force is handed to core as given
+        runnerFor(w, api, "m1", "out1", "in1", force = true).run()
+        runnerFor(w, api, "m2", "out2", "in2").run()
+        assertThat(calls).containsExactly("m1" to true, "m2" to false)
+    }
+
+    @Test
+    fun aVersionOneFileHoldingAStoredMergeStillGetsItsBackup() = runBlocking<Unit> {  // V1: every stored merge holds a Leg with a `version` key
+        val w = World().also { it.payment(1) }
+        pass(w, dryRun = false).run(d.minusDays(5), today, now = now)
+        val tree = com.fasterxml.jackson.databind.ObjectMapper().readTree(stateFile().toFile()) as com.fasterxml.jackson.databind.node.ObjectNode
+        tree.remove(listOf("version", "rejected", "failures"))
+        val v1 = tree.toString()
+        assertThat(v1).contains("\"version\"").contains("\"merges\":[{") // the substring that fooled the old test
+        Files.writeString(stateFile(), v1)
+        w.payment(2, 20_000, d.plusDays(3))
+        pass(w, dryRun = false).run(d.minusDays(5), today, now = now)
+        assertThat(Files.readString(dir.resolve("pair-state.json.v1.bak"))).isEqualTo(v1)
+        assertThat(PairStateFile.read(dir.toString()).merges).hasSize(2)
+        // the file is version 2 now: a later real pass makes no backup of it
+        Files.delete(dir.resolve("pair-state.json.v1.bak"))
+        w.payment(3, 30_000, d.plusDays(6))
+        pass(w, dryRun = false).run(d.minusDays(5), today, now = now)
+        assertThat(Files.exists(dir.resolve("pair-state.json.v1.bak"))).isFalse()
+    }
+
+    @Test
+    fun recoveryNeedsBothPlaidIdsOfTheFailedPairOnOneMergedJournalAndTheRecoveredMergeIsNotLateChecked() = runBlocking<Unit> {  // W7, W4
+        val w = World().also { it.payment(1); it.payment(2, 20_000, d.plusDays(3)) }
+        val p = pass(w, dryRun = false)
+        p.run(d.minusDays(5), today, now = now)
+        val journals = w.journals.values.toList()
+        fun failure(o: String, i: String) = PairState(failures = listOf(PairFailure(o, i, "2026-03-01", "timeout")))
+        assertThat(p.recoverCommittedMerges(failure("out1", "in2"), journals)).describedAs("another pair's inflow").isEmpty()
+        assertThat(p.recoverCommittedMerges(failure("out9", "in1"), journals)).describedAs("an outflow that is on no journal").isEmpty()
+        val got = p.recoverCommittedMerges(failure("out1", "in1"), journals).single()
+        assertThat(got.pairMergeId).isEqualTo(PairPass.RECOVERED_ID)
+        assertThat(got.out.id to got.inn.id).isEqualTo("out1" to "in1")
+        assertThat(PairPass.lateCheckable(listOf(got))).isEmpty() // its inflow leg is made up
+        assertThat(PairPass.lateCheckable(PairStateFile.read(dir.toString()).merges)).hasSize(2)
+    }
+
+    @Test
+    fun forgivingAPairThatIsNotRejectedFailsAndChangesNothing() = runBlocking<Unit> {  // W7
+        val w = World().also { it.payment(1) }
+        val settings = PairSettings(dryRun = false, directory = dir.toString(), timeZone = "UTC", pendingTag = "pending")
+        org.assertj.core.api.Assertions.assertThatThrownBy {
+            PairRunner(mock<SyncHelper>(), mock<TransactionConverter>(), pass(w, dryRun = false), settings, PairApi(), forgive = "out1,in1").run()
+        }.hasMessageContaining("not in the rejected list")
+        assertThat(Files.exists(stateFile())).isFalse()
     }
 
     @Test

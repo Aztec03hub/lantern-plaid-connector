@@ -172,6 +172,19 @@ internal class RehomePaymentsRunnerTest {
     }
 
     @Test
+    fun anOldReversedLineWithoutUndoesStillCoversTheEarlierDoneLinesOfItsJournal() = runBlocking<Unit> {  // W5: lines written by f32667e
+        File(dir, "rehome_log.jsonl").writeText(
+            done("50", "60", "2026-10-01T01:00:00Z") + "\n" +
+                """{"status":"reversed","journal":"a","split":"ja","at":"2026-10-02T01:00:00Z"}""" + "\n" +
+                done("50", "60", "2026-10-05T01:00:00Z") + "\n", // a later move, after the old reverse
+        )
+        runner(true, emptyList(), reverse = true).reverseLog()
+        val upd = argumentCaptor<TransactionUpdate>()
+        verify(txApi, org.mockito.kotlin.times(1)).updateTransaction(any(), upd.capture())
+        assertThat(upd.firstValue.transactions!!.single().destinationId).isEqualTo("50")
+    }
+
+    @Test
     fun aRuleAnchoredOnTheOriginalTextMatchesTheBackfillToo() = runBlocking<Unit> {  // L4: the stored text is "merchant: original text"
         val r = runner(false, listOf(journal("a", "400.00", desc = "PHIL: XXXX0198 ACH")), match = "^XXXX0198")
         assertThat(r.readPlan().map { it.journalId to it.to }).containsExactly("a" to 2)

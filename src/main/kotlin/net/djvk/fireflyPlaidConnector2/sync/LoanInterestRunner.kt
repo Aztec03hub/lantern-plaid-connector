@@ -98,9 +98,13 @@ class LoanInterestRunner(
     override fun run() = runBlocking<Unit> {
         val plans = runOnce(apply)
         val held = plans.filter { it.action.startsWith("HELD") }
-        check(held.isEmpty()) { "loan-interest: ${held.size} loan(s) HELD, nothing written: ${held.map { it.loan.account }}" }
+        // V3: track first, so a night with a HELD loan still records the recovery of the others
         val stuck = trackLag(plans)
-        check(stuck.isEmpty()) { "loan-interest: loan(s) $stuck have been \"Firefly lags\" for $lagNights or more nights; a payment Plaid has seen is probably missing in Firefly" }
+        val parts = listOfNotNull(
+            held.takeIf { it.isNotEmpty() }?.let { "${it.size} loan(s) HELD, nothing written: ${it.map { h -> h.loan.account }}" },
+            stuck.takeIf { it.isNotEmpty() }?.let { "loan(s) $it have been \"Firefly lags\" for $lagNights or more nights; a payment Plaid has seen is probably missing in Firefly" },
+        )
+        check(parts.isEmpty()) { "loan-interest: " + parts.joinToString(" | ") }
     }
 
     /**
@@ -110,12 +114,19 @@ class LoanInterestRunner(
     private fun trackLag(plans: List<LoanPlan>): List<Int> {
         if (!apply || lagDirectory.isBlank()) return listOf()
         val file = File(lagDirectory, "loan-lag.json")
-        @Suppress("UNCHECKED_CAST")
-        val old = if (file.exists()) runCatching { ObjectMapper().readValue(file, Map::class.java) as Map<String, String> }.getOrDefault(mapOf()) else mapOf()
+        val old: Map<String, String> = if (file.exists()) runCatching { ObjectMapper().readValue(file, Map::class.java).entries.associate { it.key.toString() to it.value.toString() } }
+            .onFailure { println("WARN: ${file.path} cannot be read (${it.message?.lineSequence()?.firstOrNull()}); the lag counters start again") }.getOrDefault(mapOf()) else mapOf()
         val now = today()
-        val lagging = plans.filter { it.action.startsWith("Firefly lags") }.associate { it.loan.account.toString() to (old[it.loan.account.toString()] ?: now.toString()) }
+        // a hand-edited date that does not parse counts as "first lagged tonight"
+        val lagging = plans.filter { it.action.startsWith("Firefly lags") }.associate {
+            val k = it.loan.account.toString()
+            k to (old[k]?.takeIf { d -> runCatching { LocalDate.parse(d) }.isSuccess } ?: now.toString())
+        }
         File(lagDirectory).mkdirs()
-        file.writeText(ObjectMapper().writeValueAsString(lagging))
+        // W3: temp file then atomic move, so a kill mid-write leaves the old file whole
+        val tmp = File(lagDirectory, "loan-lag.json.tmp")
+        tmp.writeText(ObjectMapper().writeValueAsString(lagging))
+        java.nio.file.Files.move(tmp.toPath(), file.toPath(), java.nio.file.StandardCopyOption.ATOMIC_MOVE, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
         return lagging.filterValues { ChronoUnit.DAYS.between(LocalDate.parse(it), now) >= lagNights - 1 }.keys.map { it.toInt() }
     }
 

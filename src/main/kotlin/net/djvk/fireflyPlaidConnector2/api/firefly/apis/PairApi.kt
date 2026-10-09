@@ -9,6 +9,7 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import io.ktor.client.*
 import io.ktor.client.engine.*
 import io.ktor.client.plugins.ClientRequestException
+import io.ktor.client.plugins.ServerResponseException
 import io.ktor.client.statement.bodyAsText
 import net.djvk.fireflyPlaidConnector2.api.firefly.infrastructure.*
 import org.springframework.beans.factory.annotation.Value
@@ -44,6 +45,21 @@ open class PairApi(
 
     /** POST /api/v1/plaid-links/pair. 409/422 are returned as [PairMergeOutcome.Rejected]; every other error is thrown. */
     open suspend fun merge(request: PairMergeRequest): PairMergeOutcome {
+        try {
+            return mergeOnce(request)
+        } catch (e: ServerResponseException) {
+            if (e.response.status.value != 503) throw e
+            // W2: core's 503 `busy` (a journal is being written at that moment) is a retry, not a failed pair; once, after Retry-After
+            val wait = e.response.headers["Retry-After"]?.toLongOrNull()?.coerceIn(0, 5) ?: 1
+            retryPause(wait * 1000)
+            return mergeOnce(request)
+        }
+    }
+
+    /** The sleep before the one retry of a busy core; a test overrides it. */
+    internal open suspend fun retryPause(millis: Long) = kotlinx.coroutines.delay(millis)
+
+    private suspend fun mergeOnce(request: PairMergeRequest): PairMergeOutcome {
         val body = mapOf(
             "keep_group_id" to request.keepGroupId,
             "absorb_group_id" to request.absorbGroupId,

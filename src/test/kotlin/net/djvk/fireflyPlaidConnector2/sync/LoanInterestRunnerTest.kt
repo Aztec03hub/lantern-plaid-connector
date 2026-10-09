@@ -385,4 +385,40 @@ internal class LoanInterestRunnerTest {
         day = d(10, 4); night("23817.40") // healthy again: the count starts over
         day = d(10, 5); night(); day = d(10, 6); night()
     }
+
+    @Test
+    fun aNightWithAHeldLoanStillRecordsTheRecoveryOfTheLagCount() {  // V3
+        val lagDir = File(dir, "lag").path
+        var day = d(10, 1)
+        fireflyOwed = BigDecimal("23817.37")
+        runner("23427.28", chargedThenNew, hold = true, lagDir = lagDir).also { it.today = { day } }.run() // lags: the clock starts on 10-01
+        day = d(10, 2); fireflyOwed = BigDecimal("23417.37"); owedBefore[d(8, 31)] = "23817.37"
+        // the loan is HELD tonight (a gap of 300 is not explained): the run fails, but the lag file must have been brought up to date
+        org.junit.jupiter.api.assertThrows<IllegalStateException> { runner("23717.37", chargedThenNew, hold = true, lagDir = lagDir).also { it.today = { day } }.run() }
+        assertThat(File(lagDir, "loan-lag.json").readText()).isEqualTo("{}")
+        day = d(10, 3); fireflyOwed = BigDecimal("23817.37")
+        runner("23427.28", chargedThenNew, hold = true, lagDir = lagDir).also { it.today = { day } }.run() // lags again, but only for its first night
+    }
+
+    @Test
+    fun aDryRunLeavesTheLagFileAlone() {  // V3: the `!apply` gate
+        val lagDir = File(dir, "lag")
+        fireflyOwed = BigDecimal("23817.37")
+        runner("23427.28", chargedThenNew, apply = false, lagDir = lagDir.path).also { it.today = { d(10, 1) } }.run()
+        assertThat(File(lagDir, "loan-lag.json")).doesNotExist()
+    }
+
+    @Test
+    fun aCorruptOrHandEditedLagFileNeverFailsTheLoanStepAndIsReplacedWhole() {  // W3
+        val lagDir = File(dir, "lag").also { it.mkdirs() }
+        val file = File(lagDir, "loan-lag.json")
+        fireflyOwed = BigDecimal("23817.37")
+        file.writeText("{not json")
+        runner("23427.28", chargedThenNew, hold = true, lagDir = lagDir.path).also { it.today = { d(10, 1) } }.run()
+        assertThat(file.readText()).isEqualTo("""{"2":"2026-10-01"}""")
+        file.writeText("""{"2":"yesterday"}""")
+        runner("23427.28", chargedThenNew, hold = true, lagDir = lagDir.path).also { it.today = { d(10, 2) } }.run()
+        assertThat(file.readText()).isEqualTo("""{"2":"2026-10-02"}""")
+        assertThat(lagDir.list()!!.toList()).containsExactly("loan-lag.json") // no .tmp left behind
+    }
 }

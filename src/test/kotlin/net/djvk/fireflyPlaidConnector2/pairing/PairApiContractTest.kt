@@ -116,6 +116,18 @@ internal class PairApiContractTest {
     }
 
     @Test
+    fun aBusy503IsRetriedOnceAndOtherServerErrorsAreNot() = runBlocking<Unit> {  // W2
+        val (core, keep, absorb) = world()
+        core.refuseNext = 503 to "busy"
+        assertThat(core.api().merge(request(keep, absorb))).isInstanceOf(PairMergeOutcome.Merged::class.java)
+        assertThat(core.requestLog().map { it.first }).containsExactly(HttpMethod.Post, HttpMethod.Post)
+        val (core2, keep2, absorb2) = world()
+        core2.refuseNext = 500 to "boom"
+        assertThat(runCatching { core2.api().merge(request(keep2, absorb2)) }.exceptionOrNull()).isNotNull()
+        assertThat(core2.requestLog()).hasSize(1) // no retry for a 500
+    }
+
+    @Test
     fun aRefusalWithoutAReasonBodyIsStillARefusalWithTheStatus() = runBlocking<Unit> {
         val (core, keep, absorb) = world()
         // the fake answers an empty reason: the client falls back to "HTTP <status>"
