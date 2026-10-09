@@ -83,6 +83,9 @@ class PolledSyncOrchestrator(
     /** Pairs what is left unpaired in Firefly after each poll's writes (when pair.afterRun is on); null (tests) skips it. */
     private val pairPass: PairPass? = null,
     private val pairSettings: PairSettings? = null,
+
+    /** How the one-shot mode (`maxIterations > 0`) ends the process; a lambda so tests can see the exit code. */
+    private val exit: (Int) -> Unit = { kotlin.system.exitProcess(it) },
 ) : Runner, DisposableBean {
     private val logger = LoggerFactory.getLogger(this::class.java)
 
@@ -497,13 +500,13 @@ class PolledSyncOrchestrator(
     /**
      * One iteration of the polling loop. A failed iteration (network down, Plaid or Firefly error) must not kill the
      * loop: cursors are only committed on success, so the next iteration retries the same data. Never throws, except
-     * for cancellation.
+     * for cancellation. Returns whether the iteration succeeded: the one-shot mode turns that into the exit code.
      */
     suspend fun pollOnce(
         accountMap: Map<PlaidAccountId, FireflyAccountId>,
         accountAccessTokenSequence: Sequence<Pair<PlaidAccessToken, List<PlaidAccountId>>>,
         cursorMap: MutableMap<PlaidAccessToken, PlaidSyncCursor>,
-    ) {
+    ): Boolean {
         logger.debug("Polling loop start")
         try {
             // Optionally nudge Plaid to check for new data; it arrives on a later poll
@@ -514,6 +517,7 @@ class PolledSyncOrchestrator(
                 logger.info("Poll recovered after $consecutiveFailures failed iteration(s)")
             }
             consecutiveFailures = 0
+            return true
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -522,34 +526,55 @@ class PolledSyncOrchestrator(
                 "Poll iteration failed ($consecutiveFailures consecutive); " +
                         "retrying in $syncFrequencyMinutes minutes", e
             )
+            return false
         }
+    }
+
+    /**
+     * Startup work. The service waits for a network that is down (a host that boots before its network is up); a one-shot
+     * job (`maxIterations > 0`) must not: it fails at once, so a second cron run does not queue behind a hung first one.
+     */
+    internal suspend fun <T> startup(block: suspend () -> T): T =
+        if (maxIterations > 0) block() else retryWhileNetworkDown("startup", block = block)
+
+    /** In one-shot mode, after the last iteration: ends the process with 0 for a good poll and 1 for a failed one. */
+    internal fun stopIfDone(ok: Boolean): Boolean {
+        if (maxIterations <= 0 || ++iterations < maxIterations) return false
+        logger.info("Stopping after $iterations poll iteration(s) (polled.maxIterations), ${if (ok) "ok" else "FAILED"}")
+        // ponytail: exits the JVM (shutdown hooks still run); a scheduler-friendly one-shot mode if this grows
+        exit(if (ok) 0 else 1)
+        return true
     }
 
     override fun run() {
         runBlocking {
             mainJob = launch {
-                val (accountMap, accountAccessTokenSequence, cursorMap) = retryWhileNetworkDown("startup") {
-                    syncHelper.setApiCreds()
-                    converter.accountKinds = syncHelper.fetchAccountKinds()
+                val (accountMap, accountAccessTokenSequence, cursorMap) = try {
+                    startup {
+                        syncHelper.setApiCreds()
+                        converter.accountKinds = syncHelper.fetchAccountKinds()
 
-                    // Initialize cursors
-                    initializeCursors()
+                        // Initialize cursors
+                        initializeCursors()
 
-                    // Get account mappings for the polling loop
-                    val (accountMap, accountAccessTokenSequence) = syncHelper.getAllPlaidAccessTokenAccountIdSets()
-                    Triple(accountMap, accountAccessTokenSequence, cursorManager.readCursorMap())
+                        // Get account mappings for the polling loop
+                        val (accountMap, accountAccessTokenSequence) = syncHelper.getAllPlaidAccessTokenAccountIdSets()
+                        Triple(accountMap, accountAccessTokenSequence, cursorManager.readCursorMap())
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    if (maxIterations <= 0) throw e
+                    logger.error("One-shot poll could not start", e)
+                    exit(1)
+                    return@launch
                 }
 
                 /**
                  * Periodic polling loop
                  */
                 do {
-                    pollOnce(accountMap, accountAccessTokenSequence, cursorMap)
-                    if (maxIterations > 0 && ++iterations >= maxIterations) {
-                        logger.info("Stopping after $iterations poll iteration(s) (polled.maxIterations)")
-                        // ponytail: exits the JVM (shutdown hooks still run); a scheduler-friendly one-shot mode if this grows
-                        kotlin.system.exitProcess(0)
-                    }
+                    if (stopIfDone(pollOnce(accountMap, accountAccessTokenSequence, cursorMap))) return@launch
 
                     // Trigger GC to try to reduce heap size
                     logger.trace("Calling System.gc()")

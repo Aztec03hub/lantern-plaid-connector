@@ -88,7 +88,11 @@ class LoanInterestRunner(
     private val zone = ZoneId.of(timeZoneString)
     private val tolerance = BigDecimal.valueOf(tolerance)
 
-    override fun run() = runBlocking<Unit> { runOnce(apply) }
+    /** A loan left HELD exits non-zero, so the nightly prints its "!!" line instead of looking fine (A1). */
+    override fun run() = runBlocking<Unit> {
+        val held = runOnce(apply).filter { it.action.startsWith("HELD") }
+        check(held.isEmpty()) { "loan-interest: ${held.size} loan(s) HELD, nothing written: ${held.map { it.loan.account }}" }
+    }
 
     /** One pass, also callable by a later nightly job. Apply re-reads every loan it wrote to and fails if a gap is left. */
     suspend fun runOnce(apply: Boolean = this.apply): List<LoanPlan> {

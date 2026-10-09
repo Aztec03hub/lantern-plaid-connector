@@ -217,6 +217,20 @@ internal class LoanInterestRunnerTest {
     // ---- K2 regression tests ----
 
     @Test
+    fun aHeldLoanMakesTheRunFailSoTheNightlyShowsIt() {  // A1
+        owedBefore[d(8, 31)] = "23817.37"
+        val e = org.junit.jupiter.api.assertThrows<IllegalStateException> { runner("23717.37", chargedThenNew, hold = true).run() }
+        assertThat(e.message).contains("HELD").contains("[2]")
+        assertThat(stored()).isEmpty()
+    }
+
+    @Test
+    fun aGoodRunDoesNotThrow() {
+        owedBefore[d(8, 31)] = "23817.37"
+        runner("23491.66", chargedThenNew, hold = true).run()
+    }
+
+    @Test
     fun theConnectorsOwnUnexplainedDepositIsNeverAPayment() = runBlocking<Unit> {  // M1
         owedBefore[d(8, 31)] = "23817.37"
         val rows = chargedThenNew + journal("u", "2.00", d(8, 20), "Unexplained change in $name", deposit = true, tags = listOf("lantern-unexplained"))
