@@ -291,6 +291,13 @@ internal class DatesAndOpeningsRepairTest {
     }
 
     @Test
+    fun anAuthorizedDateOnThePostedDayIsStillABookDate() {
+        val day = LocalDate.of(2026, 9, 23)
+        val r = plan(listOf(journal("gs", midnight(day), "w1")), listOf(plaid("w1", day, authorizedDate = day))).redates.single()
+        assertThat(r.newBookDate).isEqualTo(midnight(day))
+    }
+
+    @Test
     fun whenBothLegsMatchTheBookDateComesFromTheSourceLeg() {
         val day = LocalDate.of(2026, 9, 23)
         val r = plan(
