@@ -74,7 +74,7 @@ class CounterpartyNamer(private val aliases: Map<String, String> = mapOf()) {
         // ponytail: a fixed list; a 1-2 digit number cannot be told from part of a name ("Studio 54", "Pier 1") without knowing the chain.
         // Add a chain here when its stores show up as separate payees.
         private val CHAIN_STORE = Regex(
-            "^(?i)(walmart supercenter|walmart|target|starbucks|kroger|home depot|shell oil|shell|cvs[ /]pharmacy|cvs|trader joe'?s|lowe'?s|costco|walgreens|mcdonald'?s|dunkin( donuts)?)\\s+\\d{1,2}\\b.*$",
+            "^(?i)(walmart supercenter|walmart|target|starbucks|kroger|home depot|shell oil|shell|cvs[ /]pharmacy|cvs|trader joe['\u2019]?s|lowe['\u2019]?s|costco|walgreens|mcdonald['\u2019]?s|dunkin( donuts)?)\\s+\\d{1,2}\\b.*$",
         )
 
         /** Prefixes whose text after the colon is a person, not a bank spelling of the prefix ("Zelle: JOHN SMITH"). */

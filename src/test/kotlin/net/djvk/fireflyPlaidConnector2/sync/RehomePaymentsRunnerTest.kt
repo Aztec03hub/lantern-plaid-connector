@@ -148,8 +148,8 @@ internal class RehomePaymentsRunnerTest {
         verify(txApi, org.mockito.kotlin.times(2)).updateTransaction(any(), any())
     }
 
-    private fun done(old: String, new: String, at: String) =
-        """{"status":"done","journal":"a","split":"ja","oldDestination":"$old","newDestination":"$new","plaidTx":"pa","plaidAccount":"plaid1","oldLeg":"single","at":"$at"}"""
+    private fun done(old: String, new: String, at: String, journal: String = "a", split: String = "j$journal") =
+        """{"status":"done","journal":"$journal","split":"$split","oldDestination":"$old","newDestination":"$new","plaidTx":"pa","plaidAccount":"plaid1","oldLeg":"single","at":"$at"}"""
 
     @Test
     fun aJournalMovedTwiceIsReversedNewestFirstSoItEndsOnItsFirstDestination() = runBlocking<Unit> {  // N11
@@ -177,6 +177,32 @@ internal class RehomePaymentsRunnerTest {
             done("50", "60", "2026-10-01T01:00:00Z") + "\n" +
                 """{"status":"reversed","journal":"a","split":"ja","at":"2026-10-02T01:00:00Z"}""" + "\n" +
                 done("50", "60", "2026-10-05T01:00:00Z") + "\n", // a later move, after the old reverse
+        )
+        runner(true, emptyList(), reverse = true).reverseLog()
+        val upd = argumentCaptor<TransactionUpdate>()
+        verify(txApi, org.mockito.kotlin.times(1)).updateTransaction(any(), upd.capture())
+        assertThat(upd.firstValue.transactions!!.single().destinationId).isEqualTo("50")
+    }
+
+    @Test
+    fun anOldReversedLineCoversOnlyTheSameJournalAndSplit() = runBlocking<Unit> {  // L1: pins the journal and the split match
+        File(dir, "rehome_log.jsonl").writeText(
+            done("50", "60", "2026-10-01T01:00:00Z", "a") + "\n" +                    // covered by the old reverse below
+                done("51", "61", "2026-10-01T02:00:00Z", "b", split = "ja") + "\n" +  // other journal, same split: not covered
+                done("52", "62", "2026-10-01T03:00:00Z", "a", split = "jx") + "\n" +  // same journal, other split: not covered
+                """{"status":"reversed","journal":"a","split":"ja","at":"2026-10-02T01:00:00Z"}""" + "\n",
+        )
+        runner(true, emptyList(), reverse = true).reverseLog()
+        val upd = argumentCaptor<TransactionUpdate>()
+        verify(txApi, org.mockito.kotlin.times(2)).updateTransaction(any(), upd.capture())
+        assertThat(upd.allValues.map { it.transactions!!.single().destinationId }).containsExactly("52", "51")
+    }
+
+    @Test
+    fun aNewStyleReversedLineCoversOnlyTheLineItUndid() = runBlocking<Unit> {  // L1: pins the undoes == null test
+        File(dir, "rehome_log.jsonl").writeText(
+            done("50", "60", "2026-10-01T01:00:00Z") + "\n" + done("60", "70", "2026-10-02T01:00:00Z") + "\n" +
+                """{"status":"reversed","journal":"a","split":"ja","undoes":"2026-10-02T01:00:00Z","at":"2026-10-03T01:00:00Z"}""" + "\n", // crash before the earlier move was undone
         )
         runner(true, emptyList(), reverse = true).reverseLog()
         val upd = argumentCaptor<TransactionUpdate>()

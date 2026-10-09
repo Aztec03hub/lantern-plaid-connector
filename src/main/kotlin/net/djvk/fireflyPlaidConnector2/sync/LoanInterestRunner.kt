@@ -118,10 +118,16 @@ class LoanInterestRunner(
             .onFailure { println("WARN: ${file.path} cannot be read (${it.message?.lineSequence()?.firstOrNull()}); the lag counters start again") }.getOrDefault(mapOf()) else mapOf()
         val now = today()
         // a hand-edited date that does not parse counts as "first lagged tonight"
-        val lagging = plans.filter { it.action.startsWith("Firefly lags") }.associate {
+        // L3: a HELD night neither starts nor resets the clock; a loan that alternates lagging and HELD keeps its first date
+        val lagging = plans.mapNotNull {
             val k = it.loan.account.toString()
-            k to (old[k]?.takeIf { d -> runCatching { LocalDate.parse(d) }.isSuccess } ?: now.toString())
-        }
+            val prior = old[k]?.takeIf { d -> runCatching { LocalDate.parse(d) }.isSuccess }
+            when {
+                it.action.startsWith("Firefly lags") -> k to (prior ?: now.toString())
+                it.action.startsWith("HELD") && prior != null -> k to prior
+                else -> null
+            }
+        }.toMap()
         File(lagDirectory).mkdirs()
         // W3: temp file then atomic move, so a kill mid-write leaves the old file whole
         val tmp = File(lagDirectory, "loan-lag.json.tmp")

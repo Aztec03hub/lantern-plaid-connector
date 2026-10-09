@@ -549,7 +549,7 @@ internal class PairPassTest {
         val calls = mutableListOf<Pair<String, Boolean>>()
         val api = object : PairApi() { override suspend fun unmerge(pairMergeId: String, force: Boolean) { calls.add(pairMergeId to force) } }
         for ((o, i) in listOf("in1" to "out1", "out1" to "in2", "oot1" to "in1")) { // swapped, another pair's inflow, a typo
-            org.assertj.core.api.Assertions.assertThatThrownBy { runnerFor(w, api, "m1", o, i).run() }.hasMessageContaining("No merged journal")
+            org.assertj.core.api.Assertions.assertThatThrownBy { runnerFor(w, api, "m1", o, i).run() }.hasMessageContaining("No merged journal").hasMessageContaining("days")
         }
         assertThat(calls).isEmpty()
         // the ids of the real pair pass, and --force is handed to core as given

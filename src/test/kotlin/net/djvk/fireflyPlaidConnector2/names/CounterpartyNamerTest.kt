@@ -100,6 +100,7 @@ internal class CounterpartyNamerTest {
         assertThat(namer.canonical(null, "TARGET 12 CHICAGO IL")).isEqualTo("Target")
         assertThat(k("TARGET 12 CHICAGO IL")).isEqualTo(k("TARGET 31 NAPERVILLE IL"))
         assertThat(namer.canonical(null, "WALMART SUPERCENTER 47")).isEqualTo("Walmart Supercenter")
+        assertThat(namer.canonical(null, "LOWE\u2019S 12")).isEqualTo("Lowe\u2019s")
         listOf("KROGER 12" to "Kroger", "STARBUCKS 12" to "Starbucks", "HOME DEPOT 12" to "Home Depot", "SHELL OIL 12" to "Shell Oil", "TRADER JOES 12" to "Trader Joes")
             .forEach { (raw, shown) -> assertThat(namer.canonical(null, raw)).describedAs(raw).isEqualTo(shown) }
         // W6: apostrophe spellings and the longer chain names

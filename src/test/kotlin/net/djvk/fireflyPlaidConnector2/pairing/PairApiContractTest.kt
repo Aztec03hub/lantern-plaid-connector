@@ -128,6 +128,17 @@ internal class PairApiContractTest {
     }
 
     @Test
+    fun theRetryPauseFollowsRetryAfterCappedAtFiveSecondsAndDefaultsToOne() = runBlocking<Unit> {  // L2
+        for ((header, millis) in listOf("2" to 2000L, "99" to 5000L, null to 1000L)) {
+            val (core, keep, absorb) = world()
+            core.retryAfter = header
+            core.refuseNext = 503 to "busy"
+            core.api().merge(request(keep, absorb))
+            assertThat(core.pauses).containsExactly(millis)
+        }
+    }
+
+    @Test
     fun aRefusalWithoutAReasonBodyIsStillARefusalWithTheStatus() = runBlocking<Unit> {
         val (core, keep, absorb) = world()
         // the fake answers an empty reason: the client falls back to "HTTP <status>"

@@ -387,17 +387,26 @@ internal class LoanInterestRunnerTest {
     }
 
     @Test
-    fun aNightWithAHeldLoanStillRecordsTheRecoveryOfTheLagCount() {  // V3
+    fun aHeldNightKeepsTheLagClockSoALoanAlternatingLagAndHeldStillTripsTheAlarm() {  // V3, L3
         val lagDir = File(dir, "lag").path
         var day = d(10, 1)
         fireflyOwed = BigDecimal("23817.37")
         runner("23427.28", chargedThenNew, hold = true, lagDir = lagDir).also { it.today = { day } }.run() // lags: the clock starts on 10-01
         day = d(10, 2); fireflyOwed = BigDecimal("23417.37"); owedBefore[d(8, 31)] = "23817.37"
-        // the loan is HELD tonight (a gap of 300 is not explained): the run fails, but the lag file must have been brought up to date
+        // the loan is HELD tonight (a gap of 300 is not explained): the run fails, and the lag file keeps the old date
         org.junit.jupiter.api.assertThrows<IllegalStateException> { runner("23717.37", chargedThenNew, hold = true, lagDir = lagDir).also { it.today = { day } }.run() }
-        assertThat(File(lagDir, "loan-lag.json").readText()).isEqualTo("{}")
+        assertThat(File(lagDir, "loan-lag.json").readText()).isEqualTo("""{"2":"2026-10-01"}""")
         day = d(10, 3); fireflyOwed = BigDecimal("23817.37")
-        runner("23427.28", chargedThenNew, hold = true, lagDir = lagDir).also { it.today = { day } }.run() // lags again, but only for its first night
+        val e = org.junit.jupiter.api.assertThrows<IllegalStateException> { runner("23427.28", chargedThenNew, hold = true, lagDir = lagDir).also { it.today = { day } }.run() }
+        assertThat(e.message).contains("Firefly lags").contains("[2]") // three nights since 10-01, the HELD one in between
+    }
+
+    @Test
+    fun aHeldLoanThatNeverLaggedGetsNoLagEntry() {  // L3
+        val lagDir = File(dir, "lag").path
+        fireflyOwed = BigDecimal("23417.37"); owedBefore[d(8, 31)] = "23817.37"
+        org.junit.jupiter.api.assertThrows<IllegalStateException> { runner("23717.37", chargedThenNew, hold = true, lagDir = lagDir).also { it.today = { d(10, 1) } }.run() }
+        assertThat(File(lagDir, "loan-lag.json").readText()).isEqualTo("{}")
     }
 
     @Test
@@ -414,7 +423,11 @@ internal class LoanInterestRunnerTest {
         val file = File(lagDir, "loan-lag.json")
         fireflyOwed = BigDecimal("23817.37")
         file.writeText("{not json")
-        runner("23427.28", chargedThenNew, hold = true, lagDir = lagDir.path).also { it.today = { d(10, 1) } }.run()
+        val out = java.io.ByteArrayOutputStream()
+        val realOut = System.out
+        System.setOut(java.io.PrintStream(out, true))
+        try { runner("23427.28", chargedThenNew, hold = true, lagDir = lagDir.path).also { it.today = { d(10, 1) } }.run() } finally { System.setOut(realOut) }
+        assertThat(out.toString()).contains("WARN: ").contains(file.path) // nit-1
         assertThat(file.readText()).isEqualTo("""{"2":"2026-10-01"}""")
         file.writeText("""{"2":"yesterday"}""")
         runner("23427.28", chargedThenNew, hold = true, lagDir = lagDir.path).also { it.today = { d(10, 2) } }.run()

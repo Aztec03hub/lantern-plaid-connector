@@ -49,6 +49,13 @@ internal class FakePairCore {
     @Volatile
     var refuseNext: Pair<Int, String>? = null
 
+    /** If set, sent as the `Retry-After` header on every response. */
+    @Volatile
+    var retryAfter: String? = null
+
+    /** The millis the client asked to pause before a retry (the real sleep is skipped, W2). */
+    val pauses = java.util.Collections.synchronizedList(mutableListOf<Long>())
+
     /** Runs inside the call before the checks (an edit that races the merge); the fake is locked while it runs. */
     @Volatile
     var beforeChecks: (() -> Unit)? = null
@@ -109,11 +116,14 @@ internal class FakePairCore {
     }
 
     /** The real client, talking to this fake through a mock engine; expectSuccess as in production (ApiConfiguration). */
-    fun api(): PairApi = PairApi("http://core.test", MockEngine { request ->
+    fun api(): PairApi = object : PairApi("http://core.test", MockEngine { request ->
         val body = request.body.toByteArray().toString(Charsets.UTF_8)
         val (status, json) = handle(request.method, request.url.encodedPath, request.url.encodedQuery, body)
-        respond(json, HttpStatusCode.fromValue(status), headersOf(HttpHeaders.ContentType, "application/json"))
-    }, { it.expectSuccess = true })
+        val h = headersOf(HttpHeaders.ContentType to listOf("application/json"), HttpHeaders.RetryAfter to listOfNotNull(retryAfter))
+        respond(json, HttpStatusCode.fromValue(status), h)
+    }, { it.expectSuccess = true }) {
+        override suspend fun retryPause(millis: Long) { pauses.add(millis) }
+    }
 
     @Synchronized
     private fun handle(method: HttpMethod, path: String, query: String, body: String): Pair<Int, String> {
