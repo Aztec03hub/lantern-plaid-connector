@@ -3,7 +3,11 @@ package net.djvk.fireflyPlaidConnector2.sync
 import kotlinx.coroutines.runBlocking
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.AccountsApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.TransactionsApi
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.Account
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.AccountRead
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.AccountSingle
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.AccountTypeProperty
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.ShortAccountTypeProperty
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.Meta
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.ObjectLink
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.PageLink
@@ -42,10 +46,10 @@ internal class RehomePaymentsRunnerTest {
     private val syncHelper = mock<SyncHelper>()
     private val text = "AC PHILLIP LAFAYETT ACH XFER XXXX7769WEB XXXX0198"
 
-    private fun converter(): TransactionConverter {
+    private fun converter(match: String = "XXXX0198"): TransactionConverter {
         val f = File(dir, "pair.json").also {
             it.writeText("""{"scheduled":[{"from":1,"to":2,"amount":400,"day":7}],
-                "ownAccountPayments":[{"fromAccount":1,"match":"XXXX0198","route":"scheduled","candidates":[2,3]}]}""")
+                "ownAccountPayments":[{"fromAccount":1,"match":"$match","route":"scheduled","candidates":[2,3]}]}""")
         }
         return TransactionConverter(
             useNameForDestination = true, enablePrimaryCategorization = false, primaryCategoryPrefix = "p-",
@@ -63,12 +67,13 @@ internal class RehomePaymentsRunnerTest {
         ), ObjectLink(),
     )
 
-    private fun runner(apply: Boolean, rows: List<TransactionRead>): RehomePaymentsRunner {
+    private fun runner(apply: Boolean, rows: List<TransactionRead>, match: String = "XXXX0198", reverse: Boolean = false): RehomePaymentsRunner {
         runBlocking {
+            whenever(syncHelper.getAllPlaidAccessTokenAccountIdSets()).thenReturn(Pair(emptyMap(), emptySequence()))
             whenever(accountsApi.listTransactionByAccount(any(), anyOrNull(), anyOrNull(), anyOrNull(), anyOrNull(), anyOrNull()))
                 .doSuspendableAnswer { createFireflyResponse(TransactionArray(rows, Meta(), PageLink())) }
         }
-        return RehomePaymentsRunner(syncHelper, accountsApi, txApi, converter(), apply, "2000-01-01", dir.path)
+        return RehomePaymentsRunner(syncHelper, accountsApi, txApi, converter(match), apply, "2000-01-01", dir.path, "America/Chicago", reverse)
     }
 
     // 400 matches the Lexus schedule only on the 7th; journals are dated on the 7th of a recent month
@@ -101,7 +106,71 @@ internal class RehomePaymentsRunnerTest {
         assertThat(split.destinationId).isEqualTo("2")
         assertThat(split.plaidLinks!!.single().leg).isEqualTo(PlaidLinkLeg.source)
         val lines = File(dir, "rehome_log.jsonl").readLines()
+        assertThat(lines).hasSize(2)
+        assertThat(lines[0]).contains("\"status\":\"intent\"").contains("\"journal\":\"a\"").contains("\"oldDestination\":\"50\"").contains("\"newDestination\":\"2\"").contains("\"oldLeg\":\"single\"")
+        assertThat(lines[1]).contains("\"status\":\"done\"")
+    }
+
+    @Test
+    fun twoMovesKeepBothLogEntriesTheLogIsAppendedNotOverwritten() = runBlocking<Unit> {  // T9
+        val r = runner(true, listOf(journal("a", "400.00"), journal("e", "400.00")))
+        r.applyPlan(r.readPlan())
+        val lines = File(dir, "rehome_log.jsonl").readLines()
+        assertThat(lines).hasSize(4)
+        assertThat(lines.count { it.contains("\"journal\":\"a\"") }).isEqualTo(2)
+        assertThat(lines.count { it.contains("\"journal\":\"e\"") }).isEqualTo(2)
+    }
+
+    @Test
+    fun aFailedUpdateLeavesAnIntentLineButNoDoneLine() = runBlocking<Unit> {  // B4
+        whenever(txApi.updateTransaction(any(), any())).doSuspendableAnswer { error("422") }
+        val r = runner(true, listOf(journal("a", "400.00")))
+        org.junit.jupiter.api.assertThrows<IllegalStateException> { r.applyPlan(r.readPlan()) }
+        val lines = File(dir, "rehome_log.jsonl").readLines()
         assertThat(lines).hasSize(1)
-        assertThat(lines[0]).contains("\"journal\":\"a\"").contains("\"oldDestination\":\"50\"").contains("\"newDestination\":\"2\"")
+        assertThat(lines[0]).contains("\"status\":\"intent\"")
+    }
+
+    @Test
+    fun reverseModePutsDoneMovesBackWithTheirOldLeg() = runBlocking<Unit> {  // B4
+        val r = runner(true, listOf(journal("a", "400.00")))
+        r.applyPlan(r.readPlan())
+        runner(false, emptyList(), reverse = true).reverseLog()
+        verify(txApi, org.mockito.kotlin.times(1)).updateTransaction(any(), any())  // dry run reverses nothing
+        runner(true, emptyList(), reverse = true).reverseLog()
+        val upd = argumentCaptor<TransactionUpdate>()
+        verify(txApi, org.mockito.kotlin.times(2)).updateTransaction(any(), upd.capture())
+        val back = upd.lastValue.transactions!!.single()
+        assertThat(back.destinationId).isEqualTo("50")
+        assertThat(back.plaidLinks!!.single().leg).isEqualTo(PlaidLinkLeg.single)
+        assertThat(back.plaidLinks!!.single().plaidTransactionId).isEqualTo("pa")
+        runner(true, emptyList(), reverse = true).reverseLog()  // a second reverse finds nothing left
+        verify(txApi, org.mockito.kotlin.times(2)).updateTransaction(any(), any())
+    }
+
+    @Test
+    fun aRuleAnchoredOnTheOriginalTextMatchesTheBackfillToo() = runBlocking<Unit> {  // L4: the stored text is "merchant: original text"
+        val r = runner(false, listOf(journal("a", "400.00", desc = "PHIL: XXXX0198 ACH")), match = "^XXXX0198")
+        assertThat(r.readPlan().map { it.journalId to it.to }).containsExactly("a" to 2)
+    }
+
+    @Test
+    fun amountsRoundHalfUpLikeTheImportDoes() = runBlocking<Unit> {  // L4: 399.995 is 40000 cents at import, not 39999
+        val r = runner(false, listOf(journal("a", "399.995")))
+        assertThat(r.readPlan().single().to).isEqualTo(2)
+    }
+
+    @Test
+    fun aRoutingTargetWithPlaidTransactionsOfItsOwnStopsTheRun() = runBlocking<Unit> {  // L5
+        val r = runner(false, emptyList())
+        fun account(type: ShortAccountTypeProperty) {
+            val resp = createFireflyResponse(AccountSingle(AccountRead("accounts", "2", Account("n", type), ObjectLink())))
+            runBlocking { whenever(accountsApi.getAccount(any(), anyOrNull())).thenReturn(resp) }
+        }
+        account(ShortAccountTypeProperty.asset)
+        org.junit.jupiter.api.assertThrows<IllegalStateException> { r.checkTargets(listOf(2)) }
+        r.checkTargets(listOf(9))  // not a target: fine
+        account(ShortAccountTypeProperty.liabilities)
+        r.checkTargets(listOf(2, 3))  // a Plaid-synced loan has a balance only
     }
 }

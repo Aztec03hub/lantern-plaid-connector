@@ -18,6 +18,9 @@ data class OwnAccountConfig(val rules: List<OwnAccountRule> = emptyList(), val s
     /** The first rule of [fromAccount] whose regex is found in [text]. */
     fun ruleFor(fromAccount: Int, text: String): OwnAccountRule? = rules.firstOrNull { it.fromAccount == fromAccount && it.match.containsMatchIn(text) }
 
+    /** Every account a rule can route to. */
+    fun targetIds(): Set<Int> = rules.flatMap { listOfNotNull(it.toAccount) + it.candidates }.toSet()
+
     /** The target account for a payment, or null when no rule matches or the routing is not unique. */
     fun target(fromAccount: Int, text: String, cents: Long, date: LocalDate): Int? =
         ruleFor(fromAccount, text)?.let { route(it, fromAccount, cents, date, scheduled) }
