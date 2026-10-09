@@ -47,6 +47,15 @@ internal class OwnAccountPaymentsTest {
     }
 
     @Test
+    fun aRuleOfOneAccountNeverAppliesToAnotherAccount() {  // T9
+        val cfg = OwnAccountConfig(listOf(rule), flows)
+        assertThat(cfg.ruleFor(1, "x XXXX0198")).isNotNull
+        assertThat(cfg.ruleFor(6, "x XXXX0198")).isNull()
+        assertThat(cfg.target(6, "x XXXX0198", 40000, LocalDate.of(2026, 10, 7))).isNull()
+        assertThat(cfg.targetIds()).containsExactlyInAnyOrder(2, 3)
+    }
+
+    @Test
     fun fixedTargetNeedsNoSchedule() {
         assertThat(route(OwnAccountRule(6, Regex("x"), toAccount = 2), 6, 1, LocalDate.now(), emptyList())).isEqualTo(2)
     }

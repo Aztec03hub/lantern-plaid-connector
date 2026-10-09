@@ -3,6 +3,7 @@ package net.djvk.fireflyPlaidConnector2.sync
 import kotlinx.coroutines.runBlocking
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.PairApi
 import net.djvk.fireflyPlaidConnector2.pairing.PairPass
+import net.djvk.fireflyPlaidConnector2.pairing.PairPassReport
 import net.djvk.fireflyPlaidConnector2.pairing.PairStateFile
 import net.djvk.fireflyPlaidConnector2.pairing.RejectedPair
 import net.djvk.fireflyPlaidConnector2.pairing.PairSettings
@@ -58,5 +59,11 @@ class PairRunner(
         logger.info("Pairing finished: {} proposed, {} merged", report.result.proposals.count { it.auto }, report.merged.size)
         // A2: the pass went on past a failed pair and saved what it merged; now say so with a non-zero exit
         check(report.failed.isEmpty()) { "${report.failed.size} pair(s) failed to merge: " + report.failed.joinToString("; ") { "${it.out}+${it.inn}: ${it.error}" } }
+        failOnRefusals(report)
+    }
+
+    /** A1: a pair that core refused is a WARN in the log only; a non-zero exit makes the nightly say so. */
+    internal fun failOnRefusals(report: PairPassReport) = check(report.rejected.isEmpty()) {
+        "pairing: core refused ${report.rejected.size} pair(s): ${report.rejected.map { it.second.reason }.distinct()}"
     }
 }

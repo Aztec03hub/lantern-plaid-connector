@@ -80,6 +80,40 @@ internal class CounterpartyNamerTest {
     }
 
     @Test
+    fun aNumberThatIsPartOfTheNameKeepsDistinctPayeesDistinct() {  // M3 / T8
+        assertThat(k("Pier 1 Imports")).isNotEqualTo(k("Pier 39 Parking"))
+        assertThat(k("Route 66 Diner")).isNotEqualTo(k("Route 9 Gas"))
+        assertThat(namer.canonical(null, "Studio 54")).isEqualTo("Studio 54")
+        assertThat(k("Fitness 19")).isNotEqualTo(k("Fitness 24 Seven"))
+        assertThat(namer.key("Pier 1")).isNotEqualTo(namer.key("Pier 39"))  // digits are part of the key
+    }
+
+    @Test
+    fun storeNumbersOfThreeToFiveDigitsAndHashNumbersStillCollapseTheSamePayee() {
+        assertThat(k("TARGET #12 CHICAGO IL")).isEqualTo(k("TARGET #345 NAPERVILLE IL"))
+        assertThat(k("KROGER 482 CHICAGO IL")).isEqualTo(k("KROGER 1930 NAPERVILLE IL"))
+        assertThat(namer.canonical(null, "Target No. 7 Chicago")).isEqualTo("Target")
+    }
+
+    @Test
+    fun twoPeopleUnderAZellePrefixStayTwoPayees() {  // M3 colon rule
+        assertThat(k("Zelle: JOHN SMITH")).isNotEqualTo(k("Zelle: JANE DOE"))
+        assertThat(namer.canonical(null, "Amazon: AMZN MKTP US")).isEqualTo("Amazon")
+    }
+
+    @Test
+    fun theCompanyAfterCoWinsAndPaymentWordsAreDropped() {  // T8 survivors
+        assertThat(namer.canonical(null, "Foo Bar CO: Evolv Consulting")).isEqualTo("Evolv Consulting")
+        assertThat(namer.canonical(null, "Acme Payment")).isEqualTo("Acme")
+    }
+
+    @Test
+    fun anAllCapsAmpersandNameKeepsItsCaps() {  // nit2
+        assertThat(namer.canonical(null, "AT&T")).isEqualTo("AT&T")
+        assertThat(namer.key("AT&T")).isEqualTo("at t")
+    }
+
+    @Test
     fun keysIgnoreCasePunctuationAndSpacing() {
         assertThat(namer.key("Evolv  Consulting, Inc.")).isEqualTo(namer.key("EVOLV CONSULTING INC"))
     }

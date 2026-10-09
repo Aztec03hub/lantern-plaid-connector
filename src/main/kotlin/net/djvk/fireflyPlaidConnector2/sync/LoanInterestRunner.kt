@@ -34,7 +34,7 @@ object LoanConfigLoader {
     }
 }
 
-data class LoanPayment(val date: LocalDate, val amount: BigDecimal)
+data class LoanPayment(val date: LocalDate, val amount: BigDecimal, val journalId: String? = null)
 
 /** A payment without an interest journal, with what its interest should be. */
 data class InterestLine(val payment: LoanPayment, val days: Long, val owedBefore: BigDecimal, val expected: BigDecimal)
@@ -53,6 +53,8 @@ fun expectedInterest(owed: BigDecimal, apr: BigDecimal, days: Long): BigDecimal 
 
 private const val UNEXPLAINED = "Unexplained loan change"
 private const val UNEXPLAINED_TAG = "lantern-unexplained"
+private const val UNEXPLAINED_DESC = "Unexplained change in "
+private const val EXTERNAL_PREFIX = "lantern-interest:"
 
 /**
  * `syncMode: loan-interest`: DCU loans have no Plaid transactions, only a balance. Firefly gets the full payment (see
@@ -86,7 +88,11 @@ class LoanInterestRunner(
     private val zone = ZoneId.of(timeZoneString)
     private val tolerance = BigDecimal.valueOf(tolerance)
 
-    override fun run() = runBlocking<Unit> { runOnce(apply) }
+    /** A loan left HELD exits non-zero, so the nightly prints its "!!" line instead of looking fine (A1). */
+    override fun run() = runBlocking<Unit> {
+        val held = runOnce(apply).filter { it.action.startsWith("HELD") }
+        check(held.isEmpty()) { "loan-interest: ${held.size} loan(s) HELD, nothing written: ${held.map { it.loan.account }}" }
+    }
 
     /** One pass, also callable by a later nightly job. Apply re-reads every loan it wrote to and fails if a gap is left. */
     suspend fun runOnce(apply: Boolean = this.apply): List<LoanPlan> {
@@ -157,44 +163,56 @@ class LoanInterestRunner(
         fun done(action: String, lines: List<InterestLine> = listOf(), residual: BigDecimal = BigDecimal.ZERO) =
             LoanPlan(loan, name, plaidOwed, fireflyOwed, gap, lines, residual, action)
         if (gap.abs() <= tolerance) return done("OK: within $tolerance")
-        if (gap.signum() < 0) return done("Plaid balance lags: Plaid has not seen a payment Firefly has; nothing written")
+        // Plaid owes LESS than Firefly: Plaid has seen a payment that Firefly has not (not imported or not routed yet)
+        if (gap.signum() < 0) return done("Firefly lags: Plaid owes less than Firefly, so Plaid has seen a payment Firefly has not; nothing written")
 
         val splits = splitsOf(loan.account)
-        val payments = splits.filter { it.destinationId == id && !it.description.startsWith("Interest on ") }
-            .map { LoanPayment(dateOf(it), BigDecimal(it.amount)) }.sortedBy { it.date }
-        val covered = splits.filter { it.sourceId == id && it.description.startsWith("Interest on ") }.map { dateOf(it) to it.description }.toSet()
+        // the connector's own rows (interest, unexplained residual) and tagged rows are never payments
+        fun own(it: TransactionSplit) = it.description.startsWith("Interest on ") || it.description.startsWith(UNEXPLAINED_DESC) ||
+            it.tags?.contains(UNEXPLAINED_TAG) == true
+        val payments = splits.filter { it.destinationId == id && !own(it) }
+            .map { LoanPayment(dateOf(it), BigDecimal(it.amount), it.transactionJournalId) }.sortedBy { it.date }
+        val interestRows = splits.filter { it.sourceId == id && it.description.startsWith("Interest on ") }
+        val covered = interestRows.map { dateOf(it) to it.description }.toSet()
+        val coveredIds = interestRows.mapNotNull { it.externalId }.toSet()
         val lines = mutableListOf<InterestLine>()
         payments.forEachIndexed { i, p ->
+            if (p.journalId != null && EXTERNAL_PREFIX + p.journalId in coveredIds) return@forEachIndexed
             if ((p.date to interestDescription(name, p)) in covered) return@forEachIndexed
             val days = if (i == 0) 0 else ChronoUnit.DAYS.between(payments[i - 1].date, p.date)
-            val owedBefore = fireflyOwed(loan.account, p.date.minusDays(1))
+            // Firefly's balance lacks the interest of the earlier uncovered payments of this plan
+            val owedBefore = fireflyOwed(loan.account, p.date.minusDays(1)) + lines.fold(BigDecimal.ZERO) { a, l -> a + l.expected }
             lines.add(InterestLine(p, days, owedBefore, expectedInterest(owedBefore, loan.apr, days)))
         }
         val sum = lines.fold(BigDecimal.ZERO) { a, l -> a + l.expected }
         val off = gap - sum
         val explained = off.abs() <= BigDecimal.valueOf(max(tolerance.toDouble(), sum.toDouble() * 0.005))
-        if (lines.isEmpty() || !explained) {
+        // the cents remainder rides on the biggest line, so a negative one cannot turn a line zero or negative
+        val big = lines.indices.maxByOrNull { lines[it].expected }
+        val fits = big != null && lines[big].expected + off > BigDecimal.ZERO
+        if (lines.isEmpty() || !explained || !fits) {
             if (holdUnexplained) return done("HELD: payments explain $sum of the gap $gap; nothing written, retried next run")
             return done("UNEXPLAINED: payments explain $sum of the gap $gap; ${money(off)} goes to \"$UNEXPLAINED\"", lines, off)
         }
-        // the last line takes the cents so that the total is exactly the gap
-        val last = lines.last()
-        return done("write ${lines.size} interest journals", lines.dropLast(1) + last.copy(expected = last.expected + off))
+        val adjusted = lines.mapIndexed { i, l -> if (i == big) l.copy(expected = l.expected + off) else l }
+        return done("write ${lines.size} interest journals", adjusted)
     }
 
     private suspend fun write(p: LoanPlan) {
         val id = p.loan.account.toString()
-        for (l in p.lines) {
+        // the line that carries the cents remainder goes first: a later failure leaves exact lines and the rerun has no remainder
+        for (l in p.lines.sortedByDescending { it.expected }) {
             if (l.expected.signum() <= 0) continue
             store(TransactionSplit(
                 type = TransactionTypeProperty.withdrawal, date = l.payment.date.atStartOfDay(zone).toOffsetDateTime(),
                 amount = money(l.expected), description = interestDescription(p.name, l.payment),
                 sourceId = id, destinationId = null, destinationName = p.loan.interestAccount,
+                externalId = l.payment.journalId?.let { EXTERNAL_PREFIX + it },
             ))
         }
         if (p.residual.signum() != 0) {
             val date = LocalDate.now(zone).atStartOfDay(zone).toOffsetDateTime()
-            val desc = "Unexplained change in ${p.name}"
+            val desc = "$UNEXPLAINED_DESC${p.name}"
             store(
                 if (p.residual.signum() > 0) TransactionSplit(
                     type = TransactionTypeProperty.withdrawal, date = date, amount = money(p.residual), description = desc,
