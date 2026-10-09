@@ -22,6 +22,7 @@ import net.djvk.fireflyPlaidConnector2.transactions.TransactionConverter
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.io.TempDir
 import org.mockito.kotlin.any
 import org.mockito.kotlin.anyOrNull
 import org.mockito.kotlin.doSuspendableAnswer
@@ -86,7 +87,7 @@ internal class RehomeNamesRunnerTest {
     @Test
     fun theSameNameInExpenseAndRevenueIsNotMerged() {
         val groups = planNameGroups(listOf(acct(1, "Target", 1, AccountTypeFilter.expense), acct(2, "TARGET", 1, AccountTypeFilter.revenue)), namer)
-        assertThat(groups).isEmpty()
+        assertThat(groups.filter { it.duplicates.isNotEmpty() }).isEmpty()  // two rename-only groups, no merge
     }
 
     @Test
@@ -103,7 +104,7 @@ internal class RehomeNamesRunnerTest {
             "Interest: DCU personal loan",
         )
         val groups = planNameGroups(names.mapIndexed { i, n -> acct(i + 1, n, 1, AccountTypeFilter.expense) }, namer)
-        assertThat(groups.map { g -> (listOf(g.survivor) + g.duplicates).map { it.id }.sorted() }).containsExactlyInAnyOrder(listOf(4, 5), listOf(6, 7))
+        assertThat(groups.filter { it.duplicates.isNotEmpty() }.map { g -> (listOf(g.survivor) + g.duplicates).map { it.id }.sorted() }).containsExactlyInAnyOrder(listOf(4, 5), listOf(6, 7))
     }
 
     // endregion
@@ -147,6 +148,11 @@ internal class RehomeNamesRunnerTest {
             ff.journals.getOrPut(to) { mutableListOf() }.add(old)
             createFireflyResponse(net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionSingle(old))
         }
+        whenever(accountsApi.renameAccount(any(), any())).doSuspendableAnswer {
+            val id = it.getArgument<String>(0).toInt()
+            ff.accounts[id] = it.getArgument<String>(1) to ff.accounts.getValue(id).second
+            Unit
+        }
         whenever(accountsApi.deleteAccount(any())).doSuspendableAnswer {
             val id = it.getArgument<String>(0)
             deleted.add(id)
@@ -155,7 +161,9 @@ internal class RehomeNamesRunnerTest {
         }
     }
 
-    private fun runner(apply: Boolean) = RehomeNamesRunner(syncHelper, accountsApi, txApi, converter, apply)
+    @TempDir lateinit var dir: java.io.File
+
+    private fun runner(apply: Boolean) = RehomeNamesRunner(syncHelper, accountsApi, txApi, converter, apply, dir.path)
 
     private fun paycheckFirefly() = Firefly(
         mutableMapOf(1 to ("EVOLV CONSULTING" to AccountTypeFilter.revenue), 2 to (paycheck[1] to AccountTypeFilter.revenue), 3 to (paycheck[2] to AccountTypeFilter.revenue)),
@@ -169,12 +177,67 @@ internal class RehomeNamesRunnerTest {
         runner(true).applyPlan(runner(true).readPlan())
 
         val order = inOrder(txApi, accountsApi)
+        // duplicate 1 is spelled like the display name (any case), so it must go first and the rename follows its delete
         order.verify(txApi).updateTransaction(eq("a"), any())
         order.verify(accountsApi).deleteAccount("1")
+        order.verify(accountsApi).renameAccount(eq("2"), any())
         order.verify(txApi).updateTransaction(eq("d"), any())
         order.verify(accountsApi).deleteAccount("3")
-        order.verify(accountsApi).renameAccount(eq("2"), any())
         assertThat(ff.journals[2]!!.map { it.id }).containsExactlyInAnyOrder("a", "b", "c", "d")
+    }
+
+    @Test
+    fun theSurvivorIsRenamedBeforeAnyJournalMovesWhenNoDuplicateHoldsTheName() = runBlocking<Unit> {  // held rename gap
+        val ff = Firefly(
+            mutableMapOf(2 to (paycheck[1] to AccountTypeFilter.revenue), 3 to (paycheck[2] to AccountTypeFilter.revenue)),
+            mutableMapOf(2 to mutableListOf(journal("b", 2, 10), journal("c", 2, 10)), 3 to mutableListOf(journal("d", 3, 10))),
+        )
+        wire(ff)
+        runner(true).applyPlan(runner(true).readPlan())
+        val order = inOrder(txApi, accountsApi)
+        order.verify(accountsApi).renameAccount(eq("2"), eq("Evolv Consulting"))
+        order.verify(txApi).updateTransaction(eq("d"), any())
+        order.verify(accountsApi).deleteAccount("3")
+        assertThat(ff.accounts.values.map { it.first }).containsExactly("Evolv Consulting")
+    }
+
+    @Test
+    fun aRenameThatFailedAfterTheMergeIsPlannedAgainAsAnAloneAccount() = runBlocking<Unit> {  // held rename gap
+        val ff = paycheckFirefly()
+        wire(ff)
+        whenever(accountsApi.renameAccount(any(), any())).doSuspendableAnswer { error("422 rename") }
+        assertThatThrownBy { runBlocking { runner(true).applyPlan(runner(true).readPlan()) } }.hasMessageContaining("422 rename")
+        val again = runner(true).readPlan()
+        assertThat(again).hasSize(1)
+        assertThat(again[0].duplicates.map { it.id }).containsExactly(3)  // the run stopped before duplicate 3
+        // finish what is left, then the survivor is alone and still misnamed: the plan must still list it
+        whenever(accountsApi.renameAccount(any(), any())).doSuspendableAnswer { Unit }
+        ff.accounts[2] = paycheck[1] to AccountTypeFilter.revenue
+        ff.accounts.remove(3)
+        ff.accounts.remove(1)
+        val alone = runner(true).readPlan().single()
+        assertThat(alone.duplicates).isEmpty()
+        assertThat(alone.rename).isTrue()
+    }
+
+    @Test
+    fun everyJournalMoveAndDeleteIsLoggedBeforeItHappens() = runBlocking<Unit> {  // M4
+        val ff = paycheckFirefly()
+        wire(ff)
+        runner(true).applyPlan(runner(true).readPlan())
+        val lines = java.io.File(dir, "rehome_names_log.jsonl").readLines()
+        assertThat(lines.count { it.contains("\"op\":\"repoint\"") }).isEqualTo(2)
+        assertThat(lines.filter { it.contains("\"op\":\"delete\"") }).hasSize(2)
+        assertThat(lines.first { it.contains("\"journal\":\"a\"") }).contains("\"oldAccount\":\"1\"").contains("\"oldName\":\"EVOLV CONSULTING\"").contains("\"newAccount\":\"2\"")
+        assertThat(lines.first { it.contains("\"op\":\"delete\"") }).contains("\"name\":\"EVOLV CONSULTING\"")
+        assertThat(lines.count { it.contains("\"op\":\"rename\"") }).isEqualTo(1)
+    }
+
+    @Test
+    fun aDryRunWritesNoLog() {
+        wire(paycheckFirefly())
+        runner(false).run()
+        assertThat(java.io.File(dir, "rehome_names_log.jsonl")).doesNotExist()
     }
 
     @Test

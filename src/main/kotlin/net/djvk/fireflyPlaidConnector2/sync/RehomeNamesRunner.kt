@@ -22,10 +22,14 @@ data class NameGroup(val type: AccountTypeFilter, val canonical: String, val sur
     val rename: Boolean get() = survivor.name != canonical
 }
 
-/** The pure decision of `rehome-names`: groups with more than one account, survivor = most journals, ties lowest id. */
+/**
+ * The pure decision of `rehome-names`: groups with more than one account, survivor = most journals, ties lowest id.
+ * A lone account whose name differs from its canonical name is a group of one with no duplicates (a rename that failed
+ * after the merge, or never ran), so a re-plan sees it.
+ */
 fun planNameGroups(accounts: List<NamedAccount>, namer: CounterpartyNamer): List<NameGroup> =
     accounts.groupBy { it.type to namer.key(namer.canonical(null, it.name)) }
-        .filter { it.value.size > 1 }
+        .filter { it.value.size > 1 || it.value[0].name != namer.canonical(null, it.value[0].name) }
         .map { (k, members) ->
             val survivor = members.sortedWith(compareBy({ -it.journals }, { it.id })).first()
             NameGroup(k.first, namer.canonical(null, survivor.name), survivor, members.filter { it !== survivor }.sortedBy { it.id })
@@ -47,7 +51,11 @@ class RehomeNamesRunner(
     private val converter: TransactionConverter,
     @Value("\${fireflyPlaidConnector2.repair.apply:false}")
     private val apply: Boolean = false,
+    @Value("\${fireflyPlaidConnector2.polled.cursorFileDirectoryPath:persistence}")
+    private val directory: String = "persistence",
 ) : Runner {
+    private val mapper = com.fasterxml.jackson.databind.ObjectMapper()
+    private val logFile get() = java.io.File(directory, "rehome_names_log.jsonl")
     private val namer get() = converter.namer
     private val types = listOf(AccountTypeFilter.expense, AccountTypeFilter.revenue)
 
@@ -69,8 +77,9 @@ class RehomeNamesRunner(
     /** Reads every expense and revenue account, counts the journals of the candidates only, and plans. */
     internal suspend fun readPlan(): List<NameGroup> {
         val all = types.flatMap { type -> readAccounts(type) }
-        val candidates = all.groupBy { it.type to namer.key(namer.canonical(null, it.name)) }.filter { it.value.size > 1 }.values.flatten()
-        val counted = candidates.map { it.copy(journals = countJournals(it.id)) }
+        // journals are counted for the accounts that might merge only; a lone account is a rename and needs no count
+        val multi = all.groupBy { it.type to namer.key(namer.canonical(null, it.name)) }.filter { it.value.size > 1 }.values.flatten().toSet()
+        val counted = all.map { if (it in multi) it.copy(journals = countJournals(it.id)) else it }
         return planNameGroups(counted, namer)
     }
 
@@ -103,10 +112,31 @@ class RehomeNamesRunner(
         return out
     }
 
+    /** One JSONL line per step, appended BEFORE the step, so a wrong group can be reversed by hand (M4). */
+    private fun log(vararg fields: Pair<String, Any?>) {
+        logFile.also { it.absoluteFile.parentFile.mkdirs() }
+            .appendText(mapper.writeValueAsString(linkedMapOf<String, Any?>(*fields, "at" to java.time.OffsetDateTime.now().toString())) + "\n")
+    }
+
+    /**
+     * Per group: rename the survivor FIRST, so a failure later cannot strand a stale name. Firefly refuses two accounts of
+     * one type with the same name, so a duplicate already spelled like the display name (any case) is merged and deleted
+     * before the rename; the rename then runs right after that delete, ahead of the other duplicates. A rename that still
+     * fails leaves a lone account whose name differs from its canonical, which the next plan lists again.
+     */
     internal suspend fun applyPlan(plan: List<NameGroup>) {
         for (g in plan) {
             val to = g.survivor.id.toString()
-            for (d in g.duplicates) {
+            val blockers = g.duplicates.filter { it.name.equals(g.canonical, ignoreCase = true) }.map { it.id }.toMutableSet()
+            var renamed = !g.rename
+            suspend fun renameNow() {
+                if (renamed || blockers.isNotEmpty()) return
+                log("op" to "rename", "account" to to, "oldName" to g.survivor.name, "newName" to g.canonical, "type" to g.type.value)
+                fireflyAccountsApi.renameAccount(to, g.canonical)
+                renamed = true
+            }
+            renameNow()
+            for (d in g.duplicates.sortedBy { if (it.id in blockers) 0 else 1 }) {
                 val from = d.id.toString()
                 for (journal in journalsOf(d.id)) {
                     val splits = journal.attributes.transactions.filter { it.sourceId == from || it.destinationId == from }.map {
@@ -116,14 +146,21 @@ class RehomeNamesRunner(
                             destinationId = if (it.destinationId == from) to else null,
                         )
                     }
+                    log(
+                        "op" to "repoint", "journal" to journal.id, "splits" to splits.map { it.transactionJournalId },
+                        "oldAccount" to from, "oldName" to d.name, "newAccount" to to, "type" to g.type.value,
+                    )
                     fireflyTxApi.updateTransaction(journal.id, TransactionUpdate(applyRules = false, fireWebhooks = false, transactions = splits))
                 }
-                // Re-check: a journal that arrived since the plan keeps the account alive
+                // Re-check right before the delete: a journal that arrived since the plan keeps the account alive
                 val left = fireflyAccountsApi.listTransactionByAccount(from, 1, 1, null, null, TransactionTypeFilter.all).body().data
-                if (left.isEmpty()) fireflyAccountsApi.deleteAccount(from)
-                else println("The ${g.type.value} account ${d.id} \"${d.name}\" still has journals; not deleted.")
+                if (left.isEmpty()) {
+                    log("op" to "delete", "account" to from, "name" to d.name, "type" to g.type.value, "mergedInto" to to)
+                    fireflyAccountsApi.deleteAccount(from)
+                    blockers.remove(d.id)
+                    renameNow()
+                } else println("The ${g.type.value} account ${d.id} \"${d.name}\" still has journals; not deleted.")
             }
-            if (g.rename) fireflyAccountsApi.renameAccount(to, g.canonical)
         }
     }
 
@@ -131,6 +168,7 @@ class RehomeNamesRunner(
         println("== Names: ${plan.size} groups of expense/revenue accounts that are one payee")
         for (g in plan) {
             println("   ${g.type.value} \"${g.canonical}\": keep ${g.survivor.id} (\"${g.survivor.name}\", ${g.survivor.journals} journals)${if (g.rename) ", rename" else ""}")
+            if (g.duplicates.isEmpty()) println("      (alone: rename only)")
             g.duplicates.forEach { println("      merge ${it.id} (\"${it.name}\", ${it.journals} journals)") }
         }
     }
