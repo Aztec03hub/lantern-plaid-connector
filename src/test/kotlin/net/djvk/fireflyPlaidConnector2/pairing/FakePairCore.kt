@@ -33,6 +33,11 @@ import java.time.ZoneOffset
  *  - 409 reconciled / not_single, 422 same_account / amount_mismatch / direction, each checked from the stored journals
  *  - a refusal writes nothing: the journals are untouched and nothing is ever removed on a refusal
  */
+private val CORE_STAMP = Regex("""\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}""")
+
+/** Core's `date_format:Y-m-d\TH:i:sP` shape: a `T`, seconds and a numeric offset (no `Z`, no missing seconds). Null when it would be refused. */
+internal fun parseCoreStamp(s: String?): java.time.Instant? = s?.takeIf { CORE_STAMP.matches(it) }?.let { OffsetDateTime.parse(it).toInstant() }
+
 internal class FakePairCore {
     private val journals = linkedMapOf<String, TransactionRead>()
     private val live = linkedMapOf<Pair<String, String>, String>()
@@ -125,9 +130,11 @@ internal class FakePairCore {
         val absorb = journals[absorbId] ?: return refuse(404, "not_found")
         val ks = keep.attributes.transactions.single()
         val a = absorb.attributes.transactions.single()
-        if (keep.attributes.updatedAt?.toString() != req["keep_updated_at"].asText(null) ||
-            absorb.attributes.updatedAt?.toString() != req["absorb_updated_at"].asText(null)
-        ) return refuse(409, "stale")
+        // N0: validate the stamps the way core does (a T, seconds, an offset), then compare instants; never toString with toString
+        val keepStamp = parseCoreStamp(req["keep_updated_at"].asText(null))
+        val absorbStamp = parseCoreStamp(req["absorb_updated_at"].asText(null))
+        if (keepStamp == null || absorbStamp == null) return refuse(422, "invalid_request")
+        if (keep.attributes.updatedAt?.toInstant() != keepStamp || absorb.attributes.updatedAt?.toInstant() != absorbStamp) return refuse(409, "stale")
         if (ks.plaidLinks.orEmpty().size != 1 || a.plaidLinks.orEmpty().size != 1 ||
             ks.plaidLinks!!.single().leg != PlaidLinkLeg.single || a.plaidLinks!!.single().leg != PlaidLinkLeg.single
         ) return refuse(409, "not_single")

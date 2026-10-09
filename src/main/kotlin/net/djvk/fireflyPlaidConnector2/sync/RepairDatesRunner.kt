@@ -59,6 +59,11 @@ data class Redate(
     val newBookDate: OffsetDateTime?,
     /** process_date is the posted date too; the journals of older builds hold the fake midnight. */
     val newProcessDate: OffsetDateTime = newDate,
+    /**
+     * N9: a two-link journal whose stored date matches neither leg. A connector-made pair needs the destination leg's date, a core
+     * merge keeps the OUT leg's, and the links look the same; the dry run flags these so a person reads them before applying.
+     */
+    val ambiguous: Boolean = false,
 )
 
 /** An account's opening balance, before and after the repair. */
@@ -135,7 +140,9 @@ class RepairPlanner(
             // A merged transfer (core's pair merge) keeps the OUT leg's date, and the merged journal has the same two links as a
             //  connector-made pair; so a pair whose stored date is already one of its own legs' posted instants is left on that leg.
             val known = links.sortedBy { it.leg != PlaidLinkLeg.destination }.mapNotNull { input.plaidTxs[it.plaidTransactionId] }
-            val plaid = known.firstOrNull { converter.getTxPostedTimestamp(it).toInstant() == split.date.toInstant() } ?: known.firstOrNull()
+            val matching = known.firstOrNull { converter.getTxPostedTimestamp(it).toInstant() == split.date.toInstant() }
+            val plaid = matching ?: known.firstOrNull()
+            val ambiguous = matching == null && known.size > 1
             if (plaid == null) {
                 // Not in Plaid's history: reported, never moved (there is no record of the real posted date)
                 unmatched++
@@ -149,7 +156,7 @@ class RepairPlanner(
                     split.bookDate?.atZoneSameInstant(zoneId)?.toLocalDate() != newBook.atZoneSameInstant(zoneId).toLocalDate()
             val processDiffers = split.processDate?.toInstant() != newDate.toInstant()
             if (!split.date.toInstant().equals(newDate.toInstant()) || bookDiffers || processDiffers) {
-                redates.add(Redate(group.id, split.transactionJournalId, split.description, split.date, newDate, if (bookDiffers) newBook else null, newDate))
+                redates.add(Redate(group.id, split.transactionJournalId, split.description, split.date, newDate, if (bookDiffers) newBook else null, newDate, ambiguous))
             }
         }
 
@@ -394,7 +401,8 @@ class RepairDatesRunner(
 
     private fun print(plan: RepairPlan, input: RepairInput, pending: Map<Int, BigDecimal>) {
         println("== Dates: ${plan.redates.size} journals to re-date; ${plan.unmatchedJournals} Plaid journals not found in Plaid's history are reported only, never moved")
-        plan.redates.take(20).forEach { println("   ${it.groupId} ${it.description.take(40)}: ${it.oldDate} -> ${it.newDate}") }
+        plan.redates.take(20).forEach { println("   ${it.groupId} ${it.description.take(40)}: ${it.oldDate} -> ${it.newDate}" + if (it.ambiguous) "  (?) matches neither leg" else "") }
+        plan.redates.count { it.ambiguous }.takeIf { it > 0 }?.let { println("   (?) $it of them are two-leg journals whose date matches neither leg: they get the destination leg's date, but a core merge keeps the OUT leg's. Read them before applying.") }
         if (plan.redates.size > 20) println("   ... and ${plan.redates.size - 20} more")
         val winter = plan.redates.filter { it.newDate.monthValue in listOf(12, 1, 2) }
         println("   winter samples (Dec-Feb), ${winter.size} in total:")

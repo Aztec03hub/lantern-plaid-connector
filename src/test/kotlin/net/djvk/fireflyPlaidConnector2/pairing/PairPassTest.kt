@@ -119,7 +119,10 @@ internal class PairPassTest {
                 if (journals[request.keepGroupId]?.attributes?.transactions?.first()?.plaidLinks?.first()?.plaidTransactionId == throwFor) error("core answered HTTP 500")
                 val keep = journals[request.keepGroupId] ?: return PairMergeOutcome.Rejected(404, "not found")
                 val absorb = journals[request.absorbGroupId] ?: return PairMergeOutcome.Rejected(404, "not found")
-                if (keep.attributes.updatedAt?.toString() != request.keepUpdatedAt || absorb.attributes.updatedAt?.toString() != request.absorbUpdatedAt) {
+                val keepStamp = parseCoreStamp(request.keepUpdatedAt)
+                val absorbStamp = parseCoreStamp(request.absorbUpdatedAt)
+                if (keepStamp == null || absorbStamp == null) return PairMergeOutcome.Rejected(422, "invalid_request")
+                if (keep.attributes.updatedAt?.toInstant() != keepStamp || absorb.attributes.updatedAt?.toInstant() != absorbStamp) {
                     return PairMergeOutcome.Rejected(409, "stale")
                 }
                 val ks = keep.attributes.transactions.first()
@@ -417,6 +420,11 @@ internal class PairPassTest {
         assertThat(state.pendingDurations).containsExactly(3)
         assertThat(state.lags["1:2"]).contains(1, 1)
         assertThat(Files.readString(stateFile())).contains("\"version\"", "\"rejected\"")
+        // N4: the v1 file is kept the first time it is upgraded, and a second real pass does not overwrite that copy
+        val bak = dir.resolve("pair-state.json.v1.bak")
+        assertThat(Files.readString(bak)).isEqualTo("""{"lags":{"1:2":[1,1]},"pendingFirstSeen":{},"pendingDurations":[3],"merges":[]}""")
+        pass(w, dryRun = false).run(d.minusDays(5), today, now = now)
+        assertThat(Files.readString(bak)).contains("\"pendingDurations\":[3]").doesNotContain("version")
     }
 
     @Test
@@ -437,6 +445,118 @@ internal class PairPassTest {
         // a runner pass now (past the rejection) merges nothing
         PairRunner(helper, mock<TransactionConverter>(), pass(w, dryRun = false), settings, api).run()
         assertThat(w.merges).hasSize(1)
+    }
+
+    @Test
+    fun aStampWithZeroSecondsIsSentWithSecondsAndAnOffset() = runBlocking<Unit> {
+        val w = World().also {
+            it.add("out1", 1, true, d, 12_345, "AC CHASE CREDIT CRD AUTOPAY", updated = "2026-02-01T12:00:00-05:00")
+            it.add("in1", 2, false, d.plusDays(1), 12_345, "Payment Thank You", updated = "2026-02-01T12:00:30-05:00")
+        }
+        val seen = mutableListOf<PairMergeRequest>()
+        val spy = object : PairApi() {
+            override suspend fun merge(request: PairMergeRequest): PairMergeOutcome { seen.add(request); return w.core.merge(request) }
+        }
+        passWith(w, spy).run(d.minusDays(5), today, now = now)
+        assertThat(seen.single().keepUpdatedAt).isEqualTo("2026-02-01T12:00:00-05:00")
+        assertThat(seen.single().absorbUpdatedAt).isEqualTo("2026-02-01T12:00:30-05:00")
+        assertThat(w.merges).hasSize(1) // and the strict fake core accepted both stamps
+    }
+
+    @Test
+    fun theRealMapperNormalisesToUtcAndTheStampStillHasSecondsAndNoZ() {
+        val mapper = com.fasterxml.jackson.databind.ObjectMapper().apply(net.djvk.fireflyPlaidConnector2.api.firefly.infrastructure.ApiClient.JSON_DEFAULT)
+        fun read(s: String) = mapper.readValue("\"$s\"", OffsetDateTime::class.java)
+        assertThat(PairPass.stamp(read("2026-10-08T12:00:00-05:00"))).isEqualTo("2026-10-08T17:00:00+00:00")
+        assertThat(PairPass.stamp(read("2026-10-08T12:00:30-05:00"))).isEqualTo("2026-10-08T17:00:30+00:00")
+        assertThat(PairPass.stamp(read("2026-10-08T12:00:00Z"))).isEqualTo("2026-10-08T12:00:00+00:00")
+        assertThat(parseCoreStamp(PairPass.stamp(read("2026-10-08T12:00:00Z")))).isNotNull()
+        assertThat(parseCoreStamp("2026-10-08T12:00Z")).isNull() // what toString() printed: core would refuse it
+    }
+
+    @Test
+    fun aMergeFromACorrectedStampFormatIsRefusedByTheStrictFakeWhenTheFormatIsWrong() = runBlocking<Unit> {
+        val w = World().also { it.payment(1) }
+        val toStringApi = object : PairApi() {
+            override suspend fun merge(request: PairMergeRequest) =
+                w.core.merge(request.copy(keepUpdatedAt = "2026-02-01T00:00Z", absorbUpdatedAt = "2026-02-01T00:00Z"))
+        }
+        val report = passWith(w, toStringApi).run(d.minusDays(5), today, now = now)
+        assertThat(report.rejected.single().second.reason).isEqualTo("invalid_request")
+        assertThat(w.merges).isEmpty()
+    }
+
+    @Test
+    fun earlierMergesSurviveQuietPassesSoALaterUnmergeSticks() = runBlocking<Unit> {
+        val w = World().also { it.payment(1) }
+        pass(w, dryRun = false).run(d.minusDays(5), today, now = now)
+        pass(w, dryRun = false).run(d.minusDays(5), today, now = now) // a quiet night
+        assertThat(PairStateFile.read(dir.toString()).merges.map { it.out.id }).containsExactly("out1")
+        w.unmerge("m1")
+        pass(w, dryRun = false).run(d.minusDays(5), today, now = now)
+        assertThat(w.merges).hasSize(1)
+        assertThat(PairStateFile.read(dir.toString()).rejected.map { it.out to it.inn }).containsExactly("out1" to "in1")
+    }
+
+    @Test
+    fun forgivingARejectedPairLetsTheNextPassMergeItAgain() = runBlocking<Unit> {  // nit1
+        val w = World().also { it.payment(1) }
+        pass(w, dryRun = false).run(d.minusDays(5), today, now = now)
+        w.unmerge("m1")
+        pass(w, dryRun = false).run(d.minusDays(5), today, now = now)
+        assertThat(w.merges).hasSize(1)
+        val settings = PairSettings(dryRun = false, directory = dir.toString(), timeZone = "UTC", pendingTag = "pending")
+        PairRunner(mock<SyncHelper>(), mock<TransactionConverter>(), pass(w, dryRun = false), settings, PairApi(), forgive = "out1,in1").run()
+        assertThat(PairStateFile.read(dir.toString()).rejected).isEmpty()
+        pass(w, dryRun = false).run(d.minusDays(5), today, now = now)
+        assertThat(w.merges).hasSize(2)
+    }
+
+    private fun runnerFor(w: World, api: PairApi, unmerge: String, out: String = "", inn: String = "") =
+        PairRunner(
+            mock<SyncHelper>(), mock<TransactionConverter>(), pass(w, dryRun = false),
+            PairSettings(dryRun = false, directory = dir.toString(), timeZone = "UTC", pendingTag = "pending"), api, unmerge = unmerge, unmergeOut = out, unmergeInn = inn,
+        )
+
+    private fun passWith(w: World, api: PairApi): PairPass {
+        val helper = mock<SyncHelper>()
+        runBlocking { whenever(helper.fetchAccountKinds()).thenReturn(mapOf("1" to AccountKind.ASSET, "2" to AccountKind.LIABILITY, "3" to AccountKind.LIABILITY, "4" to AccountKind.ASSET)) }
+        val settings = PairSettings(dryRun = false, directory = dir.toString(), timeZone = "UTC", pendingTag = "pending")
+        return PairPass(helper, w.service(), api, AccountConfigs(configs), ItemStatusStore(dir.toString()), settings)
+    }
+
+    @Test
+    fun anUnmergeOfAMergeMissingFromStateStopsBeforeCoreUnlessThePlaidIdsAreGiven() = runBlocking<Unit> {
+        val w = World().also { it.payment(1) }
+        pass(w, dryRun = false).run(d.minusDays(5), today, now = now)
+        Files.delete(stateFile()) // the merge was never recorded
+        w.unmerge("m1")
+        val calls = mutableListOf<String>()
+        val api = object : PairApi() { override suspend fun unmerge(pairMergeId: String, force: Boolean) { calls.add(pairMergeId) } }
+        org.assertj.core.api.Assertions.assertThatThrownBy { runnerFor(w, api, "m1").run() }.hasMessageContaining("not in pair-state.json").hasMessageContaining("unmergeOut")
+        assertThat(calls).isEmpty() // core was not touched
+        runnerFor(w, api, "m1", "out1", "in1").run()
+        assertThat(calls).containsExactly("m1")
+        pass(w, dryRun = false).run(d.minusDays(5), today, now = now)
+        assertThat(w.merges).hasSize(1) // not merged again
+        assertThat(PairStateFile.read(dir.toString()).rejected.single().out).isEqualTo("out1")
+    }
+
+    @Test
+    fun aMergeCoreCommittedDespiteATimeoutIsRecoveredSoALaterUnmergeSticks() = runBlocking<Unit> {
+        val w = World().also { it.payment(1) }
+        val timeoutAfterCommit = object : PairApi() {
+            override suspend fun merge(request: PairMergeRequest): PairMergeOutcome { w.core.merge(request); error("read timeout") }
+        }
+        val first = passWith(w, timeoutAfterCommit).run(d.minusDays(5), today, now = now)
+        assertThat(first.failed).hasSize(1)
+        assertThat(w.merges).hasSize(1)
+        assertThat(PairStateFile.read(dir.toString()).merges).isEmpty() // not recorded yet
+        pass(w, dryRun = false).run(d.minusDays(5), today, now = now) // next night sees two merged journals
+        assertThat(PairStateFile.read(dir.toString()).merges.map { it.out.id to it.inn.id }).containsExactly("out1" to "in1")
+        w.unmerge("m1") // a person unmerges
+        pass(w, dryRun = false).run(d.minusDays(5), today, now = now)
+        assertThat(w.merges).hasSize(1) // no second merge
     }
 
     // endregion

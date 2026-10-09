@@ -80,7 +80,7 @@ internal class LoanInterestRunnerTest {
     private fun interest(id: String, amount: String, payAmount: String, date: LocalDate, externalId: String? = null, loanName: String = name) =
         journal(id, amount, date, "Interest on $loanName payment of $$payAmount", interest = true, externalId = externalId)
 
-    private fun runner(plaidOwed: String, rows: List<TransactionRead>, apply: Boolean = true, hold: Boolean = false): LoanInterestRunner {
+    private fun runner(plaidOwed: String, rows: List<TransactionRead>, apply: Boolean = true, hold: Boolean = false, lagDir: String = ""): LoanInterestRunner {
         val cfg = File(dir, "pair.json").also {
             it.writeText("""{"loans":[{"account":2,"apr":7.59,"interestAccount":"Interest: DCU Lexus NX loan"}]}""")
         }
@@ -112,7 +112,7 @@ internal class LoanInterestRunnerTest {
                 createFireflyResponse(TransactionSingle(rows.first()))
             }
         }
-        return LoanInterestRunner(syncHelper, plaid.wrapper, accountsApi, txApi, "America/Chicago", cfg.path, 0.05, apply, hold)
+        return LoanInterestRunner(syncHelper, plaid.wrapper, accountsApi, txApi, "America/Chicago", cfg.path, 0.05, apply, hold, lagDir, 3)
     }
 
     private fun stored(): List<TransactionStore> = runBlocking {
@@ -264,9 +264,9 @@ internal class LoanInterestRunnerTest {
     }
 
     @Test
-    fun aRemainderThatWouldZeroTheBiggestLineIsUnexplainedNotDropped() = runBlocking<Unit> {  // M2 guard
+    fun aGapTheLineCannotExplainEndsHeldWithNothingWritten() = runBlocking<Unit> {  // renamed (N10): this fails `explained`, not the `fits` guard
         owedBefore[d(8, 31)] = "23817.37"
-        // gap 0.10 is within 0.5% of... expected 74.29 is not, so this is the unexplained path
+        // gap 0.10 against a 74.29 line: not explained
         val plan = runner("23417.47", chargedThenNew, hold = true).runOnce().single()
         assertThat(plan.action).startsWith("HELD")
         assertThat(stored()).isEmpty()
@@ -310,7 +310,7 @@ internal class LoanInterestRunnerTest {
         fireflyOwed = BigDecimal("23817.37")
         val plan = runner("23427.28", chargedThenNew, hold = true).runOnce().single()
         assertThat(plan.gap).isEqualTo(BigDecimal("-390.09"))
-        assertThat(plan.action).startsWith("Firefly lags").contains("Plaid has seen a payment Firefly has not")
+        assertThat(plan.action).startsWith("Firefly lags").contains("may be missing in Firefly")
         assertThat(stored()).isEmpty()
     }
 
@@ -339,5 +339,50 @@ internal class LoanInterestRunnerTest {
         val first = stored().first().transactions.single()
         assertThat(first.description).contains("payment of \$400.00")
         assertThat(first.date.toLocalDate()).isEqualTo(d(9, 1))
+    }
+
+    @Test
+    fun aRemainderThatWouldTurnTheBiggestLineNegativeIsHeldNotDropped() = runBlocking<Unit> {  // M2 `fits` guard, reached (N10)
+        fireflyOwed = BigDecimal("100.00")
+        listOf(d(8, 2), d(8, 4), d(8, 6)).forEach { owedBefore[it] = "100.00" }
+        val rows = listOf(
+            payment("0", "400.00", d(8, 1)), interest("i0", "0.50", "400.00", d(8, 1)),
+            payment("a", "400.00", d(8, 3)), payment("b", "400.00", d(8, 5)), payment("c", "400.00", d(8, 7)),
+        )
+        // three lines of 0.04 (sum 0.12) against a gap of 0.07: off = -0.05 is explained (within 0.05) but the biggest line would be -0.01
+        val plan = runner("100.07", rows, hold = true).runOnce().single()
+        assertThat(plan.action).startsWith("HELD").contains("explain 0.12 of the gap 0.07") // three lines of 0.04, so `explained` passed and only `fits` held it
+        assertThat(stored()).isEmpty()
+    }
+
+    @Test
+    fun theBiggerLaterLineIsStoredFirstEvenWhenTheSmallerOneComesFirstInDateOrder() = runBlocking<Unit> {  // B2 with the sort really needed
+        fireflyOwed = BigDecimal("23200.00")
+        owedBefore[d(8, 16)] = "24000.00"
+        owedBefore[d(9, 19)] = "23600.00"
+        failSecondStore = true
+        val rows = listOf(
+            payment("0", "400.00", d(8, 10)), interest("i0", "100.00", "400.00", d(8, 10)),
+            payment("a", "400.00", d(8, 17)), payment("b", "400.00", d(9, 20)),
+        )
+        // a: 7 days (about 34.93), b: 34 days (about 167.10); a gap 0.20 above the sum goes to b, the biggest, which must be written first
+        org.junit.jupiter.api.assertThrows<IllegalStateException> { runner("23402.23", rows).runOnce() }
+        val first = stored().first().transactions.single()
+        assertThat(first.date.toLocalDate()).isEqualTo(d(9, 20))
+        assertThat(first.amount).isEqualTo("167.30")
+    }
+
+    @Test
+    fun aLoanThatFireflyLagsForThreeNightsInARowFailsTheRunAndAHealthyNightResetsTheCount() {  // N6
+        fireflyOwed = BigDecimal("23817.37")
+        val lagDir = File(dir, "lag").path
+        var day = d(10, 1)
+        fun night(plaid: String = "23427.28") = runner(plaid, chargedThenNew, hold = true, lagDir = lagDir).also { it.today = { day } }.run()
+        night(); day = d(10, 2); night() // two nights: still a normal lag
+        day = d(10, 3)
+        val e = org.junit.jupiter.api.assertThrows<IllegalStateException> { night() }
+        assertThat(e.message).contains("Firefly lags").contains("[2]")
+        day = d(10, 4); night("23817.40") // healthy again: the count starts over
+        day = d(10, 5); night(); day = d(10, 6); night()
     }
 }

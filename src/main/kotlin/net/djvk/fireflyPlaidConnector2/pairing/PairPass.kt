@@ -146,7 +146,7 @@ class PairPass(
         // H1: a pair this connector merged whose two journals are single again was unmerged by a person; it is never proposed again
         val state = PairStateFile.read(settings.directory)
         val singleIds = legs.map { it.id }.toSet()
-        val (stillMerged, unmerged) = state.merges.partition { !(it.out.id in singleIds && it.inn.id in singleIds) }
+        val (stillMerged, unmerged) = (state.merges + recoverCommittedMerges(state, journals)).partition { !(it.out.id in singleIds && it.inn.id in singleIds) }
         val rejectedPairs = (state.rejected + unmerged.map { RejectedPair(it.out.id, it.inn.id, it.pairMergeId, today.toString()) }).distinctBy { it.out to it.inn }
         unmerged.forEach { logger.warn("Pair {} ({} and {}) is no longer merged; it will not be proposed again", it.pairMergeId, it.out.id, it.inn.id) }
         val engine = PairEngine(accounts, config, rejectedPairs.map { it.out to it.inn }.toSet())
@@ -223,6 +223,31 @@ class PairPass(
         return PairPassReport(result, dryRun, merged, rejected, needsHuman, lateFlags, awaiting, legs.size, kinds, text, failed)
     }
 
+    /**
+     * N1: a merge that core committed although the call failed (5xx, timeout) sits in `failures`, never in `merges`. When both of
+     * its Plaid ids now are the source and destination links of one journal, it counts as merged, so a later unmerge is noticed.
+     * The inflow leg only has the outflow's date and amount here (core keeps the OUT leg's journal); ids and accounts are exact.
+     */
+    internal fun recoverCommittedMerges(state: PairState, journals: List<TransactionRead>): List<StoredMerge> =
+        state.failures.filter { f -> state.merges.none { it.out.id == f.out && it.inn.id == f.inn } }.mapNotNull { f ->
+            journals.firstNotNullOfOrNull { g ->
+                val s = g.attributes.transactions.singleOrNull() ?: return@firstNotNullOfOrNull null
+                val links = s.plaidLinks.orEmpty()
+                val merged = links.any { it.leg == PlaidLinkLeg.source && it.plaidTransactionId == f.out } &&
+                    links.any { it.leg == PlaidLinkLeg.destination && it.plaidTransactionId == f.inn }
+                val src = s.sourceId?.toIntOrNull()
+                val dst = s.destinationId?.toIntOrNull()
+                val cents = runCatching { java.math.BigDecimal(s.amount).movePointRight(2).setScale(0, RoundingMode.HALF_UP).longValueExact() }.getOrNull()
+                if (!merged || src == null || dst == null || cents == null) return@firstNotNullOfOrNull null
+                val date = s.date.atZoneSameInstant(zone).toLocalDate()
+                StoredMerge(
+                    "unknown",
+                    Leg(f.out, src, Dir.OUT, date, cents, s.description, currency = s.currencyCode, groupId = g.id),
+                    Leg(f.inn, dst, Dir.IN, date, cents, s.description, currency = s.currencyCode, groupId = g.id),
+                )
+            }
+        }
+
     private fun watermarks(now: Instant): Map<Int, LocalDate?> {
         val statuses = kotlinx.coroutines.runBlocking { itemStatusStore.read() }
         return accountConfigs.accounts.filter { !it.investment }.associate { a ->
@@ -249,7 +274,7 @@ class PairPass(
         val pending = settings.pendingTag.isNotBlank() && split.tags?.contains(settings.pendingTag) == true
         val leg = Leg(
             links[0].plaidTransactionId, account, dir, split.date.atZoneSameInstant(zone).toLocalDate(), cents, split.description,
-            pending, split.currencyCode ?: split.currencyId, true, group.id, group.attributes.updatedAt?.toString(),
+            pending, split.currencyCode ?: split.currencyId, true, group.id, group.attributes.updatedAt?.let(::stamp),
         )
         when {
             split.reconciled == true -> { needsHuman.add(leg to "reconciled"); return null }
@@ -271,6 +296,10 @@ class PairPass(
 
     companion object {
         const val MAX_PAGES = 5000
+        private val STAMP = java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ssxxx")
+
+        /** N0: the one place a version stamp is built: always seconds, an offset like `+00:00`, never `Z` (lowercase xxx) and never a dropped `:00`. */
+        internal fun stamp(t: OffsetDateTime): String = t.format(STAMP)
         private val OWN_ACCOUNT_TYPES = setOf(AccountTypeProperty.assetAccount, AccountTypeProperty.loan, AccountTypeProperty.debt, AccountTypeProperty.mortgage)
     }
 }
@@ -324,6 +353,10 @@ object PairStateFile {
     fun write(directory: String, state: PairState) {
         val dir = Path.of(directory)
         Files.createDirectories(dir)
+        // N4: v2 is a one-way format (an old jar fails on it and starts empty); keep the v1 file the first time it is upgraded
+        val current = dir.resolve("pair-state.json")
+        val bak = dir.resolve("pair-state.json.v1.bak")
+        if (Files.exists(current) && !Files.exists(bak) && !Files.readString(current).contains("\"version\"")) Files.copy(current, bak)
         val tmp = dir.resolve("pair-state.json.tmp")
         Files.writeString(tmp, mapper.writeValueAsString(state))
         Files.move(tmp, dir.resolve("pair-state.json"), java.nio.file.StandardCopyOption.ATOMIC_MOVE, java.nio.file.StandardCopyOption.REPLACE_EXISTING)

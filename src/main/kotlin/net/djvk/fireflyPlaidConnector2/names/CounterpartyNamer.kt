@@ -47,6 +47,8 @@ class CounterpartyNamer(private val aliases: Map<String, String> = mapOf()) {
         // without a # is part of the name ("Pier 39 Parking", "Route 66 Diner", "Studio 54") and stays.
         s = s.replace(Regex("\\s+(#|(?i:no)\\.?\\s*)\\d{1,5}\\b.*$"), "")
         s = s.replace(Regex("\\s+\\d{3,5}\\b.*$"), "")
+        // N8: a 1-2 digit store number after a known chain is a store number ("TARGET 12 CHICAGO IL", "WALMART SUPERCENTER 47")
+        s = s.replace(CHAIN_STORE, "\$1")
         // a trailing "CITY ST" location, only when a name of at least two words is left
         Regex("\\s+[A-Za-z.]+\\s+[A-Z]{2}$").find(s)?.let { if (s.substring(0, it.range.first).trim().contains(' ')) s = s.substring(0, it.range.first) }
         s = s.replace(Regex("(?i)(\\s+(payroll|ppd|web|ccd|pmt|payment|autopay|direct dep|dir dep|des|inc\\.?|llc\\.?))+$"), "")
@@ -70,6 +72,11 @@ class CounterpartyNamer(private val aliases: Map<String, String> = mapOf()) {
 
     companion object {
         /** Prefixes whose text after the colon is a person, not a bank spelling of the prefix ("Zelle: JOHN SMITH"). */
+        // ponytail: a fixed list; a 1-2 digit number cannot be told from part of a name ("Studio 54", "Pier 1") without knowing the chain.
+        // Add a chain here when its stores show up as separate payees.
+        private val CHAIN_STORE = Regex(
+            "^(?i)(walmart supercenter|walmart|target|starbucks|kroger|home depot|shell oil|shell|cvs pharmacy|cvs|trader joes|lowes|costco|walgreens|mcdonalds|dunkin)\\s+\\d{1,2}\\b.*$",
+        )
         private val PERSON_TO_PERSON = setOf("zelle", "venmo", "cash app", "paypal", "apple cash")
 
         /** `{"EVOLV CONSULTING": "Evolv Consulting", ...}`; keys are compared by [key]. A missing file is no aliases. */

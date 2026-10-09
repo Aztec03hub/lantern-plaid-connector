@@ -14,8 +14,8 @@ import java.time.LocalDate
 /** The client of core's merge endpoint (design 5, test 6 and K6) against a fake of the endpoint's contract. */
 internal class PairApiContractTest {
     private val day = LocalDate.of(2026, 1, 10)
-    // the version the connector reads is the group's updated_at as OffsetDateTime.toString prints it ("...T00:00Z", no zero seconds)
-    private val v = java.time.OffsetDateTime.parse("2026-02-01T00:00:00Z").toString()
+    // the version the connector sends is the group's updated_at as PairPass.stamp prints it (seconds, "+00:00", never "Z")
+    private val v = PairPass.stamp(java.time.OffsetDateTime.parse("2026-02-01T00:00:00Z"))
 
     private fun world(): Triple<FakePairCore, String, String> {
         val core = FakePairCore()
@@ -77,7 +77,7 @@ internal class PairApiContractTest {
     fun theFakeDerivesTheRefusalsItCanCheckFromTheStoredJournals() = runBlocking<Unit> {
         // stale: a version that differs from the stored one
         var (core, keep, absorb) = world()
-        assertThat(core.api().merge(request(keep, absorb, keepV = "2026-02-02T00:00:00Z"))).isEqualTo(PairMergeOutcome.Rejected(409, "stale"))
+        assertThat(core.api().merge(request(keep, absorb, keepV = "2026-02-02T00:00:00+00:00"))).isEqualTo(PairMergeOutcome.Rejected(409, "stale"))
         // an edit that lands after the connector read but before core checks
         world().let { (c, k, a) -> c.beforeChecks = { c.edit(k, "2026-02-20T00:00:00Z") }; assertThat(c.api().merge(request(k, a))).isEqualTo(PairMergeOutcome.Rejected(409, "stale")) }
         // reconciled and already-paired journals

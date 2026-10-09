@@ -142,9 +142,9 @@ class RehomePaymentsRunner(
     /** `rehome.reverse=true`: puts every `done` move back, newest first, and logs a `reversed` line for each. */
     internal suspend fun reverseLog() {
         val lines = if (logFile.exists()) logFile.readLines().filter { it.isNotBlank() }.map { mapper.readTree(it) } else listOf()
-        fun key(e: com.fasterxml.jackson.databind.JsonNode) = e["journal"].asText() + "/" + e["split"].asText()
-        val reversedKeys = lines.filter { it["status"]?.asText() == "reversed" }.map { key(it) }.toSet()
-        val todo = lines.filter { it["status"]?.asText() == "done" && key(it) !in reversedKeys }.reversed()
+        // N11: a `reversed` line names the `done` line it undid by that line's `at`, so a move made AFTER a reverse is reversed next time
+        val undone = lines.filter { it["status"]?.asText() == "reversed" }.mapNotNull { it["undoes"]?.asText() }.toSet()
+        val todo = lines.filter { it["status"]?.asText() == "done" && it["at"]?.asText() !in undone }.reversed()
         println("== Reverse: ${todo.size} moves to put back")
         todo.forEach { println("   journal ${it["journal"].asText()}: back to destination ${it["oldDestination"].asText()} and leg ${it["oldLeg"].asText()}") }
         if (!apply) { println("DRY RUN: nothing was changed. Add --fireflyPlaidConnector2.repair.apply=true to apply."); return }
@@ -156,7 +156,7 @@ class RehomePaymentsRunner(
                 e["journal"].asText(),
                 TransactionUpdate(applyRules = false, fireWebhooks = false, transactions = listOf(TransactionSplitUpdate(transactionJournalId = e["split"]?.takeIf { !it.isNull }?.asText(), destinationId = old, plaidLinks = listOf(link)))),
             )
-            log("status" to "reversed", "journal" to e["journal"].asText(), "split" to e["split"]?.takeIf { !it.isNull }?.asText())
+            log("status" to "reversed", "journal" to e["journal"].asText(), "split" to e["split"]?.takeIf { !it.isNull }?.asText(), "undoes" to e["at"].asText())
         }
         println("REVERSED ${todo.size} moves.")
     }

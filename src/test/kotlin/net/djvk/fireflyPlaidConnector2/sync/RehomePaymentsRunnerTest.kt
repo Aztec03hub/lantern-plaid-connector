@@ -148,6 +148,29 @@ internal class RehomePaymentsRunnerTest {
         verify(txApi, org.mockito.kotlin.times(2)).updateTransaction(any(), any())
     }
 
+    private fun done(old: String, new: String, at: String) =
+        """{"status":"done","journal":"a","split":"ja","oldDestination":"$old","newDestination":"$new","plaidTx":"pa","plaidAccount":"plaid1","oldLeg":"single","at":"$at"}"""
+
+    @Test
+    fun aJournalMovedTwiceIsReversedNewestFirstSoItEndsOnItsFirstDestination() = runBlocking<Unit> {  // N11
+        File(dir, "rehome_log.jsonl").writeText(done("50", "60", "2026-10-01T01:00:00Z") + "\n" + done("60", "70", "2026-10-02T01:00:00Z") + "\n")
+        runner(true, emptyList(), reverse = true).reverseLog()
+        val upd = argumentCaptor<TransactionUpdate>()
+        verify(txApi, org.mockito.kotlin.times(2)).updateTransaction(any(), upd.capture())
+        assertThat(upd.allValues.map { it.transactions!!.single().destinationId }).containsExactly("60", "50")
+    }
+
+    @Test
+    fun aMoveMadeAfterAReverseIsReversedByTheNextReverse() = runBlocking<Unit> {  // N11: keyed on the done line, not on the journal
+        File(dir, "rehome_log.jsonl").writeText(done("50", "60", "2026-10-01T01:00:00Z") + "\n")
+        runner(true, emptyList(), reverse = true).reverseLog()
+        File(dir, "rehome_log.jsonl").appendText(done("50", "60", "2026-10-05T01:00:00Z") + "\n") // moved again later
+        runner(true, emptyList(), reverse = true).reverseLog()
+        verify(txApi, org.mockito.kotlin.times(2)).updateTransaction(any(), any())
+        runner(true, emptyList(), reverse = true).reverseLog() // nothing left
+        verify(txApi, org.mockito.kotlin.times(2)).updateTransaction(any(), any())
+    }
+
     @Test
     fun aRuleAnchoredOnTheOriginalTextMatchesTheBackfillToo() = runBlocking<Unit> {  // L4: the stored text is "merchant: original text"
         val r = runner(false, listOf(journal("a", "400.00", desc = "PHIL: XXXX0198 ACH")), match = "^XXXX0198")

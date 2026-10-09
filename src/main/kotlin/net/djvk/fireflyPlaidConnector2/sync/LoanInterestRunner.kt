@@ -84,14 +84,39 @@ class LoanInterestRunner(
      */
     @Value("\${fireflyPlaidConnector2.loan.holdUnexplained:false}")
     private val holdUnexplained: Boolean = false,
+    /** N6: where `loan-lag.json` lives (blank: no tracking). A loan that "Firefly lags" for [lagNights] nights in a row fails the run. */
+    @Value("\${fireflyPlaidConnector2.polled.cursorFileDirectoryPath:persistence}")
+    private val lagDirectory: String = "",
+    @Value("\${fireflyPlaidConnector2.loan.lagNights:3}")
+    private val lagNights: Int = 3,
 ) : Runner {
+    internal var today: () -> LocalDate = { LocalDate.now(zone) }
     private val zone = ZoneId.of(timeZoneString)
     private val tolerance = BigDecimal.valueOf(tolerance)
 
     /** A loan left HELD exits non-zero, so the nightly prints its "!!" line instead of looking fine (A1). */
     override fun run() = runBlocking<Unit> {
-        val held = runOnce(apply).filter { it.action.startsWith("HELD") }
+        val plans = runOnce(apply)
+        val held = plans.filter { it.action.startsWith("HELD") }
         check(held.isEmpty()) { "loan-interest: ${held.size} loan(s) HELD, nothing written: ${held.map { it.loan.account }}" }
+        val stuck = trackLag(plans)
+        check(stuck.isEmpty()) { "loan-interest: loan(s) $stuck have been \"Firefly lags\" for $lagNights or more nights; a payment Plaid has seen is probably missing in Firefly" }
+    }
+
+    /**
+     * N6: "Firefly lags" is self-healing for a night or two and a missing payment after that. Remembers the first night each loan
+     * lagged in `loan-lag.json` (real runs only) and returns the loans that have lagged for [lagNights] nights or more.
+     */
+    private fun trackLag(plans: List<LoanPlan>): List<Int> {
+        if (!apply || lagDirectory.isBlank()) return listOf()
+        val file = File(lagDirectory, "loan-lag.json")
+        @Suppress("UNCHECKED_CAST")
+        val old = if (file.exists()) runCatching { ObjectMapper().readValue(file, Map::class.java) as Map<String, String> }.getOrDefault(mapOf()) else mapOf()
+        val now = today()
+        val lagging = plans.filter { it.action.startsWith("Firefly lags") }.associate { it.loan.account.toString() to (old[it.loan.account.toString()] ?: now.toString()) }
+        File(lagDirectory).mkdirs()
+        file.writeText(ObjectMapper().writeValueAsString(lagging))
+        return lagging.filterValues { ChronoUnit.DAYS.between(LocalDate.parse(it), now) >= lagNights - 1 }.keys.map { it.toInt() }
     }
 
     /** One pass, also callable by a later nightly job. Apply re-reads every loan it wrote to and fails if a gap is left. */
@@ -164,7 +189,7 @@ class LoanInterestRunner(
             LoanPlan(loan, name, plaidOwed, fireflyOwed, gap, lines, residual, action)
         if (gap.abs() <= tolerance) return done("OK: within $tolerance")
         // Plaid owes LESS than Firefly: Plaid has seen a payment that Firefly has not (not imported or not routed yet)
-        if (gap.signum() < 0) return done("Firefly lags: Plaid owes less than Firefly, so Plaid has seen a payment Firefly has not; nothing written")
+        if (gap.signum() < 0) return done("Firefly lags: Plaid owes less than Firefly, so a payment Plaid has seen may be missing in Firefly, or Firefly holds interest or withdrawals Plaid does not; nothing written")
 
         val splits = splitsOf(loan.account)
         // the connector's own rows (interest, unexplained residual) and tagged rows are never payments

@@ -276,7 +276,12 @@ internal class DatesAndOpeningsRepairTest {
                 transactionJournalId = "jgm",
             ), ObjectLink(),
         )
-        assertThat(plan(listOf(merged), listOf(plaid("src", day.plusDays(1)), plaid("dst", day))).redates.single().newDate).isEqualTo(midnight(day))
+        val redate = plan(listOf(merged), listOf(plaid("src", day.plusDays(1)), plaid("dst", day))).redates.single()
+        assertThat(redate.newDate).isEqualTo(midnight(day))
+        assertThat(redate.ambiguous).isTrue() // N9: flagged in the dry run, because a core merge would have kept the OUT leg's date
+        // a single-link journal, and a pair with one leg unknown to Plaid, are not ambiguous
+        assertThat(plan(listOf(journal("gs", midnight(day.minusDays(3)), "w1")), listOf(plaid("w1", day))).redates.single().ambiguous).isFalse()
+        assertThat(plan(listOf(merged), listOf(plaid("dst", day))).redates.single().ambiguous).isFalse()
     }
 
     @Test

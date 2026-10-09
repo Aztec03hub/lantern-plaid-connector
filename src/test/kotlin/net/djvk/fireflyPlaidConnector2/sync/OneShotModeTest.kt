@@ -91,6 +91,14 @@ internal class OneShotModeTest {
     }
 
     @Test
+    fun aOneShotThatCannotStartExitsOneAndNeverPolls() {  // nit2: the startup catch in run()
+        runBlocking { whenever(syncHelper.setApiCreds()).doSuspendableAnswer { throw IllegalStateException("no credentials") } }
+        orchestrator(1).run()
+        assertEquals(listOf(1), exits)
+        runBlocking { verify(plaidSyncService, org.mockito.kotlin.never()).processPlaidTransactions(any(), any()) }
+    }
+
+    @Test
     fun aThrowingPairPassIsLoggedAndTheCursorsStillCommit() = runBlocking<Unit> {
         emptyPoll()
         // an empty poll skips Firefly entirely (and the pair hook with it), so give it one deletion to work on

@@ -165,8 +165,10 @@ class RehomeNamesRunner(
     }
 
     private fun print(plan: List<NameGroup>) {
-        println("== Names: ${plan.size} groups of expense/revenue accounts that are one payee")
-        for (g in plan) {
+        val (renameOnly, merges) = plan.partition { it.duplicates.isEmpty() }
+        // N12: rename-only groups (every account whose name differs from the namer's spelling) are listed after the merges and counted apart
+        println("== Names: ${merges.size} groups of expense/revenue accounts that are one payee, and ${renameOnly.size} lone accounts to rename only (listed last)")
+        for (g in merges + renameOnly) {
             println("   ${g.type.value} \"${g.canonical}\": keep ${g.survivor.id} (\"${g.survivor.name}\", ${g.survivor.journals} journals)${if (g.rename) ", rename" else ""}")
             if (g.duplicates.isEmpty()) println("      (alone: rename only)")
             g.duplicates.forEach { println("      merge ${it.id} (\"${it.name}\", ${it.journals} journals)") }
