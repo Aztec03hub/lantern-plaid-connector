@@ -230,6 +230,56 @@ internal class DatesAndOpeningsRepairTest {
     }
 
     @Test
+    fun aMergedTransferKeepsTheDateOfItsOutLegAndIsNotProposed() {
+        val day = LocalDate.of(2024, 12, 6)
+        // core's pair merge keeps the OUT (source) leg's journal, so the date is the OUT leg's posted date; the in leg posts a day earlier
+        val merged = TransactionRead(
+            "transactions", "gm",
+            FireflyFixtures.getTransaction(
+                type = TransactionTypeProperty.transfer, date = midnight(day.plusDays(1)), amount = "10.00", sourceId = "1", destinationId = "2",
+                processDate = midnight(day.plusDays(1)),
+                plaidLinks = listOf(PlaidLink("src", PlaidLinkLeg.source, plaidAccount), PlaidLink("dst", PlaidLinkLeg.destination, plaidAccount)),
+                transactionJournalId = "jgm",
+            ), ObjectLink(),
+        )
+        val p = plan(listOf(merged), listOf(plaid("src", day.plusDays(1)), plaid("dst", day)))
+        assertThat(p.redates).isEmpty()
+    }
+
+    @Test
+    fun aMergedTransferStoredAsTheSameInstantWrittenAnotherWayIsNotProposed() {
+        val day = LocalDate.of(2024, 12, 6)
+        val inUtc = midnight(day.plusDays(1)).withOffsetSameInstant(ZoneOffset.UTC)  // 06:00Z instead of 00:00-06:00
+        val merged = TransactionRead(
+            "transactions", "gm",
+            FireflyFixtures.getTransaction(
+                type = TransactionTypeProperty.transfer, date = inUtc, amount = "10.00", sourceId = "1", destinationId = "2", processDate = inUtc,
+                plaidLinks = listOf(PlaidLink("src", PlaidLinkLeg.source, plaidAccount), PlaidLink("dst", PlaidLinkLeg.destination, plaidAccount)),
+                transactionJournalId = "jgm",
+            ), ObjectLink(),
+        )
+        assertThat(plan(listOf(merged), listOf(plaid("src", day.plusDays(1)), plaid("dst", day))).redates).isEmpty()
+        // and a single-link journal stored the same way is not proposed either
+        val single = journal("gs", midnight(day).withOffsetSameInstant(ZoneOffset.UTC), "w1")
+        assertThat(plan(listOf(single), listOf(plaid("w1", day))).redates).isEmpty()
+    }
+
+    @Test
+    fun aMergedTransferMatchingNeitherLegStillGetsTheDestinationLegDate() {
+        val day = LocalDate.of(2024, 12, 6)
+        val merged = TransactionRead(
+            "transactions", "gm",
+            FireflyFixtures.getTransaction(
+                type = TransactionTypeProperty.transfer, date = midnight(day.minusDays(3)), amount = "10.00", sourceId = "1", destinationId = "2",
+                processDate = midnight(day.minusDays(3)),
+                plaidLinks = listOf(PlaidLink("src", PlaidLinkLeg.source, plaidAccount), PlaidLink("dst", PlaidLinkLeg.destination, plaidAccount)),
+                transactionJournalId = "jgm",
+            ), ObjectLink(),
+        )
+        assertThat(plan(listOf(merged), listOf(plaid("src", day.plusDays(1)), plaid("dst", day))).redates.single().newDate).isEqualTo(midnight(day))
+    }
+
+    @Test
     fun anAuthorizedTimeWithNoAuthorizedDateIsNotUsedForBookDate() {
         val tx = firefly(plaid("a2", LocalDate.of(2024, 12, 6), authorizedDatetime = OffsetDateTime.of(2024, 12, 4, 5, 0, 0, 0, ZoneOffset.UTC)))
         assertThat(tx.bookDate).isNull()

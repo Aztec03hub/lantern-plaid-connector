@@ -132,8 +132,10 @@ class RepairPlanner(
             if (links.isEmpty()) continue
             // A pair carries the destination leg's date (that leg has the best categorization, see convertDoublePlaid);
             //  when that leg is not in Plaid's history the source leg's record is used
-            val plaid = links.sortedBy { it.leg != PlaidLinkLeg.destination }
-                .firstNotNullOfOrNull { input.plaidTxs[it.plaidTransactionId] }
+            // A merged transfer (core's pair merge) keeps the OUT leg's date, and the merged journal has the same two links as a
+            //  connector-made pair; so a pair whose stored date is already one of its own legs' posted instants is left on that leg.
+            val known = links.sortedBy { it.leg != PlaidLinkLeg.destination }.mapNotNull { input.plaidTxs[it.plaidTransactionId] }
+            val plaid = known.firstOrNull { converter.getTxPostedTimestamp(it).toInstant() == split.date.toInstant() } ?: known.firstOrNull()
             if (plaid == null) {
                 // Not in Plaid's history: reported, never moved (there is no record of the real posted date)
                 unmatched++
