@@ -268,7 +268,9 @@ class LoanInterestRunner(
     }
 
     private suspend fun store(split: TransactionSplit) {
-        fireflyTxApi.storeTransaction(TransactionStore(listOf(split), errorIfDuplicateHash = false, applyRules = false, fireWebhooks = false, groupTitle = null))
+        // Firefly answers 422 to a create with order or reconciled sent as null; the importer sends 0 and false too
+        val s = split.copy(order = split.order ?: 0, reconciled = split.reconciled ?: false)
+        fireflyTxApi.storeTransaction(TransactionStore(listOf(s), errorIfDuplicateHash = false, applyRules = false, fireWebhooks = false, groupTitle = null))
     }
 
     private fun print(p: LoanPlan) {

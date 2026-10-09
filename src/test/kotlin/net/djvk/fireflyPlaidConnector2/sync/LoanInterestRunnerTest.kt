@@ -180,6 +180,17 @@ internal class LoanInterestRunnerTest {
     }
 
     @Test
+    fun everyStoredJournalCarriesOrderAndReconciledAsFireflyRequires() = runBlocking<Unit> {
+        // Firefly answers 422 to a create whose order or reconciled is sent as null (the 2026-10-09 nightly)
+        owedBefore[d(8, 31)] = "23817.37"
+        runner("23717.37", chargedThenNew).runOnce()
+        val all = stored().map { it.transactions.single() }
+        assertThat(all).hasSize(2)
+        assertThat(all.map { it.order }).containsOnly(0)
+        assertThat(all.map { it.reconciled }).containsOnly(false)
+    }
+
+    @Test
     fun holdUnexplainedWritesNothingForAGapThePaymentsDoNotExplain() = runBlocking<Unit> {
         owedBefore[d(8, 31)] = "23817.37"
         val plan = runner("23717.37", chargedThenNew, hold = true).runOnce().single()
