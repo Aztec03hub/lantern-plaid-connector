@@ -63,6 +63,11 @@ internal class ResyncNoDuplicatesTest {
     private val journals = linkedMapOf<String, TransactionStore>()
     private var stores = 0
     private var failOnStoreNumber = -1
+    private var lostResponseOnStoreNumber = -1
+
+    /** Switch off one defence at a time: the 409 on an already-linked id, or the link lookup (answers "nothing held"). */
+    private var conflictsEnabled = true
+    private var lookupEnabled = true
 
     private fun linkOwners(): Map<String, String> =
         journals.flatMap { (group, tx) -> tx.transactions.flatMap { it.plaidLinks.orEmpty() }.map { it.plaidTransactionId to group } }.toMap()
@@ -91,18 +96,23 @@ internal class ResyncNoDuplicatesTest {
                 if (++stores == failOnStoreNumber) throw IllegalStateException("simulated crash before store #$stores")
                 val owners = linkOwners()
                 val conflicts = store.transactions.flatMap { s -> s.plaidLinks.orEmpty().map { l -> l.plaidTransactionId } }.filter { id -> id in owners }
-                if (conflicts.isNotEmpty()) {
-                    throw statusError(
-                        HttpStatusCode.Conflict,
-                        """{"message":"already linked","conflicts":[${conflicts.joinToString(",") { id -> """{"plaid_transaction_id":"$id"}""" }}]}""",
-                    )
+                if (conflictsEnabled && conflicts.isNotEmpty()) {
+                    // core's body: integer journal and group ids plus the leg (docs/core-plaid-links.md)
+                    val rows = conflicts.joinToString(",") { id ->
+                        val group = owners.getValue(id)
+                        val link = journals.getValue(group).transactions.flatMap { s -> s.plaidLinks.orEmpty() }.first { l -> l.plaidTransactionId == id }
+                        """{"plaid_transaction_id":"$id","transaction_journal_id":${group.drop(1)},"transaction_group_id":${group.drop(1)},"leg":"${link.leg.value}"}"""
+                    }
+                    throw statusError(HttpStatusCode.Conflict, """{"message":"already linked","conflicts":[$rows]}""")
                 }
                 val group = "g${journals.size + 1}"
                 journals[group] = store
+                // The write landed but the answer never reached the connector
+                if (stores == lostResponseOnStoreNumber) throw java.io.IOException("simulated lost response for store #$stores")
                 createFireflyResponse(TransactionSingle(read(group, store)))
             }
             whenever(firefly.plaidLinksApi.lookupPlaidLinks(any())).doSuspendableAnswer {
-                val owners = linkOwners()
+                val owners = if (lookupEnabled) linkOwners() else mapOf()
                 val rows = it.getArgument<List<String>>(0).filter { id -> id in owners }.map { id ->
                     val group = owners.getValue(id)
                     val link = journals.getValue(group).transactions.flatMap { s -> s.plaidLinks.orEmpty() }.first { l -> l.plaidTransactionId == id }
@@ -143,10 +153,52 @@ internal class ResyncNoDuplicatesTest {
         assertThat(sync()).isEqualTo(batch.size)
         assertThat(journals).hasSize(batch.size)
 
+        val storesBefore = stores
         val secondRun = sync()
 
+        assertThat(stores - storesBefore).describedAs("create requests the second run sent").isEqualTo(0)
         assertThat(secondRun).describedAs("journals created by the second run").isEqualTo(0)
         assertThat(journals).describedAs("journals after the second run").hasSize(batch.size)
+        assertThat(linkOwners().keys).containsExactlyInAnyOrder("tx1", "tx2", "tx3", "tx4")
+    }
+
+    /** The lookup alone: Firefly never refuses a duplicate (409 off), so only the connector's link lookup can stop one. */
+    @Test
+    fun theLinkLookupAlonePreventsDuplicatesOnAResync() = runBlocking<Unit> {
+        conflictsEnabled = false
+        sync()
+
+        val storesBefore = stores
+        sync()
+
+        assertThat(stores - storesBefore).describedAs("create requests sent by the second run").isEqualTo(0)
+        assertThat(journals).describedAs("journals after the second run").hasSize(batch.size)
+    }
+
+    /** The 409 alone: the lookup misses (Firefly lagging behind), so every create is sent and every one must be refused and dropped. */
+    @Test
+    fun theConflictHandlingAlonePreventsDuplicatesOnAResync() = runBlocking<Unit> {
+        lookupEnabled = false
+        sync()
+
+        val storesBefore = stores
+        val secondRun = sync()
+
+        assertThat(stores - storesBefore).describedAs("creates sent (all refused with 409)").isEqualTo(batch.size)
+        assertThat(secondRun).isEqualTo(0)
+        assertThat(journals).describedAs("journals after the second run").hasSize(batch.size)
+    }
+
+    /** The realistic double-create: Firefly stores the journal but the answer is lost, so the poll fails and is retried. */
+    @Test
+    fun aLostResponseAfterAStoredJournalIsNotRecordedAgainOnTheRetry() = runBlocking<Unit> {
+        lostResponseOnStoreNumber = 2
+        runCatching { sync() }.exceptionOrNull().let { assertThat(it).isNotNull() }
+        assertThat(journals).describedAs("journals the failed run left").hasSize(2)
+
+        sync()
+
+        assertThat(journals).hasSize(batch.size)
         assertThat(linkOwners().keys).containsExactlyInAnyOrder("tx1", "tx2", "tx3", "tx4")
     }
 
