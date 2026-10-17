@@ -92,13 +92,6 @@ class CursorManager(
         }
     }
 
-    private fun writeDurably(path: java.nio.file.Path, content: String) {
-        java.nio.channels.FileChannel.open(path, java.nio.file.StandardOpenOption.WRITE).use { ch ->
-            ch.write(java.nio.ByteBuffer.wrap(content.toByteArray()))
-            ch.force(true)
-        }
-    }
-
     private fun restrictToOwner(path: java.nio.file.Path) {
         try {
             Files.setPosixFilePermissions(path, PosixFilePermissions.fromString("rw-------"))
