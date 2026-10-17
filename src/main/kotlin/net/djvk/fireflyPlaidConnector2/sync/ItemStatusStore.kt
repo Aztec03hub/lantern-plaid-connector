@@ -98,7 +98,10 @@ class ItemStatusStore(
         Files.createDirectories(directory)
         val temp = Files.createTempFile(directory, "item_status", ".tmp")
         try {
-            Files.writeString(temp, mapper.writerWithDefaultPrettyPrinter().writeValueAsString(statuses))
+            java.nio.channels.FileChannel.open(temp, java.nio.file.StandardOpenOption.WRITE).use { ch ->
+                ch.write(java.nio.ByteBuffer.wrap(mapper.writerWithDefaultPrettyPrinter().writeValueAsString(statuses).toByteArray()))
+                ch.force(true)
+            }
             try {
                 Files.move(temp, path, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
             } catch (e: java.nio.file.AtomicMoveNotSupportedException) {

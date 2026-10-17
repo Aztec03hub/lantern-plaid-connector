@@ -77,7 +77,9 @@ class CursorManager(
             val temp = Files.createTempFile(directory, "plaid_sync_cursors", ".tmp")
             try {
                 restrictToOwner(temp)
-                Files.writeString(temp, content)
+                writeDurably(temp, content)
+                // ponytail: directory fsync is skipped; a lost rename leaves the old file, and cursors stay safe
+                // because the next poll re-reads from the last committed cursor
                 try {
                     Files.move(temp, cursorFilePath, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
                 } catch (e: AtomicMoveNotSupportedException) {
@@ -87,6 +89,13 @@ class CursorManager(
             } finally {
                 Files.deleteIfExists(temp)
             }
+        }
+    }
+
+    private fun writeDurably(path: java.nio.file.Path, content: String) {
+        java.nio.channels.FileChannel.open(path, java.nio.file.StandardOpenOption.WRITE).use { ch ->
+            ch.write(java.nio.ByteBuffer.wrap(content.toByteArray()))
+            ch.force(true)
         }
     }
 
