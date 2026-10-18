@@ -9,6 +9,7 @@ import com.fasterxml.jackson.databind.SerializationFeature
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule
 import io.ktor.client.*
 import io.ktor.client.engine.*
+import io.ktor.client.plugins.defaultRequest
 import io.ktor.client.plugins.contentnegotiation.*
 import io.ktor.client.request.*
 import io.ktor.client.request.forms.*
@@ -30,6 +31,8 @@ abstract class ApiClient(
             it.install(ContentNegotiation) {
                 jackson { jsonBlock() }
             }
+            // ktor 3 stopped sending Accept-Charset by default; ktor 2 sent "UTF-8". Keep the wire format unchanged.
+            it.defaultRequest { headers.append(HttpHeaders.AcceptCharset, "UTF-8") }
             httpClientConfig?.invoke(it)
         }
     }

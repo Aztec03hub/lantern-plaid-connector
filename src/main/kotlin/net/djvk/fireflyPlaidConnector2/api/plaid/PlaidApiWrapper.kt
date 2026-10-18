@@ -43,7 +43,11 @@ class PlaidApiWrapper(
     @Value("\${fireflyPlaidConnector2.plaid.retryBackoffMillis:2000}")
     private val retryBackoffMillis: Long = 2000,
 ) {
-    private val plaidApi = PlaidApi(baseUrl, httpClientEngine, httpClientConfig) {
+    private val plaidApi = PlaidApi(baseUrl, httpClientEngine, { config ->
+        // ktor 3 stopped sending Accept-Charset by default; ktor 2 sent "UTF-8". Keep the wire format unchanged.
+        config.defaultRequest { headers.append(HttpHeaders.AcceptCharset, "UTF-8") }
+        httpClientConfig?.invoke(config)
+    }) {
         ApiClient.JSON_DEFAULT.invoke(this)
         configure(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS, false)
         // Plaid answers 400 UNKNOWN_FIELDS to a field an endpoint does not know, even when it is null (the generated

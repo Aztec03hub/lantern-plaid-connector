@@ -28,6 +28,7 @@ springBoot {
 //  OSV scan of the runtime classpath). Remove an override once Boot's own BOM catches up.
 extra["jackson-bom.version"] = "2.22.3"
 extra["log4j2.version"] = "2.26.1"
+extra["kotlin-coroutines.version"] = "1.11.0"
 
 repositories {
     mavenCentral()
@@ -38,7 +39,7 @@ dependencies {
     implementation(libs.ktor.cio)
     implementation(libs.ktor.logging)
     implementation("org.springframework.boot:spring-boot-starter")
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0")
     implementation("org.semver4j:semver4j:5.8.0")
     testImplementation(libs.kotlin.test)
     testImplementation(libs.ktor.mock)
