@@ -32,7 +32,7 @@ abstract class ApiClient(
                 jackson { jsonBlock() }
             }
             // ktor 3 stopped sending Accept-Charset by default; ktor 2 sent "UTF-8". Keep the wire format unchanged.
-            it.defaultRequest { headers.append(HttpHeaders.AcceptCharset, "UTF-8") }
+            it.defaultRequest { headers.set(HttpHeaders.AcceptCharset, "UTF-8") }
             httpClientConfig?.invoke(it)
         }
     }

@@ -45,7 +45,7 @@ class PlaidApiWrapper(
 ) {
     private val plaidApi = PlaidApi(baseUrl, httpClientEngine, { config ->
         // ktor 3 stopped sending Accept-Charset by default; ktor 2 sent "UTF-8". Keep the wire format unchanged.
-        config.defaultRequest { headers.append(HttpHeaders.AcceptCharset, "UTF-8") }
+        config.defaultRequest { headers.set(HttpHeaders.AcceptCharset, "UTF-8") }
         httpClientConfig?.invoke(config)
     }) {
         ApiClient.JSON_DEFAULT.invoke(this)
