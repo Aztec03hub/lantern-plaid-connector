@@ -1,6 +1,7 @@
 package net.djvk.fireflyPlaidConnector2.sync
 
 import com.fasterxml.jackson.databind.ObjectMapper
+import io.ktor.client.plugins.ClientRequestException
 import kotlinx.coroutines.runBlocking
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.AccountsApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.TransactionsApi
@@ -24,6 +25,9 @@ import kotlin.math.max
 
 /** One loan of the pair config's `loans` list: the Firefly account, its APR in percent, and the expense account interest goes to. */
 data class LoanConfig(val account: Int, val apr: BigDecimal, val interestAccount: String)
+
+/** Plaid's institution did not answer for a loan's balance (transient error_code, no figures or tokens). */
+internal class PlaidBalanceUnavailable(val errorCode: String, cause: Throwable) : RuntimeException("Plaid balance unavailable: $errorCode", cause)
 
 object LoanConfigLoader {
     private val mapper = ObjectMapper()
@@ -94,6 +98,9 @@ class LoanInterestRunner(
     private val zone = ZoneId.of(timeZoneString)
     private val tolerance = BigDecimal.valueOf(tolerance)
 
+    /** Loans [runOnce] skipped because Plaid's institution did not answer (LAN-50), with Plaid's error_code. */
+    private var skipped: List<Pair<LoanConfig, String>> = listOf()
+
     /** A loan left HELD exits non-zero, so the nightly prints its "!!" line instead of looking fine (A1). */
     override fun run() = runBlocking<Unit> {
         val plans = runOnce(apply)
@@ -101,6 +108,7 @@ class LoanInterestRunner(
         // V3: track first, so a night with a HELD loan still records the recovery of the others
         val stuck = trackLag(plans)
         val parts = listOfNotNull(
+            skipped.takeIf { it.isNotEmpty() }?.let { "${it.size} loan(s) SKIPPED, Plaid did not answer: ${it.map { (l, c) -> "${l.account} ($c)" }}" },
             held.takeIf { it.isNotEmpty() }?.let { "${it.size} loan(s) HELD, nothing written: ${it.map { h -> h.loan.account }}" },
             stuck.takeIf { it.isNotEmpty() }?.let { "loan(s) $it have been \"Firefly lags\" for $lagNights or more nights; a payment Plaid has seen is probably missing in Firefly" },
         )
@@ -127,7 +135,7 @@ class LoanInterestRunner(
                 it.action.startsWith("HELD") && prior != null -> k to prior
                 else -> null
             }
-        }.toMap()
+        }.toMap() + skipped.mapNotNull { (l, _) -> old[l.account.toString()]?.takeIf { d -> runCatching { LocalDate.parse(d) }.isSuccess }?.let { l.account.toString() to it } }.toMap()
         File(lagDirectory).mkdirs()
         // W3: temp file then atomic move, so a kill mid-write leaves the old file whole
         val tmp = File(lagDirectory, "loan-lag.json.tmp")
@@ -140,7 +148,15 @@ class LoanInterestRunner(
     suspend fun runOnce(apply: Boolean = this.apply): List<LoanPlan> {
         syncHelper.setApiCreds()
         val loans = LoanConfigLoader.load(configFile)
-        val plans = loans.map { plan(it) }
+        val skip = mutableListOf<Pair<LoanConfig, String>>()
+        // LAN-50: only a loan whose Plaid balance cannot be read after the wrapper's retries is skipped; nothing is written for it
+        val plans = loans.mapNotNull {
+            try { plan(it) } catch (e: PlaidBalanceUnavailable) {
+                println("WARN: loan ${it.account} skipped: Plaid balance unavailable (${e.errorCode}); nothing written for it")
+                skip.add(it to e.errorCode); null
+            }
+        }
+        skipped = skip
         plans.forEach { print(it) }
         if (!apply) {
             println("DRY RUN: nothing was changed. Add --fireflyPlaidConnector2.repair.apply=true to apply.")
@@ -148,7 +164,7 @@ class LoanInterestRunner(
         }
         plans.filter { it.writes }.forEach { write(it) }
         println("APPLIED. Re-reading to check:")
-        val plaidAfter = readPlaidOwed(loans)
+        val plaidAfter = readPlaidOwed(plans.filter { it.writes }.map { it.loan })
         for (p in plans.filter { it.writes }) {
             val again = gapOf(p.loan, plaidAfter)
             println("   loan ${p.loan.account}: gap now $again")
@@ -164,10 +180,14 @@ class LoanInterestRunner(
         for ((token, ids) in items.toList()) {
             val ours = ids.filter { accountMap[it] in wanted }
             if (ours.isEmpty()) continue
-            val balances = plaidApiWrapper.executeRequest(
-                { it.accountsBalanceGet(AccountsBalanceGetRequest(token, null, null, AccountsBalanceGetRequestOptions(ours, null))) },
-                "balance get request",
-            ).body().accounts
+            val balances = try {
+                plaidApiWrapper.executeRequest(
+                    { it.accountsBalanceGet(AccountsBalanceGetRequest(token, null, null, AccountsBalanceGetRequestOptions(ours, null))) },
+                    "balance get request",
+                ).body().accounts
+            } catch (e: ClientRequestException) {
+                throw PlaidBalanceUnavailable(plaidApiWrapper.transientPlaidError(e) ?: throw e, e)
+            }
             balances.forEach { b -> b.balances.current?.let { c -> accountMap[b.accountId]?.let { f -> out[f] = BigDecimal.valueOf(c) } } }
         }
         return out

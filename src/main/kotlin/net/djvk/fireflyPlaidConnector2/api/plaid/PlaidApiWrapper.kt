@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.SerializationFeature
 import io.ktor.client.HttpClientConfig
 import io.ktor.client.engine.HttpClientEngine
 import io.ktor.client.plugins.*
+import io.ktor.client.statement.bodyAsText
 import io.ktor.http.*
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
@@ -88,6 +89,13 @@ class PlaidApiWrapper(
                 delay(1.minutes)
                 return executeRequest(request, logString, remainingRetries)
             }
+            if (transientPlaidError(cre) != null) {
+                // LAN-50: an institution that does not answer (a 400, not a 5xx) is retried like a network failure
+                logger.error("Transient Plaid error ${transientPlaidError(cre)} while calling $logString; ${remainingRetries - 1} retries remaining.")
+                if (remainingRetries - 1 <= 0) throw cre
+                delay(retryBackoffMillis * (maxRetries - remainingRetries + 1))
+                return executeRequest(request, logString, remainingRetries - 1)
+            }
             throw cre
         } catch (e: CancellationException) {
             // Never swallow cancellation (app shutdown); retrying here would keep a cancelled job alive
@@ -101,6 +109,17 @@ class PlaidApiWrapper(
             delay(retryBackoffMillis * (maxRetries - remainingRetries + 1))
             return executeRequest(request, logString, remainingRetries - 1)
         }
+    }
+
+    /**
+     * Plaid's `error_code` when [cre] is a transient institution or rate-limit error (error_type INSTITUTION_ERROR or
+     * RATE_LIMIT, or an INSTITUTION_* code), else null. Never returns the message, which can hold user data.
+     */
+    suspend fun transientPlaidError(cre: ClientRequestException): String? {
+        val body = runCatching { cre.response.bodyAsText() }.getOrDefault("")
+        val type = Regex("\"error_type\"\\s*:\\s*\"([A-Z_]+)\"").find(body)?.groupValues?.get(1)
+        val code = Regex("\"error_code\"\\s*:\\s*\"([A-Z_0-9]+)\"").find(body)?.groupValues?.get(1) ?: return null
+        return code.takeIf { type == "INSTITUTION_ERROR" || type == "RATE_LIMIT" || it.startsWith("INSTITUTION_") }
     }
 
     companion object {
