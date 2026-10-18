@@ -36,6 +36,10 @@ import org.mockito.kotlin.whenever
  * `GET /plaid-links` from that state and refuses a create whose Plaid id is already linked with a 409.
  * Each run does what a poll does: look up the batch's ids (the window read is empty, as for old transactions),
  * convert, then write.
+ *
+ * Limit: `sync()` below is that poll assembled by hand (lookup, convert, write), not a run of `PolledSyncOrchestrator`,
+ * so an orchestrator change that skips the lookup is not caught here. The batches are four plain payments: no pending
+ * to posted, no transfer pair, no batch over MAX_IDS.
  */
 internal class ResyncNoDuplicatesTest {
     /** Touch MockUtil first: its file-level mocks must not be created in the middle of a whenever().thenReturn(). */
