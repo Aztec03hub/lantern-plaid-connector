@@ -89,9 +89,10 @@ class PlaidApiWrapper(
                 delay(1.minutes)
                 return executeRequest(request, logString, remainingRetries)
             }
-            if (transientPlaidError(cre) != null) {
+            val transientCode = transientPlaidError(cre)
+            if (transientCode != null) {
                 // LAN-50: an institution that does not answer (a 400, not a 5xx) is retried like a network failure
-                logger.error("Transient Plaid error ${transientPlaidError(cre)} while calling $logString; ${remainingRetries - 1} retries remaining.")
+                logger.error("Transient Plaid error $transientCode while calling $logString; ${remainingRetries - 1} retries remaining.")
                 if (remainingRetries - 1 <= 0) throw cre
                 delay(retryBackoffMillis * (maxRetries - remainingRetries + 1))
                 return executeRequest(request, logString, remainingRetries - 1)
@@ -112,17 +113,20 @@ class PlaidApiWrapper(
     }
 
     /**
-     * Plaid's `error_code` when [cre] is a transient institution or rate-limit error (error_type INSTITUTION_ERROR or
-     * RATE_LIMIT, or an INSTITUTION_* code), else null. Never returns the message, which can hold user data.
+     * Plaid's `error_code` when [cre] is a transient institution or rate-limit error (error_type RATE_LIMIT or a code in
+     * [TRANSIENT_INSTITUTION_CODES]), else null. Never returns the message, which can hold user data.
      */
     suspend fun transientPlaidError(cre: ClientRequestException): String? {
-        val body = runCatching { cre.response.bodyAsText() }.getOrDefault("")
+        val body = try { cre.response.bodyAsText() } catch (e: CancellationException) { throw e } catch (e: Exception) { "" }
         val type = Regex("\"error_type\"\\s*:\\s*\"([A-Z_]+)\"").find(body)?.groupValues?.get(1)
         val code = Regex("\"error_code\"\\s*:\\s*\"([A-Z_0-9]+)\"").find(body)?.groupValues?.get(1) ?: return null
-        return code.takeIf { type == "INSTITUTION_ERROR" || type == "RATE_LIMIT" || it.startsWith("INSTITUTION_") }
+        return code.takeIf { type == "RATE_LIMIT" || it in TRANSIENT_INSTITUTION_CODES }
     }
 
     companion object {
+        /** Plaid's documented INSTITUTION_ERROR codes that recover on their own. INSTITUTION_NOT_SUPPORTED, INSTITUTION_NO_LONGER_SUPPORTED, INSTITUTION_REGISTRATION_REQUIRED and the like are permanent and are not retried. */
+        private val TRANSIENT_INSTITUTION_CODES = setOf("INSTITUTION_DOWN", "INSTITUTION_NOT_RESPONDING", "INSTITUTION_NOT_AVAILABLE")
+
         /**
          * True if [url] is https, or http to a loopback host (for local mock servers).
          */

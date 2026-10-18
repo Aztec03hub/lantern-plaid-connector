@@ -51,7 +51,7 @@ internal class LoanInterestResilienceTest {
         """{"accounts":[{"account_id":"$acc","balances":{"current":23491.66,"iso_currency_code":"USD"},"name":"x","type":"loan"}],"item":{"available_products":["balance"],"billed_products":["transactions"],"consent_expiration_time":null,"error":null,"institution_id":"ins_56","item_id":"zzz","products":["transactions"],"update_type":"background","webhook":""},"request_id":"r"}"""
 
     /** [failA]/[failB]: given the call number for that token, the (status, body) to answer with, or null for the real balance. */
-    private fun runner(failA: (Int) -> Pair<HttpStatusCode, String>?, failB: (Int) -> Pair<HttpStatusCode, String>? = { null }): LoanInterestRunner {
+    private fun runner(failA: (Int) -> Pair<HttpStatusCode, String>?, failB: (Int) -> Pair<HttpStatusCode, String>? = { null }, lagDir: String = ""): LoanInterestRunner {
         val engine = MockEngine { req ->
             val body = String(req.body.toByteArray())
             val (tok, acc, fail) = if ("tokA" in body) Triple("tokA", "plA", failA) else Triple("tokB", "plB", failB)
@@ -92,7 +92,7 @@ internal class LoanInterestResilienceTest {
                 createFireflyResponse(TransactionSingle(TransactionRead("transactions", "n", FireflyFixtures.getTransaction(), ObjectLink())))
             }
         }
-        return LoanInterestRunner(syncHelper, wrapper, accountsApi, txApi, "America/Chicago", cfg.path, 0.05, true, true, "", 3)
+        return LoanInterestRunner(syncHelper, wrapper, accountsApi, txApi, "America/Chicago", cfg.path, 0.05, true, true, lagDir, 3)
     }
 
     private val instDown = HttpStatusCode.BadRequest to errorBody("INSTITUTION_ERROR", "INSTITUTION_NOT_RESPONDING")
@@ -129,7 +129,47 @@ internal class LoanInterestResilienceTest {
         assertThrows<ClientRequestException> { runner(failA = { bad }).run() }
         assertThat(calls["tokA"]).isEqualTo(1)
         assertThat(stores).isEmpty()
+        calls.keys.forEach { calls[it] = 0 }
         assertThrows<ClientRequestException> { runner(failA = { HttpStatusCode.Unauthorized to "{}" }).run() }
+        assertThat(calls["tokA"]).isEqualTo(1)
+    }
+
+    @Test
+    fun aPermanentInstitutionErrorIsNotRetried() {
+        val gone = HttpStatusCode.BadRequest to errorBody("INSTITUTION_ERROR", "INSTITUTION_NOT_SUPPORTED")
+        assertThrows<ClientRequestException> { runner(failA = { gone }).run() }
+        assertThat(calls["tokA"]).isEqualTo(1)
+        assertThat(stores).isEmpty()
+    }
+
+    @Test
+    fun aRateLimitTypeErrorIsRetried() {
+        val rl = HttpStatusCode.BadRequest to errorBody("RATE_LIMIT", "ACCOUNTS_LIMIT")
+        runner(failA = { if (it <= 1) rl else null }).run()
+        assertThat(calls["tokA"]).isEqualTo(2 + 1)  // failure, success, apply re-read
+    }
+
+    @Test
+    fun aSkippedLoanKeepsItsLagCounter() {
+        val lag = File(dir, "lag").path
+        val d1 = LocalDate.of(2026, 10, 1)
+        owed[2] = BigDecimal("23600.00")  // Plaid owes less than Firefly: "Firefly lags"
+        runner(failA = { null }, lagDir = lag).also { it.today = { d1 } }.run()
+        assertThat(File(lag, "loan-lag.json").readText()).isEqualTo("""{"2":"2026-10-01"}""")
+        val r = runner(failA = { instDown }, lagDir = lag).also { it.today = { d1.plusDays(1) } }
+        assertThrows<IllegalStateException> { r.run() }
+        assertThat(File(lag, "loan-lag.json").readText()).isEqualTo("""{"2":"2026-10-01"}""")
+    }
+
+    @Test
+    fun aFailedReReadStillTracksLagAndReportsTheWrittenLoan() {
+        val lag = File(dir, "lag").path
+        // night 1 per call: A = 1 balance (plan), 2 = re-read (fails persistently); B is fine
+        owed[3] = BigDecimal("23600.00")
+        val e = assertThrows<IllegalStateException> { runner(failA = { if (it >= 2) instDown else null }, lagDir = lag).run() }
+        assertThat(e.message).contains("WRITTEN but not re-checked").contains("2 (INSTITUTION_NOT_RESPONDING)")
+        assertThat(stores.map { it.transactions.single().sourceId }).containsExactly("2")
+        assertThat(File(lag, "loan-lag.json").readText()).contains("\"3\"")  // trackLag ran
     }
 
     @Test

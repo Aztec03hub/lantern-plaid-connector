@@ -101,6 +101,9 @@ class LoanInterestRunner(
     /** Loans [runOnce] skipped because Plaid's institution did not answer (LAN-50), with Plaid's error_code. */
     private var skipped: List<Pair<LoanConfig, String>> = listOf()
 
+    /** F2: loans written whose post-write re-read got no answer from Plaid. Their writes stand (a rerun is idempotent); the run fails so a human looks. */
+    private var unchecked: List<Pair<LoanConfig, String>> = listOf()
+
     /** A loan left HELD exits non-zero, so the nightly prints its "!!" line instead of looking fine (A1). */
     override fun run() = runBlocking<Unit> {
         val plans = runOnce(apply)
@@ -109,6 +112,7 @@ class LoanInterestRunner(
         val stuck = trackLag(plans)
         val parts = listOfNotNull(
             skipped.takeIf { it.isNotEmpty() }?.let { "${it.size} loan(s) SKIPPED, Plaid did not answer: ${it.map { (l, c) -> "${l.account} ($c)" }}" },
+            unchecked.takeIf { it.isNotEmpty() }?.let { "${it.size} loan(s) WRITTEN but not re-checked, Plaid did not answer: ${it.map { (l, c) -> "${l.account} ($c)" }}" },
             held.takeIf { it.isNotEmpty() }?.let { "${it.size} loan(s) HELD, nothing written: ${it.map { h -> h.loan.account }}" },
             stuck.takeIf { it.isNotEmpty() }?.let { "loan(s) $it have been \"Firefly lags\" for $lagNights or more nights; a payment Plaid has seen is probably missing in Firefly" },
         )
@@ -157,6 +161,7 @@ class LoanInterestRunner(
             }
         }
         skipped = skip
+        unchecked = listOf()
         plans.forEach { print(it) }
         if (!apply) {
             println("DRY RUN: nothing was changed. Add --fireflyPlaidConnector2.repair.apply=true to apply.")
@@ -164,7 +169,12 @@ class LoanInterestRunner(
         }
         plans.filter { it.writes }.forEach { write(it) }
         println("APPLIED. Re-reading to check:")
-        val plaidAfter = readPlaidOwed(plans.filter { it.writes }.map { it.loan })
+        val plaidAfter = try { readPlaidOwed(plans.filter { it.writes }.map { it.loan }) } catch (e: PlaidBalanceUnavailable) {
+            // F2: the writes are done; do not abort before trackLag and the summary. Nothing is written again, so this cannot double-post.
+            println("WARN: written but not re-checked (${e.errorCode})")
+            unchecked = plans.filter { it.writes }.map { it.loan to e.errorCode }
+            return plans
+        }
         for (p in plans.filter { it.writes }) {
             val again = gapOf(p.loan, plaidAfter)
             println("   loan ${p.loan.account}: gap now $again")
