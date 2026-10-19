@@ -152,16 +152,50 @@ internal class ItemStatusPruneTest {
     }
 
     @Test
-    fun sameBankDamagedConfigKeepsARecentLoginRequiredEntry(@TempDir dir: Path) = runBlocking<Unit> {
+    fun relinkedBankDropsTheOldAlarmBecauseTheNewLinkSyncedLater(@TempDir dir: Path) = runBlocking<Unit> {
         val store = ItemStatusStore(dir.toString())
         val a = store.ref("access-fake-a", "Same Bank")
         val b = store.ref("access-fake-b", "Same Bank")
-        store.record(ago(1), listOf(b), listOf(a to "ITEM_LOGIN_REQUIRED"))
+        seed(store, status(a, null, ago(2).toString(), "ITEM_LOGIN_REQUIRED"))
 
         store.poll(now, listOf(b))
 
-        assertEquals(setOf(a.id, b.id), store.read().keys)
-        assertEquals("ITEM_LOGIN_REQUIRED", store.read()[a.id]!!.lastErrorCode)
+        assertEquals(setOf(b.id), store.read().keys)
+    }
+
+    @Test
+    fun olderOrEqualSiblingSuccessKeepsTheAlarm(@TempDir dir: Path) = runBlocking<Unit> {
+        // The poll stamps the sibling at `now`; the alarm's failure time is made later or equal to it
+        for (failureAt in listOf(now, now.plus(Duration.ofHours(1)))) {
+            val store = ItemStatusStore(dir.resolve(failureAt.toString().replace(":", "")).also { Files.createDirectories(it) }.toString())
+            val a = store.ref("access-fake-a", "Same Bank")
+            val b = store.ref("access-fake-b", "Same Bank")
+            seed(store, status(a, null, failureAt.toString(), "ITEM_LOGIN_REQUIRED"), status(b, ago(5).toString(), null, null))
+
+            store.poll(now, listOf(b))
+
+            assertEquals(setOf(a.id, b.id), store.read().keys, "failure at $failureAt")
+        }
+    }
+
+    @Test
+    fun theKeptWarnIsLoggedOnlyWhenTheCountChanges(@TempDir dir: Path) = runBlocking<Unit> {
+        val appender = ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent>().also { it.start() }
+        val log = org.slf4j.LoggerFactory.getLogger(ItemStatusStore::class.java) as ch.qos.logback.classic.Logger
+        log.addAppender(appender)
+        try {
+            val store = ItemStatusStore(dir.toString())
+            val live = store.ref("access-fake-live", "Live Bank")
+            val kept = store.ref("access-fake-kept", "Kept Bank")
+            store.record(ago(1), listOf(kept), emptyList())
+
+            store.poll(now, listOf(live))
+            store.poll(now, listOf(live))
+
+            assertEquals(1, appender.list.count { it.level == ch.qos.logback.classic.Level.WARN })
+        } finally {
+            log.detachAppender(appender)
+        }
     }
 
     @Test
@@ -258,7 +292,7 @@ internal class ItemStatusPruneTest {
     }
 
     @Test
-    fun codeWithoutAFailureTimeIsKeptEvenWhenOldAndSameBank(@TempDir dir: Path) = runBlocking<Unit> {
+    fun codeWithoutAFailureTimeIsComparedByItsOwnSuccessAgainstASibling(@TempDir dir: Path) = runBlocking<Unit> {
         val store = ItemStatusStore(dir.toString())
         val live = store.ref("access-fake-live", "Same Bank")
         val odd = store.ref("access-fake-odd", "Same Bank")
@@ -266,6 +300,6 @@ internal class ItemStatusPruneTest {
 
         store.poll(now, listOf(live))
 
-        assertEquals(setOf(live.id, odd.id), store.read().keys)
+        assertEquals(setOf(live.id), store.read().keys)
     }
 }

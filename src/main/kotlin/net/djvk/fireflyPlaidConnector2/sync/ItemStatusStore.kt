@@ -100,7 +100,7 @@ class ItemStatusStore(
 
     /**
      * Drops entries absent from this poll ([polled]) only when that is certain enough: a polled Item of the same
-     * institution exists (the Item was replaced by a new link), or the entry has been silent for more than
+     * institution exists (the Item was replaced by a new link), the entry is outlived by a newer success of a polled sibling (re-link), or it has been silent for more than
      * [SILENT_DAYS] days (no success and no failure that recent). Any other absent entry is kept, so a damaged accounts
      * config naming fewer Items cannot erase a live alarm; one WARN counts them. Nothing is pruned from an empty poll.
      */
@@ -120,14 +120,31 @@ class ItemStatusStore(
         // No error code and no usable time at all (corrupt or empty): it carries no alarm, so it goes, but only because
         //  another Item was polled (the guard above). With an error code it is kept.
         fun unusable(e: ItemStatus) = e.lastErrorCode == null && parse(e.lastSuccessfulSync) == null && parse(e.lastFailure) == null
-        val drop = absent.filter { unusable(it) || (failureClear(it) && (it.institution in named || silent(it))) }
+        // Re-link: a polled Item of the same named institution has a success strictly later than this entry's failure
+        //  (or, with no failure, its own last success). That drops the entry even with an error code. Retiring a login by
+        //  removing its config block is the deliberate way; a damaged config that loses one login of a two-login bank
+        //  while the other works is the accepted residual risk.
+        val siblingSuccess = statuses.values.filter { it.item in polled && it.institution in named }
+            .groupBy { it.institution }.mapValues { (_, v) -> v.mapNotNull { parse(it.lastSuccessfulSync) }.maxOrNull() }
+        fun relinked(e: ItemStatus): Boolean {
+            val sibling = siblingSuccess[e.institution] ?: return false
+            val reference = parse(if (e.lastFailure != null) e.lastFailure else e.lastSuccessfulSync) ?: return false
+            return sibling > reference
+        }
+        val drop = absent.filter { unusable(it) || relinked(it) || (failureClear(it) && (it.institution in named || silent(it))) }
         if (drop.isNotEmpty()) {
             logger.info("Dropping ${drop.size} item status entr${if (drop.size == 1) "y" else "ies"} for Items replaced or silent over $SILENT_DAYS days")
             statuses.keys.removeAll(drop.map { it.item }.toSet())
         }
         val kept = absent.size - drop.size
-        if (kept > 0) logger.warn("$kept item status entr${if (kept == 1) "y" else "ies"} not polled this run were kept (institutions: ${absent.filter { it !in drop }.map { it.institution }.distinct()})")
+        // Logged when the count changes, not on every poll
+        if (kept != lastKeptWarned) {
+            if (kept > 0) logger.warn("$kept item status entr${if (kept == 1) "y" else "ies"} not polled this run were kept (institutions: ${absent.filter { it !in drop }.map { it.institution }.distinct()})")
+            lastKeptWarned = kept
+        }
     }
+
+    private var lastKeptWarned = 0
 
     private companion object {
         const val SILENT_DAYS = 30L
