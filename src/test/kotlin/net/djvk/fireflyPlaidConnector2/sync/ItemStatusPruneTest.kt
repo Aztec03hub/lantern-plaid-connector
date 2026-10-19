@@ -232,4 +232,16 @@ internal class ItemStatusPruneTest {
 
         assertEquals(setOf(live.id, junk.id, coded.id, empty.id), store.read().keys)
     }
+
+    @Test
+    fun codeWithoutAFailureTimeIsKeptEvenWhenOldAndSameBank(@TempDir dir: Path) = runBlocking<Unit> {
+        val store = ItemStatusStore(dir.toString())
+        val live = store.ref("access-fake-live", "Same Bank")
+        val odd = store.ref("access-fake-odd", "Same Bank")
+        seed(store, status(odd, hoursAgo(90 * 24).toString(), null, "ITEM_LOGIN_REQUIRED"))
+
+        store.poll(now, listOf(live))
+
+        assertEquals(setOf(live.id, odd.id), store.read().keys)
+    }
 }

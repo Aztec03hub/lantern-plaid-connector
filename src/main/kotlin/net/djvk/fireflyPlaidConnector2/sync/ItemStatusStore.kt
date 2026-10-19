@@ -115,9 +115,9 @@ class ItemStatusStore(
         // The failure side is clear when there is none, or it is valid and older than the cutoff; an error code with no
         //  valid old failure time is a live alarm
         fun failureClear(e: ItemStatus) = if (e.lastFailure == null) e.lastErrorCode == null else old(e.lastFailure)
-        // Silent: at least one time present, and every time that is present is valid and old. Unparseable: kept.
+        // Silent: some time present and the success time, if any, valid and old (the failure side is in failureClear).
         fun silent(e: ItemStatus) = (e.lastSuccessfulSync != null || e.lastFailure != null) &&
-            (e.lastSuccessfulSync == null || old(e.lastSuccessfulSync)) && (e.lastFailure == null || old(e.lastFailure))
+            (e.lastSuccessfulSync == null || old(e.lastSuccessfulSync))
         val drop = absent.filter { failureClear(it) && (it.institution in named || silent(it)) }
         if (drop.isNotEmpty()) {
             logger.info("Dropping ${drop.size} item status entr${if (drop.size == 1) "y" else "ies"} for Items replaced or silent over $SILENT_DAYS days")
