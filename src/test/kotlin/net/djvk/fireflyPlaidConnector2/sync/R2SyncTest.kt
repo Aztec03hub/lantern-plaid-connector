@@ -245,7 +245,25 @@ internal class R2SyncTest {
     }
 
     @Test
-    fun theCallbackStatusIsPartialWhenABankFailedAndSuccessOtherwise() = runBlocking<Unit> {
+    fun aPollDropsTheStatusOfAnItemItNoLongerPolls() = runBlocking<Unit> {
+        val store = ItemStatusStore(dir.toString())
+        store.record(java.time.Instant.now(), listOf(), listOf(store.ref("tok-replaced-0000", "Old Link") to "ITEM_LOGIN_REQUIRED"))
+        whenever(plaidSyncService.processPlaidTransactions(any(), any())).thenReturn(
+            PlaidTransactionResult(listOf(), listOf(), listOf(), listOf())
+        )
+        whenever(plaidSyncService.describeInstitution(any())).thenReturn("New Link")
+        val orchestrator = PolledSyncOrchestrator(
+            30, syncHelper, cursorManager, plaidSyncService, fireflyTransactionService, converter,
+            itemStatusStore = store,
+        )
+
+        orchestrator.runIteration(mapOf(accountA to 1), sequenceOf(Pair("tok-new-1111", listOf(accountA))), mutableMapOf("tok-new-1111" to "c"))
+
+        assertThat(store.read().values.map { it.institution }).containsExactly("New Link")
+    }
+
+    @Test
+    fun theCallbackStatusIsPartialWhenABankFailedAndSuccessOtherwise()= runBlocking<Unit> {
         val captured = mutableListOf<String>()
         val engine = MockEngine { request ->
             captured.add(String(request.body.toByteArray()))
