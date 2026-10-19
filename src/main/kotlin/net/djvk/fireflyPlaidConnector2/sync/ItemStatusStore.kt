@@ -58,12 +58,15 @@ class ItemStatusStore(
      * Records the outcome of a poll: every Item in [succeeded] is stamped as synced at [now], every Item in [failed]
      * gets its failure recorded (and keeps its previous last success).
      *
+     * @param pruneUnlisted when true, entries for Items in neither list are dropped in the same atomic write (the caller
+     *   passes every Item it polled); never prunes when both lists are empty
      * @return the last successful sync of each failed Item (by [ItemStatus.item]), null if it never succeeded
      */
     suspend fun record(
         now: Instant,
         succeeded: List<ItemRef>,
         failed: List<Pair<ItemRef, String>>,
+        pruneUnlisted: Boolean = false,
     ): Map<String, String?> {
         val lastSuccess = mutableMapOf<String, String?>()
         try {
@@ -83,6 +86,16 @@ class ItemStatusStore(
                 statuses[ref.id] = ItemStatus(
                     ref.id, ref.institution, ref.redactedToken, before?.lastSuccessfulSync, now.toString(), code,
                 )
+            }
+            // An Item that was replaced (re-linked under a new id) is no longer polled; its old entry would show a stale
+            //  "log in again" forever. An empty poll set (nothing known to be linked) prunes nothing.
+            val linked = (succeeded.map { it.id } + failed.map { it.first.id }).toSet()
+            if (pruneUnlisted && linked.isNotEmpty()) {
+                val stale = statuses.keys.filter { it !in linked }
+                if (stale.isNotEmpty()) {
+                    logger.info("Dropping ${stale.size} item status entr${if (stale.size == 1) "y" else "ies"} for Items no longer linked")
+                    statuses.keys.removeAll(stale.toSet())
+                }
             }
             write(statuses.values.sortedBy { it.item })
         } catch (e: kotlinx.coroutines.CancellationException) {

@@ -238,7 +238,7 @@ class PolledSyncOrchestrator(
             accessTokens.firstOrNull { Utilities.redactAccessToken(it) == f.accessTokenRedacted }
                 ?.let { store.ref(it, f.institution) to f.errorCode }
         }
-        val lastSuccess = store.record(Instant.now(), succeeded, failedRefs)
+        val lastSuccess = store.record(Instant.now(), succeeded, failedRefs, pruneUnlisted = true)
         return failed.map { f ->
             val ref = failedRefs.firstOrNull { it.first.redactedToken == f.accessTokenRedacted }?.first
             FailedItemReport(f.institution, f.accessTokenRedacted, f.errorCode, ref?.let { lastSuccess[it.id] })
