@@ -13,6 +13,7 @@ import kotlin.test.assertEquals
 internal class ItemStatusPruneTest {
     private val now = Instant.parse("2026-06-01T00:00:00Z")
     private fun ago(days: Long) = now.minus(Duration.ofDays(days))
+    private fun hoursAgo(h: Long) = now.minus(Duration.ofHours(h))
 
     private suspend fun ItemStatusStore.poll(t: Instant, ok: List<ItemStatusStore.ItemRef>, bad: List<Pair<ItemStatusStore.ItemRef, String>> = emptyList()) =
         record(t, ok, bad, pruneUnlisted = true)
@@ -52,8 +53,8 @@ internal class ItemStatusPruneTest {
         val old = store.ref("access-fake-old", "Old Bank")
         val recent = store.ref("access-fake-recent", "Recent Bank")
         val failedOld = store.ref("access-fake-fold", "Failing Bank")
-        store.record(ago(31), listOf(old), listOf(failedOld to "ITEM_LOGIN_REQUIRED"))
-        store.record(ago(29), listOf(recent), emptyList())
+        store.record(hoursAgo(30 * 24 + 1), listOf(old), listOf(failedOld to "ITEM_LOGIN_REQUIRED"))
+        store.record(hoursAgo(30 * 24 - 1), listOf(recent), emptyList())
 
         store.poll(now, listOf(live))
 

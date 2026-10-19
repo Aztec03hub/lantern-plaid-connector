@@ -263,6 +263,24 @@ internal class R2SyncTest {
     }
 
     @Test
+    fun twoTokensSharingTheRedactedSuffixAreBothKeptWhenOneFails() = runBlocking<Unit> {
+        val sequence = sequenceOf(Pair("tok-aaaa-1234", listOf(accountA)), Pair("tok-bbbb-1234", listOf(accountA)))
+        whenever(plaidSyncService.processPlaidTransactions(any(), any())).thenReturn(
+            PlaidTransactionResult(listOf(), listOf(), listOf(), listOf(ItemFailure("Chase", "access-****1234", "ITEM_LOGIN_REQUIRED")))
+        )
+        whenever(plaidSyncService.describeInstitution(any())).thenReturn("Other Bank")
+        val store = ItemStatusStore(dir.toString())
+        val orchestrator = PolledSyncOrchestrator(
+            30, syncHelper, cursorManager, plaidSyncService, fireflyTransactionService, converter,
+            itemStatusStore = store,
+        )
+
+        orchestrator.runIteration(mapOf(accountA to 1), sequence, mutableMapOf())
+
+        assertThat(store.read().values.map { it.lastErrorCode }).containsExactly("ITEM_LOGIN_REQUIRED", "ITEM_LOGIN_REQUIRED")
+    }
+
+    @Test
     fun theCallbackStatusIsPartialWhenABankFailedAndSuccessOtherwise() = runBlocking<Unit> {
         val captured = mutableListOf<String>()
         val engine = MockEngine { request ->
