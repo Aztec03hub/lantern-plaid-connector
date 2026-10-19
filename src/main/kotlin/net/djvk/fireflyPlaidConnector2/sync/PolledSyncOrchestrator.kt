@@ -234,13 +234,17 @@ class PolledSyncOrchestrator(
         val succeeded = accessTokens
             .filter { Utilities.redactAccessToken(it) !in failedRedacted }
             .map { store.ref(it, plaidSyncService.describeInstitution(it)) }
-        // Tokens sharing a failure's redacted suffix cannot be told apart by token; the one whose configured institution
-        //  matches the failure gets its code, the others are kept with a distinct code instead of the other Item's
-        val failedRefs = failed.flatMap { f ->
+        // A failure is matched to its token by the redacted suffix (as before). If that suffix is shared, the failure is
+        //  attributed only when exactly one of those tokens has the failing institution's name; otherwise nothing is
+        //  recorded for any of them, so no Item is shown failing on a guess
+        val failedRefs = failed.mapNotNull { f ->
             val matches = accessTokens.filter { Utilities.redactAccessToken(it) == f.accessTokenRedacted }
-            val exact = matches.filter { matches.size == 1 || plaidSyncService.describeInstitution(it) == f.institution }
-            exact.map { store.ref(it, f.institution) to f.errorCode } +
-                (matches - exact.toSet()).map { store.ref(it, plaidSyncService.describeInstitution(it)) to "AMBIGUOUS_TOKEN_SUFFIX" }
+            val token = if (matches.size <= 1) matches.firstOrNull() else {
+                matches.singleOrNull { plaidSyncService.describeInstitution(it) == f.institution }.also {
+                    if (it == null) logger.warn("A failure matched ${matches.size} Items sharing a token suffix and could not be attributed; no status recorded for them")
+                }
+            }
+            token?.let { store.ref(it, f.institution) to f.errorCode }
         }
         val lastSuccess = store.record(Instant.now(), succeeded, failedRefs, pruneUnlisted = true)
         return failed.map { f ->

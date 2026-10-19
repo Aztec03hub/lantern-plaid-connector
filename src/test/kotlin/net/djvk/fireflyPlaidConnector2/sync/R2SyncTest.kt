@@ -263,7 +263,7 @@ internal class R2SyncTest {
     }
 
     @Test
-    fun twoTokensSharingTheRedactedSuffixAreBothKeptAndTheHealthyOneGetsNoForeignCode() = runBlocking<Unit> {
+    fun suffixTwinOfAnotherInstitutionIsLeftUntouchedAndTheFailureGoesToTheNamedOne() = runBlocking<Unit> {
         val sequence = sequenceOf(Pair("tok-aaaa-1234", listOf(accountA)), Pair("tok-bbbb-1234", listOf(accountA)))
         whenever(plaidSyncService.processPlaidTransactions(any(), any())).thenReturn(
             PlaidTransactionResult(listOf(), listOf(), listOf(), listOf(ItemFailure("Chase", "access-****1234", "ITEM_LOGIN_REQUIRED")))
@@ -271,6 +271,9 @@ internal class R2SyncTest {
         whenever(plaidSyncService.describeInstitution("tok-aaaa-1234")).thenReturn("Chase")
         whenever(plaidSyncService.describeInstitution("tok-bbbb-1234")).thenReturn("Other Bank")
         val store = ItemStatusStore(dir.toString())
+        val twin = store.ref("tok-bbbb-1234", "Other Bank")
+        val earlier = java.time.Instant.now().minus(java.time.Duration.ofDays(5))
+        store.record(earlier, listOf(twin), listOf())
         val orchestrator = PolledSyncOrchestrator(
             30, syncHelper, cursorManager, plaidSyncService, fireflyTransactionService, converter,
             itemStatusStore = store,
@@ -278,7 +281,32 @@ internal class R2SyncTest {
 
         orchestrator.runIteration(mapOf(accountA to 1), sequence, mutableMapOf())
 
-        assertThat(store.read().values.map { it.lastErrorCode }).containsExactlyInAnyOrder("ITEM_LOGIN_REQUIRED", "AMBIGUOUS_TOKEN_SUFFIX")
+        val after = store.read()
+        assertThat(after.values.single { it.institution == "Chase" }.lastErrorCode).isEqualTo("ITEM_LOGIN_REQUIRED")
+        assertThat(after[twin.id]!!.lastErrorCode).isNull()
+        assertThat(after[twin.id]!!.lastSuccessfulSync).isEqualTo(earlier.toString())
+    }
+
+    @Test
+    fun suffixTwinsOfTheSameInstitutionRecordNothing() = runBlocking<Unit> {
+        val sequence = sequenceOf(Pair("tok-aaaa-1234", listOf(accountA)), Pair("tok-bbbb-1234", listOf(accountA)))
+        whenever(plaidSyncService.processPlaidTransactions(any(), any())).thenReturn(
+            PlaidTransactionResult(listOf(), listOf(), listOf(), listOf(ItemFailure("Chase", "access-****1234", "ITEM_LOGIN_REQUIRED")))
+        )
+        whenever(plaidSyncService.describeInstitution(any())).thenReturn("Chase")
+        val store = ItemStatusStore(dir.toString())
+        val earlier = java.time.Instant.now().minus(java.time.Duration.ofDays(5))
+        store.record(earlier, listOf(store.ref("tok-aaaa-1234", "Chase"), store.ref("tok-bbbb-1234", "Chase")), listOf())
+        val orchestrator = PolledSyncOrchestrator(
+            30, syncHelper, cursorManager, plaidSyncService, fireflyTransactionService, converter,
+            itemStatusStore = store,
+        )
+
+        orchestrator.runIteration(mapOf(accountA to 1), sequence, mutableMapOf())
+
+        val after = store.read().values
+        assertThat(after.map { it.lastErrorCode }).containsOnlyNulls()
+        assertThat(after.map { it.lastSuccessfulSync }).containsOnly(earlier.toString())
     }
 
     @Test

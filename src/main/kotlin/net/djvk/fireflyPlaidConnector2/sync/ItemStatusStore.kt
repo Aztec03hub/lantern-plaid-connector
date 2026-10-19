@@ -118,7 +118,10 @@ class ItemStatusStore(
         // Silent: some time present and the success time, if any, valid and old (the failure side is in failureClear).
         fun silent(e: ItemStatus) = (e.lastSuccessfulSync != null || e.lastFailure != null) &&
             (e.lastSuccessfulSync == null || old(e.lastSuccessfulSync))
-        val drop = absent.filter { failureClear(it) && (it.institution in named || silent(it)) }
+        // No error code and no usable time at all (corrupt or empty): it carries no alarm, so it goes, but only because
+        //  another Item was polled (the guard above). With an error code it is kept.
+        fun unusable(e: ItemStatus) = e.lastErrorCode == null && parse(e.lastSuccessfulSync) == null && parse(e.lastFailure) == null
+        val drop = absent.filter { unusable(it) || (failureClear(it) && (it.institution in named || silent(it))) }
         if (drop.isNotEmpty()) {
             logger.info("Dropping ${drop.size} item status entr${if (drop.size == 1) "y" else "ies"} for Items replaced or silent over $SILENT_DAYS days")
             statuses.keys.removeAll(drop.map { it.item }.toSet())

@@ -216,7 +216,7 @@ internal class ItemStatusPruneTest {
     }
 
     @Test
-    fun unparseableOrMissingTimestampsAreKept(@TempDir dir: Path) = runBlocking<Unit> {
+    fun unusableTimesDropOnlyWithoutAnErrorCode(@TempDir dir: Path) = runBlocking<Unit> {
         val store = ItemStatusStore(dir.toString())
         val live = store.ref("access-fake-live", "Live Bank")
         val junk = store.ref("access-fake-junk", "Junk Bank")
@@ -230,7 +230,31 @@ internal class ItemStatusPruneTest {
 
         store.poll(now, listOf(live))
 
-        assertEquals(setOf(live.id, junk.id, coded.id, empty.id), store.read().keys)
+        assertEquals(setOf(live.id, coded.id), store.read().keys)
+    }
+
+    @Test
+    fun unusableEntriesSurviveAnEmptyPoll(@TempDir dir: Path) = runBlocking<Unit> {
+        val store = ItemStatusStore(dir.toString())
+        val empty = store.ref("access-fake-empty", "Empty Bank")
+        seed(store, status(empty, null, null, null))
+
+        store.poll(now, emptyList())
+
+        assertEquals(setOf(empty.id), store.read().keys)
+    }
+
+    @Test
+    fun outageOverThirtyOneDaysDropsAnOldAlarmWhenAbsent(@TempDir dir: Path) = runBlocking<Unit> {
+        // Documents the accepted limit: the dashboard then shows the Item as unsynced rather than needing a log in
+        val store = ItemStatusStore(dir.toString())
+        val live = store.ref("access-fake-live", "Live Bank")
+        val gone = store.ref("access-fake-gone", "Gone Bank")
+        store.record(hoursAgo(31 * 24), emptyList(), listOf(gone to "ITEM_LOGIN_REQUIRED"))
+
+        store.poll(now, listOf(live))
+
+        assertEquals(setOf(live.id), store.read().keys)
     }
 
     @Test
