@@ -87,7 +87,7 @@ class ItemStatusStore(
                     ref.id, ref.institution, ref.redactedToken, before?.lastSuccessfulSync, now.toString(), code,
                 )
             }
-            if (pruneUnlisted) prune(statuses, succeeded.map { it.id }.toSet() + failed.map { it.first.id },
+            if (pruneUnlisted) prune(statuses, succeeded.map { it.id }.toSet() + failed.map { it.first.id }, succeeded.map { it.id }.toSet(),
                 (succeeded.map { it.institution } + failed.map { it.first.institution }).toSet(), now)
             write(statuses.values.sortedBy { it.item })
         } catch (e: kotlinx.coroutines.CancellationException) {
@@ -104,7 +104,7 @@ class ItemStatusStore(
      * [SILENT_DAYS] days (no success and no failure that recent). Any other absent entry is kept, so a damaged accounts
      * config naming fewer Items cannot erase a live alarm; one WARN counts them. Nothing is pruned from an empty poll.
      */
-    private fun prune(statuses: MutableMap<String, ItemStatus>, polled: Set<String>, institutions: Set<String>, now: Instant) {
+    private fun prune(statuses: MutableMap<String, ItemStatus>, polled: Set<String>, succeededIds: Set<String>, institutions: Set<String>, now: Instant) {
         if (polled.isEmpty()) return
         val cutoff = now.minus(java.time.Duration.ofDays(SILENT_DAYS))
         // A timestamp is missing (null), unparseable (parse gives null) or valid. Future times are not old (kept).
@@ -124,7 +124,9 @@ class ItemStatusStore(
         //  (or, with no failure, its own last success). That drops the entry even with an error code. Retiring a login by
         //  removing its config block is the deliberate way; a damaged config that loses one login of a two-login bank
         //  while the other works is the accepted residual risk.
-        val siblingSuccess = statuses.values.filter { it.item in polled && it.institution in named }
+        // Only Items that succeeded in this run count (a failing sibling is no evidence). Their success is stamped at
+        //  [now] by this very call, so a skewed stored time cannot reach this comparison.
+        val siblingSuccess = statuses.values.filter { it.item in succeededIds && it.institution in named }
             .groupBy { it.institution }.mapValues { (_, v) -> v.mapNotNull { parse(it.lastSuccessfulSync) }.maxOrNull() }
         fun relinked(e: ItemStatus): Boolean {
             val sibling = siblingSuccess[e.institution] ?: return false
@@ -136,15 +138,16 @@ class ItemStatusStore(
             logger.info("Dropping ${drop.size} item status entr${if (drop.size == 1) "y" else "ies"} for Items replaced or silent over $SILENT_DAYS days")
             statuses.keys.removeAll(drop.map { it.item }.toSet())
         }
-        val kept = absent.size - drop.size
-        // Logged when the count changes, not on every poll
-        if (kept != lastKeptWarned) {
-            if (kept > 0) logger.warn("$kept item status entr${if (kept == 1) "y" else "ies"} not polled this run were kept (institutions: ${absent.filter { it !in drop }.map { it.institution }.distinct()})")
-            lastKeptWarned = kept
+        val keptEntries = absent.filter { it !in drop }
+        // Logged when the set of kept entries changes (not on every poll); the text carries a count and institutions only
+        val keptIds = keptEntries.map { it.item }.toSet()
+        if (keptIds != lastKeptWarned) {
+            if (keptIds.isNotEmpty()) logger.warn("${keptIds.size} item status entr${if (keptIds.size == 1) "y" else "ies"} not polled this run were kept (institutions: ${keptEntries.map { it.institution }.distinct()})")
+            lastKeptWarned = keptIds
         }
     }
 
-    private var lastKeptWarned = 0
+    private var lastKeptWarned: Set<String> = emptySet()
 
     private companion object {
         const val SILENT_DAYS = 30L

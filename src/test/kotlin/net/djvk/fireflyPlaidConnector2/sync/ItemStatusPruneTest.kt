@@ -326,4 +326,39 @@ internal class ItemStatusPruneTest {
 
         assertEquals(setOf(live.id), store.read().keys)
     }
+
+    @Test
+    fun aFailingSiblingIsNoEvidenceOfARelinkWhateverItsStoredSuccessTime(@TempDir dir: Path) = runBlocking<Unit> {
+        for ((n, siblingSuccess) in listOf(ago(1), now.plus(Duration.ofDays(30))).withIndex()) {
+            val store = ItemStatusStore(Files.createDirectories(dir.resolve("s$n")).toString())
+            val a = store.ref("access-fake-a", "Same Bank")
+            val b = store.ref("access-fake-b", "Same Bank")
+            seed(store, status(a, null, ago(3).toString(), "ITEM_LOGIN_REQUIRED"), status(b, siblingSuccess.toString(), null, null))
+
+            store.poll(now, emptyList(), listOf(b to "ITEM_LOGIN_REQUIRED"))
+
+            assertEquals(setOf(a.id, b.id), store.read().keys, "sibling success $siblingSuccess")
+        }
+    }
+
+    @Test
+    fun aSwappedKeptEntryWithTheSameCountIsLoggedAgain(@TempDir dir: Path) = runBlocking<Unit> {
+        val appender = ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent>().also { it.start() }
+        val log = org.slf4j.LoggerFactory.getLogger(ItemStatusStore::class.java) as ch.qos.logback.classic.Logger
+        log.addAppender(appender)
+        try {
+            val store = ItemStatusStore(dir.toString())
+            val live = store.ref("access-fake-live", "Live Bank")
+            val k1 = store.ref("access-fake-k1", "Kept One")
+            val k2 = store.ref("access-fake-k2", "Kept Two")
+            seed(store, status(k1, ago(1).toString(), null, null))
+            store.poll(now, listOf(live))
+            seed(store, status(k2, ago(1).toString(), null, null), store.read()[live.id]!!)
+            store.poll(now, listOf(live))
+
+            assertEquals(2, appender.list.count { it.level == ch.qos.logback.classic.Level.WARN })
+        } finally {
+            log.detachAppender(appender)
+        }
+    }
 }
