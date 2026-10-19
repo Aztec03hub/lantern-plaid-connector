@@ -234,9 +234,10 @@ class PolledSyncOrchestrator(
         val succeeded = accessTokens
             .filter { Utilities.redactAccessToken(it) !in failedRedacted }
             .map { store.ref(it, plaidSyncService.describeInstitution(it)) }
-        val failedRefs = failed.mapNotNull { f ->
-            accessTokens.firstOrNull { Utilities.redactAccessToken(it) == f.accessTokenRedacted }
-                ?.let { store.ref(it, f.institution) to f.errorCode }
+        // Tokens sharing the redacted suffix cannot be told apart, so all of them count as failed (kept, not dropped)
+        val failedRefs = failed.flatMap { f ->
+            accessTokens.filter { Utilities.redactAccessToken(it) == f.accessTokenRedacted }
+                .map { store.ref(it, f.institution) to f.errorCode }
         }
         val lastSuccess = store.record(Instant.now(), succeeded, failedRefs, pruneUnlisted = true)
         return failed.map { f ->

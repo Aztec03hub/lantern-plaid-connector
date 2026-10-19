@@ -247,7 +247,7 @@ internal class R2SyncTest {
     @Test
     fun aPollDropsTheStatusOfAnItemItNoLongerPolls() = runBlocking<Unit> {
         val store = ItemStatusStore(dir.toString())
-        store.record(java.time.Instant.now(), listOf(), listOf(store.ref("tok-replaced-0000", "Old Link") to "ITEM_LOGIN_REQUIRED"))
+        store.record(java.time.Instant.now(), listOf(), listOf(store.ref("tok-replaced-0000", "New Link") to "ITEM_LOGIN_REQUIRED"))
         whenever(plaidSyncService.processPlaidTransactions(any(), any())).thenReturn(
             PlaidTransactionResult(listOf(), listOf(), listOf(), listOf())
         )
@@ -263,7 +263,7 @@ internal class R2SyncTest {
     }
 
     @Test
-    fun theCallbackStatusIsPartialWhenABankFailedAndSuccessOtherwise()= runBlocking<Unit> {
+    fun theCallbackStatusIsPartialWhenABankFailedAndSuccessOtherwise() = runBlocking<Unit> {
         val captured = mutableListOf<String>()
         val engine = MockEngine { request ->
             captured.add(String(request.body.toByteArray()))

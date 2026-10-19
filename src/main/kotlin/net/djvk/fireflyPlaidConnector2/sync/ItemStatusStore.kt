@@ -58,8 +58,8 @@ class ItemStatusStore(
      * Records the outcome of a poll: every Item in [succeeded] is stamped as synced at [now], every Item in [failed]
      * gets its failure recorded (and keeps its previous last success).
      *
-     * @param pruneUnlisted when true, entries for Items in neither list are dropped in the same atomic write (the caller
-     *   passes every Item it polled); never prunes when both lists are empty
+     * @param pruneUnlisted when true (the caller passes every Item it polled), see [prune]; the drop is part of the same
+     *   atomic write. Not safe for concurrent callers (read-modify-write); the one caller, the poll loop, is serial.
      * @return the last successful sync of each failed Item (by [ItemStatus.item]), null if it never succeeded
      */
     suspend fun record(
@@ -87,16 +87,8 @@ class ItemStatusStore(
                     ref.id, ref.institution, ref.redactedToken, before?.lastSuccessfulSync, now.toString(), code,
                 )
             }
-            // An Item that was replaced (re-linked under a new id) is no longer polled; its old entry would show a stale
-            //  "log in again" forever. An empty poll set (nothing known to be linked) prunes nothing.
-            val linked = (succeeded.map { it.id } + failed.map { it.first.id }).toSet()
-            if (pruneUnlisted && linked.isNotEmpty()) {
-                val stale = statuses.keys.filter { it !in linked }
-                if (stale.isNotEmpty()) {
-                    logger.info("Dropping ${stale.size} item status entr${if (stale.size == 1) "y" else "ies"} for Items no longer linked")
-                    statuses.keys.removeAll(stale.toSet())
-                }
-            }
+            if (pruneUnlisted) prune(statuses, succeeded.map { it.id }.toSet() + failed.map { it.first.id },
+                (succeeded.map { it.institution } + failed.map { it.first.institution }).toSet(), now)
             write(statuses.values.sortedBy { it.item })
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
@@ -105,6 +97,28 @@ class ItemStatusStore(
         }
         return lastSuccess
     }
+
+    /**
+     * Drops entries absent from this poll ([polled]) only when that is certain enough: a polled Item of the same
+     * institution exists (the Item was replaced by a new link), or the entry has been silent for more than
+     * [SILENT_DAYS] days (no success and no failure that recent). Any other absent entry is kept, so a damaged accounts
+     * config naming fewer Items cannot erase a live alarm; one WARN counts them. Nothing is pruned from an empty poll.
+     */
+    private fun prune(statuses: MutableMap<String, ItemStatus>, polled: Set<String>, institutions: Set<String>, now: Instant) {
+        if (polled.isEmpty()) return
+        val cutoff = now.minus(java.time.Duration.ofDays(SILENT_DAYS))
+        fun recent(t: String?) = t != null && runCatching { Instant.parse(t) }.getOrNull()?.let { it >= cutoff } == true
+        val absent = statuses.values.filter { it.item !in polled }
+        val drop = absent.filter { it.institution in institutions || !(recent(it.lastSuccessfulSync) || recent(it.lastFailure)) }
+        if (drop.isNotEmpty()) {
+            logger.info("Dropping ${drop.size} item status entr${if (drop.size == 1) "y" else "ies"} for Items replaced or silent over $SILENT_DAYS days")
+            statuses.keys.removeAll(drop.map { it.item }.toSet())
+        }
+        val kept = absent.size - drop.size
+        if (kept > 0) logger.warn("$kept item status entr${if (kept == 1) "y" else "ies"} not polled this run were kept (institutions: ${absent.filter { it !in drop }.map { it.institution }.distinct()})")
+    }
+
+    private companion object { const val SILENT_DAYS = 30L }
 
     private suspend fun write(statuses: List<ItemStatus>) = withContext(Dispatchers.IO) {
         val directory = path.toAbsolutePath().parent
