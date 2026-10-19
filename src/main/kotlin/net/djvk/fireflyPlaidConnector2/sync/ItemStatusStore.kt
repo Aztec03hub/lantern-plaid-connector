@@ -115,9 +115,8 @@ class ItemStatusStore(
         // The failure side is clear when there is none, or it is valid and older than the cutoff; an error code with no
         //  valid old failure time is a live alarm
         fun failureClear(e: ItemStatus) = if (e.lastFailure == null) e.lastErrorCode == null else old(e.lastFailure)
-        // Silent: some time present and the success time, if any, valid and old (the failure side is in failureClear).
-        fun silent(e: ItemStatus) = (e.lastSuccessfulSync != null || e.lastFailure != null) &&
-            (e.lastSuccessfulSync == null || old(e.lastSuccessfulSync))
+        // Silent: the success time, if any, valid and old (the failure side is in failureClear).
+        fun silent(e: ItemStatus) = e.lastSuccessfulSync == null || old(e.lastSuccessfulSync)
         // No error code and no usable time at all (corrupt or empty): it carries no alarm, so it goes, but only because
         //  another Item was polled (the guard above). With an error code it is kept.
         fun unusable(e: ItemStatus) = e.lastErrorCode == null && parse(e.lastSuccessfulSync) == null && parse(e.lastFailure) == null
