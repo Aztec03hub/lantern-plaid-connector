@@ -247,7 +247,7 @@ internal class R2SyncTest {
     @Test
     fun aPollDropsTheStatusOfAnItemItNoLongerPolls() = runBlocking<Unit> {
         val store = ItemStatusStore(dir.toString())
-        store.record(java.time.Instant.now(), listOf(), listOf(store.ref("tok-replaced-0000", "New Link") to "ITEM_LOGIN_REQUIRED"))
+        store.record(java.time.Instant.now(), listOf(store.ref("tok-replaced-0000", "New Link")), listOf())
         whenever(plaidSyncService.processPlaidTransactions(any(), any())).thenReturn(
             PlaidTransactionResult(listOf(), listOf(), listOf(), listOf())
         )
@@ -263,12 +263,13 @@ internal class R2SyncTest {
     }
 
     @Test
-    fun twoTokensSharingTheRedactedSuffixAreBothKeptWhenOneFails() = runBlocking<Unit> {
+    fun twoTokensSharingTheRedactedSuffixAreBothKeptAndTheHealthyOneGetsNoForeignCode() = runBlocking<Unit> {
         val sequence = sequenceOf(Pair("tok-aaaa-1234", listOf(accountA)), Pair("tok-bbbb-1234", listOf(accountA)))
         whenever(plaidSyncService.processPlaidTransactions(any(), any())).thenReturn(
             PlaidTransactionResult(listOf(), listOf(), listOf(), listOf(ItemFailure("Chase", "access-****1234", "ITEM_LOGIN_REQUIRED")))
         )
-        whenever(plaidSyncService.describeInstitution(any())).thenReturn("Other Bank")
+        whenever(plaidSyncService.describeInstitution("tok-aaaa-1234")).thenReturn("Chase")
+        whenever(plaidSyncService.describeInstitution("tok-bbbb-1234")).thenReturn("Other Bank")
         val store = ItemStatusStore(dir.toString())
         val orchestrator = PolledSyncOrchestrator(
             30, syncHelper, cursorManager, plaidSyncService, fireflyTransactionService, converter,
@@ -277,7 +278,7 @@ internal class R2SyncTest {
 
         orchestrator.runIteration(mapOf(accountA to 1), sequence, mutableMapOf())
 
-        assertThat(store.read().values.map { it.lastErrorCode }).containsExactly("ITEM_LOGIN_REQUIRED", "ITEM_LOGIN_REQUIRED")
+        assertThat(store.read().values.map { it.lastErrorCode }).containsExactlyInAnyOrder("ITEM_LOGIN_REQUIRED", "AMBIGUOUS_TOKEN_SUFFIX")
     }
 
     @Test

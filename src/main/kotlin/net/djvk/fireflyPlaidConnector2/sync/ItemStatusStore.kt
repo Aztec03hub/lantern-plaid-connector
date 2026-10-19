@@ -107,9 +107,18 @@ class ItemStatusStore(
     private fun prune(statuses: MutableMap<String, ItemStatus>, polled: Set<String>, institutions: Set<String>, now: Instant) {
         if (polled.isEmpty()) return
         val cutoff = now.minus(java.time.Duration.ofDays(SILENT_DAYS))
-        fun recent(t: String?) = t != null && runCatching { Instant.parse(t) }.getOrNull()?.let { it >= cutoff } == true
+        // A timestamp is missing (null), unparseable (parse gives null) or valid. Future times are not old (kept).
+        fun parse(t: String?): Instant? = t?.let { runCatching { Instant.parse(it) }.getOrNull() }
+        fun old(t: String?) = parse(t)?.let { it < cutoff } == true
         val absent = statuses.values.filter { it.item !in polled }
-        val drop = absent.filter { it.institution in institutions || !(recent(it.lastSuccessfulSync) || recent(it.lastFailure)) }
+        val named = institutions.filter { it.isNotBlank() && it != UNNAMED_ITEM }.toSet()
+        // The failure side is clear when there is none, or it is valid and older than the cutoff; an error code with no
+        //  valid old failure time is a live alarm
+        fun failureClear(e: ItemStatus) = if (e.lastFailure == null) e.lastErrorCode == null else old(e.lastFailure)
+        // Silent: at least one time present, and every time that is present is valid and old. Unparseable: kept.
+        fun silent(e: ItemStatus) = (e.lastSuccessfulSync != null || e.lastFailure != null) &&
+            (e.lastSuccessfulSync == null || old(e.lastSuccessfulSync)) && (e.lastFailure == null || old(e.lastFailure))
+        val drop = absent.filter { failureClear(it) && (it.institution in named || silent(it)) }
         if (drop.isNotEmpty()) {
             logger.info("Dropping ${drop.size} item status entr${if (drop.size == 1) "y" else "ies"} for Items replaced or silent over $SILENT_DAYS days")
             statuses.keys.removeAll(drop.map { it.item }.toSet())
@@ -118,7 +127,11 @@ class ItemStatusStore(
         if (kept > 0) logger.warn("$kept item status entr${if (kept == 1) "y" else "ies"} not polled this run were kept (institutions: ${absent.filter { it !in drop }.map { it.institution }.distinct()})")
     }
 
-    private companion object { const val SILENT_DAYS = 30L }
+    private companion object {
+        const val SILENT_DAYS = 30L
+        /** The fallback name of PlaidSyncService.describeInstitution; never an institution match. */
+        const val UNNAMED_ITEM = "unnamed Item"
+    }
 
     private suspend fun write(statuses: List<ItemStatus>) = withContext(Dispatchers.IO) {
         val directory = path.toAbsolutePath().parent

@@ -234,10 +234,13 @@ class PolledSyncOrchestrator(
         val succeeded = accessTokens
             .filter { Utilities.redactAccessToken(it) !in failedRedacted }
             .map { store.ref(it, plaidSyncService.describeInstitution(it)) }
-        // Tokens sharing the redacted suffix cannot be told apart, so all of them count as failed (kept, not dropped)
+        // Tokens sharing a failure's redacted suffix cannot be told apart by token; the one whose configured institution
+        //  matches the failure gets its code, the others are kept with a distinct code instead of the other Item's
         val failedRefs = failed.flatMap { f ->
-            accessTokens.filter { Utilities.redactAccessToken(it) == f.accessTokenRedacted }
-                .map { store.ref(it, f.institution) to f.errorCode }
+            val matches = accessTokens.filter { Utilities.redactAccessToken(it) == f.accessTokenRedacted }
+            val exact = matches.filter { matches.size == 1 || plaidSyncService.describeInstitution(it) == f.institution }
+            exact.map { store.ref(it, f.institution) to f.errorCode } +
+                (matches - exact.toSet()).map { store.ref(it, plaidSyncService.describeInstitution(it)) to "AMBIGUOUS_TOKEN_SUFFIX" }
         }
         val lastSuccess = store.record(Instant.now(), succeeded, failedRefs, pruneUnlisted = true)
         return failed.map { f ->

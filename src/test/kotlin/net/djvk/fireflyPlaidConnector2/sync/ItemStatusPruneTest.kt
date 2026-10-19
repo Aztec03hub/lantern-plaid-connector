@@ -24,7 +24,7 @@ internal class ItemStatusPruneTest {
         val old = store.ref("access-fake-old", "Test Bank")
         val kept = store.ref("access-fake-kept", "Other Bank")
         val fresh = store.ref("access-fake-new", "Test Bank")
-        store.record(ago(1), listOf(kept), listOf(old to "ITEM_LOGIN_REQUIRED"))
+        store.record(ago(1), listOf(kept, old), emptyList())
 
         store.poll(now, listOf(kept, fresh))
 
@@ -142,5 +142,94 @@ internal class ItemStatusPruneTest {
         assertEquals("rw-------", PosixFilePermissions.toString(Files.getPosixFilePermissions(store.path)))
         assertEquals(setOf(fresh.id), store.read().keys)
         assertEquals(once, Files.readString(store.path))
+    }
+
+    private fun status(ref: ItemStatusStore.ItemRef, ok: String?, fail: String?, code: String?) =
+        ItemStatus(ref.id, ref.institution, ref.redactedToken, ok, fail, code)
+
+    private fun seed(store: ItemStatusStore, vararg e: ItemStatus) {
+        Files.writeString(store.path, com.fasterxml.jackson.module.kotlin.jacksonObjectMapper().writeValueAsString(e.toList()))
+    }
+
+    @Test
+    fun sameBankDamagedConfigKeepsARecentLoginRequiredEntry(@TempDir dir: Path) = runBlocking<Unit> {
+        val store = ItemStatusStore(dir.toString())
+        val a = store.ref("access-fake-a", "Same Bank")
+        val b = store.ref("access-fake-b", "Same Bank")
+        store.record(ago(1), listOf(b), listOf(a to "ITEM_LOGIN_REQUIRED"))
+
+        store.poll(now, listOf(b))
+
+        assertEquals(setOf(a.id, b.id), store.read().keys)
+        assertEquals("ITEM_LOGIN_REQUIRED", store.read()[a.id]!!.lastErrorCode)
+    }
+
+    @Test
+    fun sameBankEntryWithoutCodeIsStillReplaced(@TempDir dir: Path) = runBlocking<Unit> {
+        val store = ItemStatusStore(dir.toString())
+        val a = store.ref("access-fake-a", "Same Bank")
+        val b = store.ref("access-fake-b", "Same Bank")
+        store.record(ago(1), listOf(a), emptyList())
+
+        store.poll(now, listOf(b))
+
+        assertEquals(setOf(b.id), store.read().keys)
+    }
+
+    @Test
+    fun oldFailureWithCodeIsReplacedByTheInstitutionRule(@TempDir dir: Path) = runBlocking<Unit> {
+        val store = ItemStatusStore(dir.toString())
+        val a = store.ref("access-fake-a", "Same Bank")
+        val b = store.ref("access-fake-b", "Same Bank")
+        store.record(hoursAgo(31 * 24), emptyList(), listOf(a to "ITEM_LOGIN_REQUIRED"))
+
+        store.poll(now, listOf(b))
+
+        assertEquals(setOf(b.id), store.read().keys)
+    }
+
+    @Test
+    fun blankAndUnnamedInstitutionsNeverCountAsAMatch(@TempDir dir: Path) = runBlocking<Unit> {
+        val store = ItemStatusStore(dir.toString())
+        for (name in listOf("unnamed Item", "")) {
+            val a = store.ref("access-fake-a-$name", name)
+            val b = store.ref("access-fake-b-$name", name)
+            store.record(ago(1), listOf(a), emptyList())
+
+            store.poll(now, listOf(b))
+
+            assertEquals(setOf(a.id, b.id), store.read().keys, "name '$name'")
+            Files.delete(store.path)
+        }
+    }
+
+    @Test
+    fun futureTimestampsAreKept(@TempDir dir: Path) = runBlocking<Unit> {
+        val store = ItemStatusStore(dir.toString())
+        val live = store.ref("access-fake-live", "Live Bank")
+        val skew = store.ref("access-fake-skew", "Skew Bank")
+        seed(store, status(skew, now.plus(Duration.ofDays(400)).toString(), null, null))
+
+        store.poll(now, listOf(live))
+
+        assertEquals(setOf(live.id, skew.id), store.read().keys)
+    }
+
+    @Test
+    fun unparseableOrMissingTimestampsAreKept(@TempDir dir: Path) = runBlocking<Unit> {
+        val store = ItemStatusStore(dir.toString())
+        val live = store.ref("access-fake-live", "Live Bank")
+        val junk = store.ref("access-fake-junk", "Junk Bank")
+        val coded = store.ref("access-fake-coded", "Coded Bank")
+        val empty = store.ref("access-fake-empty", "Empty Bank")
+        seed(store,
+            status(junk, "not a time", "also not", null),
+            status(coded, null, "garbage", "ITEM_LOGIN_REQUIRED"),
+            status(empty, null, null, null),
+        )
+
+        store.poll(now, listOf(live))
+
+        assertEquals(setOf(live.id, junk.id, coded.id, empty.id), store.read().keys)
     }
 }
