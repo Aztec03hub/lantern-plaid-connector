@@ -302,4 +302,28 @@ internal class ItemStatusPruneTest {
 
         assertEquals(setOf(live.id), store.read().keys)
     }
+
+    @Test
+    fun codeWithoutAFailureTimeIsKeptWhenNoSiblingExists(@TempDir dir: Path) = runBlocking<Unit> {
+        val store = ItemStatusStore(dir.toString())
+        val live = store.ref("access-fake-live", "Live Bank")
+        val odd = store.ref("access-fake-odd", "Odd Bank")
+        seed(store, status(odd, hoursAgo(90 * 24).toString(), null, "ITEM_LOGIN_REQUIRED"))
+
+        store.poll(now, listOf(live))
+
+        assertEquals(setOf(live.id, odd.id), store.read().keys)
+    }
+
+    @Test
+    fun codeLessSameBankEntryWithAFutureSuccessIsStillReplaced(@TempDir dir: Path) = runBlocking<Unit> {
+        val store = ItemStatusStore(dir.toString())
+        val live = store.ref("access-fake-live", "Same Bank")
+        val skew = store.ref("access-fake-skew", "Same Bank")
+        seed(store, status(skew, now.plus(Duration.ofDays(2)).toString(), null, null))
+
+        store.poll(now, listOf(live))
+
+        assertEquals(setOf(live.id), store.read().keys)
+    }
 }
