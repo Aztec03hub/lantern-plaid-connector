@@ -303,37 +303,65 @@ class PlaidSyncService(
     }
 
     /**
-     * Initializes cursors for access tokens that don't have one yet.
+     * Fast-forwards Items that have no usable cursor: pages through their history and ignores it. An Item's cursor is
+     * stored only after its LAST page arrived, so a failed fast-forward leaves nothing behind (a mid-history cursor
+     * would make the next poll import the rest of the history).
+     *
+     * @return the Items whose fast-forward failed (only with allowItemToFail; otherwise the failure is thrown)
      */
     suspend fun initializeCursors(
         accountAccessTokenSequence: Sequence<Pair<PlaidAccessToken, List<PlaidAccountId>>>,
         cursorMap: MutableMap<PlaidAccessToken, PlaidSyncCursor>
-    ) {
+    ): Map<PlaidAccessToken, ItemFailure> {
         logger.debug("Beginning Plaid sync endpoint cursor initialization")
-        cursorCatchupLoop@ for ((accessToken, _) in accountAccessTokenSequence) {
+        val failures = mutableMapOf<PlaidAccessToken, ItemFailure>()
+        for ((accessToken, _) in accountAccessTokenSequence) {
             // If we already have a cursor for this access token, then move on
-            if (cursorMap.contains(accessToken)) {
+            if (hasCursor(cursorMap, accessToken)) {
                 logger.debug("Cursor map contains ${redactAccessToken(accessToken)}, skipping initialization for it")
                 continue
             }
 
-            // For access tokens that we don't have cursors for, iterate through historical data and ignore it
-            // to get current cursors
-            do {
-                val response =
-                    executeTransactionSyncRequest(accessToken, cursorMap[accessToken], plaidBatchSize)
-                        ?: continue@cursorCatchupLoop
-                logger.debug(
-                    "Received initial batch of sync updates for access token ${redactAccessToken(accessToken)}. " +
-                            "Updating cursor map to next cursor: ${response.nextCursor}"
-                )
-                if (response.nextCursor.isNotBlank()) {
-                    cursorMap[accessToken] = response.nextCursor
+            var restarts = 0
+            while (true) {
+                var cursor: PlaidSyncCursor? = null
+                var failure: Exception? = null
+                try {
+                    var hasMore: Boolean
+                    do {
+                        val response = executeTransactionSyncRequest(
+                            accessToken, cursor, plaidBatchSize, onFailure = { failure = it },
+                        ) ?: break
+                        if (response.nextCursor.isNotBlank()) cursor = response.nextCursor
+                        hasMore = response.hasMore
+                    } while (hasMore)
+                } catch (e: SyncMutationDuringPaginationException) {
+                    if (++restarts <= maxMutationRestarts) {
+                        logger.warn("Plaid data for ${redactAccessToken(accessToken)} changed during fast-forward; restarting (restart $restarts of $maxMutationRestarts)")
+                        continue
+                    }
+                    if (!allowItemToFail) throw e
+                    failure = e
                 }
-            } while (response.hasMore)
+                val failed = failure
+                if (failed != null) {
+                    val code = if (failed is SyncMutationDuringPaginationException) MUTATION_DURING_PAGINATION else plaidErrorCode(failed)
+                    failures[accessToken] = ItemFailure(describeInstitution(accessToken), redactAccessToken(accessToken), code)
+                    logger.error("Cursor fast-forward failed for ${describeItem(accessToken)}: $code; it will be retried on the next poll")
+                    break
+                }
+                // Only here: the last page arrived
+                if (cursor != null) cursorMap[accessToken] = cursor
+                break
+            }
         }
+        return failures
     }
 }
+
+/** True when [accessToken] has a usable cursor; a blank one (hand edit) counts as none. */
+fun hasCursor(cursorMap: Map<PlaidAccessToken, PlaidSyncCursor>, accessToken: PlaidAccessToken): Boolean =
+    !cursorMap[accessToken].isNullOrBlank()
 
 /** Plaid error_code returned when an Item's data changed between pages of a /transactions/sync pagination. */
 const val MUTATION_DURING_PAGINATION = "TRANSACTIONS_SYNC_MUTATION_DURING_PAGINATION"

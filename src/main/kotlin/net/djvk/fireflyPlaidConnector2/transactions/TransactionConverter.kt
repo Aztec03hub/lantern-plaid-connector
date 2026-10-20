@@ -373,6 +373,7 @@ class TransactionConverter(
         /**
          * Firefly transfers whose two Plaid legs disagree after a Plaid change, which this conversion therefore left
          * alone. A person has to check them; the poll reports the count (callback status "partial").
+         * Also groups with several splits whose Plaid removal was refused.
          */
         val transfersNeedingReview: Set<FireflyTransactionId> = setOf(),
     )
@@ -586,6 +587,13 @@ class TransactionConverter(
             }
             // Both legs of one transfer removed in the same sync: one delete, not two
             if (!handledRemovals.add(target.id)) continue
+            val groupSplits = target.attributes.transactions
+            if (groupSplits.size != 1) {
+                // A DELETE of the group would take the user's other splits and their links with it; the update path above refuses the same way
+                logger.error("Plaid removed id $plaidDeleteId but Firefly transaction ${target.id} has ${groupSplits.size} splits; not deleting it, check it by hand")
+                needsReview.add(target.id) // removal refused: counted in transfersNeedingReview
+                continue
+            }
             val split = target.attributes.transactions.singleOrNull()
             val legIds = split?.plaidLinks.orEmpty().map { it.plaidTransactionId }
             // A transfer with one link was paired with a manually entered transaction: the user's own side is never deleted

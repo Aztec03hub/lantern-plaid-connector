@@ -277,10 +277,11 @@ class PolledSyncOrchestrator(
         //  changes, so a failure part way through (network down, Firefly error) never skips Plaid data: the next
         //  iteration re-reads from the last committed cursors.
         val workingCursors = cursorMap.toMutableMap()
-        val plaidTransactions = plaidSyncService.processPlaidTransactions(
-            accountAccessTokenSequence,
-            workingCursors
-        )
+        // An Item that is new (or whose fast-forward failed earlier) is fast-forwarded first, so it is never synced from the start of its history
+        val initFailures = if (importHistoryOnFirstSync) mapOf() else plaidSyncService.initializeCursors(accountAccessTokenSequence, workingCursors) ?: mapOf() // ?: because a Mockito mock of a suspend fun returns null
+        val pollable = if (initFailures.isEmpty()) accountAccessTokenSequence else accountAccessTokenSequence.filter { it.first !in initFailures }
+        val processed = plaidSyncService.processPlaidTransactions(pollable, workingCursors)
+        val plaidTransactions = if (initFailures.isEmpty()) processed else processed.copy(failedItems = processed.failedItems + initFailures.values)
         val accessTokens = accountAccessTokenSequence.map { it.first }.toList()
 
         // Most polls find nothing new. Don't page through Firefly every interval just to do nothing with it.
