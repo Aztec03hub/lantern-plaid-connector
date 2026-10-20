@@ -340,7 +340,7 @@ class PlaidSyncService(
                         logger.warn("Plaid data for ${redactAccessToken(accessToken)} changed during fast-forward; restarting (restart $restarts of $maxMutationRestarts)")
                         continue
                     }
-                    if (!allowItemToFail) throw e
+                    if (!allowItemToFail) throw e // strict: surface it
                     failure = e
                 }
                 val failed = failure
