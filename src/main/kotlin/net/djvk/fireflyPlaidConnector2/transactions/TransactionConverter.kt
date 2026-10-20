@@ -573,7 +573,7 @@ class TransactionConverter(
                             preserveUserFields(leg, target),
                             changesType = typeChange(leg, existingSplit),
                             fallbackCreate = fallback,
-                            fallbackOnlyWhenGone = true,
+                            fallbackOnlyWhenGone = true, // the transfer keeps the money after a 422
                             plaidAccountId = plaidUpdate.accountId,
                         )
                     }
@@ -706,9 +706,8 @@ class TransactionConverter(
                 target.id,
                 preserveUserFields(leg.copy(plaidLinks = if (swap) swapLegs(relinked) else relinked), target),
                 changesType = typeChange(leg, existingSplit),
-                // Gone (404) -> create the posted transaction; a 422 leaves the pending leg holding the money
-                fallbackCreate = convertSingle(posted, accountMap, currentImportTag(), link = true),
-                fallbackOnlyWhenGone = true,
+                fallbackCreate = convertSingle(posted, accountMap, currentImportTag(), link = true), // gone (404): create the posted transaction
+                fallbackOnlyWhenGone = true, // a 422 leaves the pending leg holding the money
             )
         }
         if (existingSplit.type != getFireflyTransactionDtoType(posted, false)) {
