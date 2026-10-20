@@ -8,6 +8,7 @@ import net.djvk.fireflyPlaidConnector2.api.firefly.apis.AboutApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.AccountsApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.FireflyTransactionId
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.PlaidLinksApi
+import net.djvk.fireflyPlaidConnector2.api.firefly.apis.SearchApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.AccountTypeFilter
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.PlaidLink
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.PlaidLinkConflictError
@@ -52,6 +53,9 @@ class SyncHelper(
     /** How many creates run at once, see [forEachBounded]; 1 writes one at a time. */
     @Value("\${fireflyPlaidConnector2.firefly.writeConcurrency:8}")
     val writeConcurrency: Int = 8,
+
+    /** Finds transactions an older import made without a link row, see [heldByLegacyReference]. */
+    private val fireflySearchApi: SearchApi? = null,
 ) {
     private val logger = LoggerFactory.getLogger(this::class.java)
 
@@ -62,6 +66,7 @@ class SyncHelper(
         fireflyAccountsApi.setAccessToken(fireflyAccessToken)
         fireflyAboutApi.setAccessToken(fireflyAccessToken)
         fireflyPlaidLinksApi.setAccessToken(fireflyAccessToken)
+        fireflySearchApi?.setAccessToken(fireflyAccessToken)
         validateFireflyApiVersion()
         validatePlaidLinksEndpoint()
     }
@@ -158,6 +163,19 @@ class SyncHelper(
             for ((accessToken, accountConfigs) in investmentsByAccessToken) {
                 yield(Pair(accessToken, accountConfigs.map { it.plaidAccountId }))
             }
+        }
+    }
+
+    /**
+     * True when Firefly holds a transaction an older import made for [plaidId] before the link table existed: one with
+     * the Plaid id as its external id or internal reference. A failed search propagates, so the caller never creates
+     * on a guess.
+     */
+    suspend fun heldByLegacyReference(plaidId: String): Boolean {
+        val api = checkNotNull(fireflySearchApi) { "No Firefly search API to look for an older import of $plaidId" }
+        val quoted = plaidId.replace("\\", "").replace("\"", "")
+        return listOf("external_id_is", "internal_reference_is").any { operator ->
+            api.searchTransactions("$operator:\"$quoted\"", null).body().data.isNotEmpty()
         }
     }
 

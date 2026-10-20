@@ -315,7 +315,7 @@ class PolledSyncOrchestrator(
 
         // Writes Firefly rejected in earlier polls are retried first, so a newer write for the same transaction
         //  (below) always lands after the stale one
-        fireflyTransactionService.retryDeadLetters()
+        fireflyTransactionService.retryDeadLetters(accountMap)
 
         // Advance a working copy of the cursors. The real map is only updated after Firefly has accepted the
         //  changes, so a failure part way through (network down, Firefly error) never skips Plaid data: the next

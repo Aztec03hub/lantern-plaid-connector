@@ -74,7 +74,10 @@ internal class R3SyncTest {
     )
 
     private val txApi: TransactionsApi = mock()
-    private val helper: SyncHelper = mock { onBlocking { optimisticInsertBatchIntoFirefly(any()) } doReturn 1 }
+    private val helper: SyncHelper = mock {
+        onBlocking { optimisticInsertBatchIntoFirefly(any()) } doReturn 1
+        onBlocking { heldByLegacyReference(any()) } doReturn false
+    }
     private val plaidLinksApi: PlaidLinksApi = mock()
     private val syncHelper: SyncHelper = mock { onBlocking { fetchAccountKinds() } doReturn emptyMap() }
     private val cursorManager: CursorManager = mock()
@@ -248,6 +251,59 @@ internal class R3SyncTest {
         assertThat(kept.split?.type).isEqualTo(TransactionTypeProperty.withdrawal)
         assertThat(kept.split?.sourceId).isEqualTo("1")
         assertThat(kept.split?.plaidLinks).containsExactly(PlaidLink("wd", PlaidLinkLeg.single, "plaidAccountA"))
+    }
+
+    // endregion
+
+    // region U02: a modified Plaid transaction with no Firefly record
+
+    @Test
+    fun aModifiedPlaidTransactionWithNoFireflyRecordIsCreatedAndTheCursorMoves() = runBlocking<Unit> {
+        emptyFirefly()
+        val store = DeadLetterStore(dir.toString())
+        whenever(plaidSyncService.processPlaidTransactions(any(), any())).thenReturn(plaidResult(updated = listOf(plaid(accountA, "tx1", 50.0))))
+
+        val result = orchestrator(service(store), store)
+            .processTransactions(accountMap, sequenceOf(Pair("tok-12345678", listOf(accountA))), mutableMapOf())
+
+        val sent = argumentCaptor<List<FireflyTransactionDto>>()
+        verify(helper).optimisticInsertBatchIntoFirefly(sent.capture())
+        assertThat(sent.firstValue.single().tx.plaidLinks?.single()?.plaidTransactionId).isEqualTo("tx1")
+        verify(helper).heldByLegacyReference("tx1")
+        verify(cursorManager).writeCursorMap(any())
+        assertThat(result.deadLetters).isEqualTo(0)
+    }
+
+    @Test
+    fun aModifiedPlaidTransactionWhoseCreateFireflyRejectsIsKeptAsALetterAndTheCursorMoves() = runBlocking<Unit> {
+        emptyFirefly()
+        rejectCreates()
+        val store = DeadLetterStore(dir.toString())
+        whenever(plaidSyncService.processPlaidTransactions(any(), any())).thenReturn(plaidResult(updated = listOf(plaid(accountA, "tx1", 50.0))))
+
+        val result = orchestrator(service(store), store)
+            .processTransactions(accountMap, sequenceOf(Pair("tok-12345678", listOf(accountA))), mutableMapOf())
+
+        val letter = store.read().single()
+        assertThat(letter.operation).isEqualTo("create")
+        assertThat(letter.key).isEqualTo("tx1")
+        verify(cursorManager).writeCursorMap(any())
+        assertThat(result.deadLetters).isEqualTo(1)
+        assertThat(result.partial).isTrue()
+    }
+
+    @Test
+    fun aModifiedPlaidTransactionWhoseCreateFailsWith503KeepsTheCursorWhereItWas() = runBlocking<Unit> {
+        emptyFirefly()
+        whenever(helper.optimisticInsertBatchIntoFirefly(any())).doSuspendableAnswer { throw statusError(HttpStatusCode.ServiceUnavailable) }
+        val store = DeadLetterStore(dir.toString())
+        whenever(plaidSyncService.processPlaidTransactions(any(), any())).thenReturn(plaidResult(updated = listOf(plaid(accountA, "tx1", 50.0))))
+
+        runCatching {
+            orchestrator(service(store), store).processTransactions(accountMap, sequenceOf(Pair("tok-12345678", listOf(accountA))), mutableMapOf())
+        }
+
+        verify(cursorManager, never()).writeCursorMap(any())
     }
 
     // endregion

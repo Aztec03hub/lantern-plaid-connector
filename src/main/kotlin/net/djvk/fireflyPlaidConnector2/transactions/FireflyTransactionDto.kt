@@ -24,12 +24,22 @@ data class FireflyTransactionDto(
      */
     val changesType: Boolean = false,
     /**
-     * For an update that adds a Plaid leg to an existing transaction (pairing, or pending to posted): what to create
-     * instead if the transaction is gone (404), or, for a pairing only, if Firefly rejects the update for good (any 4xx
-     * but 401/403/408/409/429), so the new
-     * leg's money is never hidden behind a rejected update (see FireflyTransactionService.processFireflyTransactionUpdates).
+     * For an update that carries a Plaid fact (a pairing, a pending to posted promotion, or a plain Plaid update): what
+     * to create instead if the Firefly transaction is gone (404), so the money is never lost behind a failed update. A
+     * pairing (and only a pairing, see [fallbackOnlyWhenGone]) also creates it when Firefly rejects the update for good
+     * (any 4xx but 401/403/408/409/429). A dead letter keeps it too (see FireflyTransactionService.processFireflyTransactionUpdates).
      */
     val fallbackCreate: FireflyTransactionDto? = null,
+    /** True when the fallback may only replace the update if the Firefly transaction is GONE (404): a transfer or plain Plaid update, where a rejected update leaves the old transaction holding the money. False keeps the pairing rule (any permanent 4xx). */
+    val fallbackOnlyWhenGone: Boolean = false,
+    /** The Plaid account this update is for, kept so a dead letter can re-resolve the Firefly account after the mapping changes; null when the split's links carry it. */
+    val plaidAccountId: String? = null,
+    /**
+     * True for a create that stands in for a Plaid update Firefly has no link for: before it is sent, Firefly is searched
+     * for a transaction an older import (before the link table) made with this Plaid id as its external id or internal
+     * reference, and the create is skipped if there is one.
+     */
+    val checkLegacyReference: Boolean = false,
 ) {
     val transactionId: String
         get() = id ?: throw RuntimeException("Can't use a Firefly transaction without an id for sorting")
