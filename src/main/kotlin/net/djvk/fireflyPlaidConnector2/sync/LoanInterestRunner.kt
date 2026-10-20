@@ -28,6 +28,9 @@ import kotlin.math.max
 /** One loan of the pair config's `loans` list: the Firefly account, its APR in percent, and the expense account interest goes to. */
 data class LoanConfig(val account: Int, val apr: BigDecimal, val interestAccount: String)
 
+/** Plaid error_codes of an institution that will not come back; such a loan is reported every night but does not fail the step alone (M3). */
+private val PERMANENT_CODES = setOf("INSTITUTION_NOT_SUPPORTED", "INSTITUTION_NO_LONGER_SUPPORTED")
+
 /** Plaid's institution did not answer for a loan's balance (transient error_code, no figures or tokens). */
 internal class PlaidBalanceUnavailable(val errorCode: String, cause: Throwable) : RuntimeException("Plaid balance unavailable: $errorCode", cause)
 
@@ -111,14 +114,18 @@ class LoanInterestRunner(
         val plans = runOnce(apply)
         val held = plans.filter { it.action.startsWith("HELD") }
         // V3: track first, so a night with a HELD loan still records the recovery of the others
-        val stuck = trackLag(plans)
+        // L2: a skipped loan was not read tonight, so its carried lag date must not raise the "payment probably missing" alert
+        val stuck = trackLag(plans).filter { a -> skipped.none { it.first.account == a } }
+        // M3: a permanently unsupported institution is reported every night but does not fail the step by itself
+        val (permanent, transient) = skipped.partition { it.second in PERMANENT_CODES }
         val parts = listOfNotNull(
-            skipped.takeIf { it.isNotEmpty() }?.let { "${it.size} loan(s) SKIPPED, Plaid did not answer or needs a login: ${it.map { (l, c) -> "${l.account} ($c)" }}" },
-            unchecked.takeIf { it.isNotEmpty() }?.let { "${it.size} loan(s) WRITTEN but not re-checked, Plaid did not answer: ${it.map { (l, c) -> "${l.account} ($c)" }}" },
+            transient.takeIf { it.isNotEmpty() }?.let { "${it.size} loan(s) SKIPPED, Plaid did not answer or needs a login: ${it.map { (l, c) -> "${l.account} ($c)" }}" },
+            unchecked.takeIf { it.isNotEmpty() }?.let { "${it.size} loan(s) WRITTEN but not re-checked, Plaid did not answer or a gap is left: ${it.map { (l, c) -> "${l.account} ($c)" }}" },
             held.takeIf { it.isNotEmpty() }?.let { "${it.size} loan(s) HELD, nothing written: ${it.map { h -> h.loan.account }}" },
             stuck.takeIf { it.isNotEmpty() }?.let { "loan(s) $it have been \"Firefly lags\" for $lagNights or more nights; a payment Plaid has seen is probably missing in Firefly" },
         )
-        if (parts.isNotEmpty()) println("!! loan-interest: " + parts.joinToString(" | "))
+        val notes = permanent.takeIf { it.isNotEmpty() }?.let { "${it.size} loan(s) SKIPPED (permanent), institution not supported by Plaid: ${it.map { (l, c) -> "${l.account} ($c)" }}" }
+        if (parts.isNotEmpty() || notes != null) println("!! loan-interest: " + (parts + listOfNotNull(notes)).joinToString(" | "))
         check(parts.isEmpty()) { "loan-interest: " + parts.joinToString(" | ") }
     }
 
@@ -182,13 +189,22 @@ class LoanInterestRunner(
             unchecked = written.map { it.loan to code }
             return plans
         }
-        unchecked = written.filter { it.loan.account in failedAfter }.map { it.loan to failedAfter.getValue(it.loan.account) }
-        unchecked.forEach { (l, c) -> println("WARN: loan ${l.account} written but not re-checked ($c)") }
+        val left = written.filter { it.loan.account in failedAfter }.map { it.loan to failedAfter.getValue(it.loan.account) }.toMutableList()
+        left.forEach { (l, c) -> println("WARN: loan ${l.account} written but not re-checked ($c)") }
+        // M1: one loan's missing balance, Firefly error or leftover gap marks that loan unchecked; the others are still checked
         for (p in written.filter { it.loan.account !in failedAfter }) {
-            val again = gapOf(p.loan, plaidAfter)
-            println("   loan ${p.loan.account}: gap now $again")
-            check(again.abs() <= tolerance) { "loan-interest is not done: loan ${p.loan.account} still has a gap of $again" }
+            try {
+                val again = gapOf(p.loan, plaidAfter)
+                println("   loan ${p.loan.account}: gap now $again")
+                if (again.abs() > tolerance) { println("WARN: loan ${p.loan.account} still has a gap after writing"); left.add(p.loan to "GAP") }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                println("WARN: loan ${p.loan.account} written but not re-checked (ERROR_${e.javaClass.simpleName})")
+                left.add(p.loan to "ERROR_${e.javaClass.simpleName}")
+            }
         }
+        unchecked = left
         return plans
     }
 
@@ -203,6 +219,8 @@ class LoanInterestRunner(
         }
         val cause = e.cause
         return when {
+            // L1: a connection cut while the body is read; a JSON parse error is also an IOException and must still abort
+            e is java.io.IOException && e !is com.fasterxml.jackson.core.JsonProcessingException -> "NETWORK_${e.javaClass.simpleName}"
             e !is RuntimeException -> null
             cause is ServerResponseException -> "HTTP_${cause.response.status.value}"
             cause is java.io.IOException -> "NETWORK_${cause.javaClass.simpleName}"

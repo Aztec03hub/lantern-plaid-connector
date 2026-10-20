@@ -41,6 +41,8 @@ internal class LoanInterestResilienceTest {
     private val calls = mutableMapOf("tokA" to 0, "tokB" to 0)
     private val stores = mutableListOf<TransactionStore>()
     /** token -> exception its request throws before any answer (a network failure, or a request-building bug) */
+    /** when true tokA serves both loan accounts (plA and plB) */
+    private var sharedItem = false
     private var requestFails = mapOf<String, Exception>()
     private val txApi = mock<TransactionsApi>()
     private val accountsApi = mock<AccountsApi>()
@@ -49,21 +51,23 @@ internal class LoanInterestResilienceTest {
     private fun errorBody(type: String, code: String) =
         """{"error_type":"$type","error_code":"$code","error_message":"private message","display_message":null,"request_id":"r"}"""
 
-    private fun balance(acc: String) =
-        """{"accounts":[{"account_id":"$acc","balances":{"current":23491.66,"iso_currency_code":"USD"},"name":"x","type":"loan"}],"item":{"available_products":["balance"],"billed_products":["transactions"],"consent_expiration_time":null,"error":null,"institution_id":"ins_56","item_id":"zzz","products":["transactions"],"update_type":"background","webhook":""},"request_id":"r"}"""
+    /** one Plaid balance answer for [accs]; [current] null leaves the `current` field out */
+    private fun balance(accs: List<String>, current: String? = "23491.66") =
+        """{"accounts":[${accs.joinToString(",") { acc -> """{"account_id":"$acc","balances":{${if (current != null) "\"current\":$current," else ""}"iso_currency_code":"USD"},"name":"x","type":"loan"}""" }}],"item":{"available_products":["balance"],"billed_products":["transactions"],"consent_expiration_time":null,"error":null,"institution_id":"ins_56","item_id":"zzz","products":["transactions"],"update_type":"background","webhook":""},"request_id":"r"}"""
 
     /** [failA]/[failB]: given the call number for that token, the (status, body) to answer with, or null for the real balance. */
-    private fun runner(failA: (Int) -> Pair<HttpStatusCode, String>?, failB: (Int) -> Pair<HttpStatusCode, String>? = { null }, lagDir: String = ""): LoanInterestRunner {
+    private fun runner(failA: (Int) -> Pair<HttpStatusCode, String>?, failB: (Int) -> Pair<HttpStatusCode, String>? = { null }, lagDir: String = "", bodyOfA: io.ktor.utils.io.ByteReadChannel? = null): LoanInterestRunner {
         val engine = MockEngine { req ->
             val body = String(req.body.toByteArray())
             val (tok, acc, fail) = if ("tokA" in body) Triple("tokA", "plA", failA) else Triple("tokB", "plB", failB)
             val n = calls.merge(tok, 1, Int::plus)!!
             requestFails[tok]?.let { throw it }
             val f = fail(n)
+            if (tok == "tokA" && bodyOfA != null) return@MockEngine respond(bodyOfA, HttpStatusCode.OK, headersOf(HttpHeaders.ContentType, "application/json"))
             if (f != null) respond(f.second, f.first, headersOf(HttpHeaders.ContentType, "application/json"))
-            else respond(balance(acc), HttpStatusCode.OK, headersOf(HttpHeaders.ContentType, "application/json"))
+            else respond(balance(if (sharedItem && tok == "tokA") listOf("plA", "plB") else listOf(acc)), HttpStatusCode.OK, headersOf(HttpHeaders.ContentType, "application/json"))
         }
-        val wrapper = PlaidApiWrapper("https://plaid.test", 3, "id", "secret", engine, ApiConfiguration().getClientConfig(), 0)
+        val wrapper = PlaidApiWrapper("https://plaid.test", 3, "id", "secret", engine, ApiConfiguration().getClientConfig(), 0, 0)
         val cfg = File(dir, "pair.json").also {
             it.writeText("""{"loans":[{"account":2,"apr":7.59,"interestAccount":"Interest A"},{"account":3,"apr":7.59,"interestAccount":"Interest B"}]}""")
         }
@@ -149,11 +153,94 @@ internal class LoanInterestResilienceTest {
     }
 
     @Test
-    fun aPermanentInstitutionErrorIsSkippedNotRetried() {
+    fun aPermanentInstitutionErrorIsSkippedNotRetriedAndAloneDoesNotFailTheRun() {
         val gone = HttpStatusCode.BadRequest to errorBody("INSTITUTION_ERROR", "INSTITUTION_NOT_SUPPORTED")
-        val e = assertThrows<IllegalStateException> { runner(failA = { gone }).run() }
-        assertThat(e.message).contains("2 (INSTITUTION_NOT_SUPPORTED)")
+        val out = printed { runner(failA = { gone }).run() }
+        assertThat(out).contains("!! loan-interest: ").contains("SKIPPED (permanent)").contains("2 (INSTITUTION_NOT_SUPPORTED)")
         assertThat(calls["tokA"]).isEqualTo(1)
+        assertThat(stores.map { it.transactions.single().sourceId }).containsExactly("3")
+    }
+
+    @Test
+    fun aPermanentSkipPlusAnotherFailureStillFailsAndNamesOnlyTheOther() {
+        val gone = HttpStatusCode.BadRequest to errorBody("INSTITUTION_ERROR", "INSTITUTION_NO_LONGER_SUPPORTED")
+        var thrown: IllegalStateException? = null
+        val out = printed { thrown = assertThrows<IllegalStateException> { runner(failA = { gone }, failB = { instDown }).run() } }
+        assertThat(thrown!!.message).contains("3 (INSTITUTION_NOT_RESPONDING)").doesNotContain("2 (")
+        assertThat(out).contains("SKIPPED (permanent)").contains("2 (INSTITUTION_NO_LONGER_SUPPORTED)")
+    }
+
+    @Test
+    fun aRateLimitErrorIsSkippedAfterItsRetries() {
+        val rl = HttpStatusCode.BadRequest to errorBody("RATE_LIMIT", "ACCOUNTS_LIMIT")
+        val e = assertThrows<IllegalStateException> { runner(failA = { rl }).run() }
+        assertThat(e.message).contains("2 (ACCOUNTS_LIMIT)")
+        assertThat(calls["tokA"]).isEqualTo(3)
+        assertThat(stores.map { it.transactions.single().sourceId }).containsExactly("3")
+    }
+
+    @Test
+    fun aPersistent429IsSkippedNotLoopedForever() {
+        val e = assertThrows<IllegalStateException> { runner(failA = { HttpStatusCode.TooManyRequests to errorBody("RATE_LIMIT", "RATE_LIMIT_EXCEEDED") }).run() }
+        assertThat(e.message).contains("2 (RATE_LIMIT_EXCEEDED)")
+        assertThat(calls["tokA"]).isEqualTo(3)
+        assertThat(stores.map { it.transactions.single().sourceId }).containsExactly("3")
+    }
+
+    @Test
+    fun aSharedItemFailingOnTheReReadMarksBothLoansUnchecked() {
+        sharedItem = true
+        val login = HttpStatusCode.BadRequest to errorBody("ITEM_ERROR", "ITEM_LOGIN_REQUIRED")
+        val r = runner(failA = { if (it >= 3) login else null })
+        runBlocking {
+            whenever(syncHelper.getAllPlaidAccessTokenAccountIdSets()).thenReturn(
+                Pair(mapOf("plA" to 2, "plB" to 3), sequenceOf("tokA" to listOf("plA", "plB"))))
+        }
+        val e = assertThrows<IllegalStateException> { r.run() }
+        assertThat(stores).hasSize(2)
+        assertThat(e.message).contains("WRITTEN but not re-checked").contains("2 (ITEM_LOGIN_REQUIRED)").contains("3 (ITEM_LOGIN_REQUIRED)")
+    }
+
+    @Test
+    fun aReReadWithoutACurrentBalanceMarksThatLoanOnlyAndTracksLag() {
+        val lag = File(dir, "lag").path
+        val noCurrent = HttpStatusCode.OK to balance(listOf("plA"), null)
+        var thrown: IllegalStateException? = null
+        val out = printed { thrown = assertThrows<IllegalStateException> { runner(failA = { if (it >= 2) noCurrent else null }, lagDir = lag).run() } }
+        assertThat(thrown!!.message).contains("WRITTEN but not re-checked").contains("2 (ERROR_IllegalStateException)").doesNotContain("3 (")
+        assertThat(out).contains("loan 3: gap now")
+        assertThat(File(lag, "loan-lag.json")).exists()
+        assertThat(stores).hasSize(2)
+    }
+
+    @Test
+    fun aGapLeftAfterWritingMarksThatLoanAndTheOtherIsStillChecked() {
+        val lag = File(dir, "lag").path
+        val farOff = HttpStatusCode.OK to balance(listOf("plA"), "99999.00")
+        var thrown: IllegalStateException? = null
+        val out = printed { thrown = assertThrows<IllegalStateException> { runner(failA = { if (it >= 2) farOff else null }, lagDir = lag).run() } }
+        assertThat(thrown!!.message).contains("WRITTEN but not re-checked").contains("2 (GAP)").doesNotContain("3 (")
+        assertThat(out).contains("loan 3: gap now")
+        assertThat(File(lag, "loan-lag.json")).exists()
+    }
+
+    @Test
+    fun aSkippedLoanDoesNotRaiseThePaymentProbablyMissingAlert() {
+        val lag = File(dir, "lag")
+        lag.mkdirs()
+        File(lag, "loan-lag.json").writeText("""{"2":"2026-09-25"}""")
+        val r = runner(failA = { instDown }, lagDir = lag.path).also { it.today = { LocalDate.of(2026, 10, 1) } }
+        val e = assertThrows<IllegalStateException> { r.run() }
+        assertThat(e.message).contains("SKIPPED").doesNotContain("Firefly lags")
+        assertThat(File(lag, "loan-lag.json").readText()).isEqualTo("""{"2":"2026-09-25"}""")
+    }
+
+    @Test
+    fun aConnectionCutWhileTheBodyIsReadIsSkipped() {
+        val cut = io.ktor.utils.io.ByteChannel(true)
+        cut.cancel(java.io.IOException("cut"))
+        val e = assertThrows<IllegalStateException> { runner(failA = { null }, bodyOfA = cut).run() }
+        assertThat(e.message).contains("2 (NETWORK_")
         assertThat(stores.map { it.transactions.single().sourceId }).containsExactly("3")
     }
 

@@ -15,7 +15,6 @@ import net.djvk.fireflyPlaidConnector2.api.plaid.infrastructure.ApiClient
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.stereotype.Component
-import kotlin.time.Duration.Companion.minutes
 
 typealias PlaidTransactionId = String
 
@@ -43,6 +42,9 @@ class PlaidApiWrapper(
     /** Base wait between retries of a failed call; attempt N waits N times this. */
     @Value("\${fireflyPlaidConnector2.plaid.retryBackoffMillis:2000}")
     private val retryBackoffMillis: Long = 2000,
+    /** Longest wait after one 429 (also the wait when Plaid sends no Retry-After); a 429 uses up a retry like any other failure. */
+    @Value("\${fireflyPlaidConnector2.plaid.rateLimitWaitMillis:60000}")
+    private val rateLimitWaitMillis: Long = 60_000,
 ) {
     private val plaidApi = PlaidApi(baseUrl, httpClientEngine, { config ->
         // ktor 3 stopped sending Accept-Charset by default; ktor 2 sent "UTF-8". Keep the wire format unchanged.
@@ -79,15 +81,18 @@ class PlaidApiWrapper(
         remainingRetries: Int = maxRetries,
     ): T {
         if (remainingRetries <= 0) {
-            throw RuntimeException("Plaid API call $logString failed after $maxRetries retries")
+            throw RuntimeException("Plaid API call $logString was not attempted: maxRetries is $maxRetries, it must be at least 1")
         }
         try {
             return request(plaidApi)
         } catch (cre: ClientRequestException) {
             if (cre.response.status == HttpStatusCode.TooManyRequests) {
-                logger.error("429 rate limiting error encountered while calling $logString. Waiting for one minute.", cre)
-                delay(1.minutes)
-                return executeRequest(request, logString, remainingRetries)
+                // LAN-54: the budget shrinks on every 429, so a persistent one ends after maxRetries attempts and the caller sees the exception
+                logger.error("429 rate limiting error encountered while calling $logString; ${remainingRetries - 1} retries remaining.", cre)
+                if (remainingRetries <= 1) throw cre
+                val retryAfter = cre.response.headers[HttpHeaders.RetryAfter]?.trim()?.toLongOrNull()?.let { it.coerceAtLeast(0) * 1000 }
+                delay(minOf(retryAfter ?: rateLimitWaitMillis, rateLimitWaitMillis))
+                return executeRequest(request, logString, remainingRetries - 1)
             }
             val transientCode = transientPlaidError(cre)
             if (transientCode != null) {

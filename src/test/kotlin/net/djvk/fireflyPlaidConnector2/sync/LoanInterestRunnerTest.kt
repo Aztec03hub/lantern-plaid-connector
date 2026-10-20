@@ -287,8 +287,9 @@ internal class LoanInterestRunnerTest {
     fun theApplyCheckFailsWhenFireflyDoesNotMove() = runBlocking<Unit> {  // T6: the mock used to satisfy the check by construction
         owedBefore[d(8, 31)] = "23817.37"
         storeMovesOwed = false
-        val e = org.junit.jupiter.api.assertThrows<IllegalStateException> { runner("23491.66", chargedThenNew).runOnce() }
-        assertThat(e.message).contains("loan-interest is not done").contains("loan 2")
+        val e = org.junit.jupiter.api.assertThrows<IllegalStateException> { runner("23491.66", chargedThenNew).run() }
+        // LAN-54 M1: a leftover gap no longer aborts mid-loop; the loan is named unchecked (GAP) and the run still fails
+        assertThat(e.message).contains("WRITTEN but not re-checked").contains("2 (GAP)")
     }
 
     @Test
