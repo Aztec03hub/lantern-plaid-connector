@@ -2,6 +2,8 @@ package net.djvk.fireflyPlaidConnector2.sync
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import io.ktor.client.plugins.ClientRequestException
+import io.ktor.client.plugins.ServerResponseException
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.runBlocking
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.AccountsApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.TransactionsApi
@@ -111,11 +113,12 @@ class LoanInterestRunner(
         // V3: track first, so a night with a HELD loan still records the recovery of the others
         val stuck = trackLag(plans)
         val parts = listOfNotNull(
-            skipped.takeIf { it.isNotEmpty() }?.let { "${it.size} loan(s) SKIPPED, Plaid did not answer: ${it.map { (l, c) -> "${l.account} ($c)" }}" },
+            skipped.takeIf { it.isNotEmpty() }?.let { "${it.size} loan(s) SKIPPED, Plaid did not answer or needs a login: ${it.map { (l, c) -> "${l.account} ($c)" }}" },
             unchecked.takeIf { it.isNotEmpty() }?.let { "${it.size} loan(s) WRITTEN but not re-checked, Plaid did not answer: ${it.map { (l, c) -> "${l.account} ($c)" }}" },
             held.takeIf { it.isNotEmpty() }?.let { "${it.size} loan(s) HELD, nothing written: ${it.map { h -> h.loan.account }}" },
             stuck.takeIf { it.isNotEmpty() }?.let { "loan(s) $it have been \"Firefly lags\" for $lagNights or more nights; a payment Plaid has seen is probably missing in Firefly" },
         )
+        if (parts.isNotEmpty()) println("!! loan-interest: " + parts.joinToString(" | "))
         check(parts.isEmpty()) { "loan-interest: " + parts.joinToString(" | ") }
     }
 
@@ -169,13 +172,19 @@ class LoanInterestRunner(
         }
         plans.filter { it.writes }.forEach { write(it) }
         println("APPLIED. Re-reading to check:")
-        val plaidAfter = try { readPlaidOwed(plans.filter { it.writes }.map { it.loan }) } catch (e: PlaidBalanceUnavailable) {
-            // F2: the writes are done; do not abort before trackLag and the summary. Nothing is written again, so this cannot double-post.
-            println("WARN: written but not re-checked (${e.errorCode})")
-            unchecked = plans.filter { it.writes }.map { it.loan to e.errorCode }
+        val written = plans.filter { it.writes }
+        val (plaidAfter, failedAfter) = try { readPlaidOwed(written.map { it.loan }) } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            // F2/L1: the writes are done; do not abort before trackLag and the summary. Nothing is written again, so this cannot double-post.
+            val code = (e as? PlaidBalanceUnavailable)?.errorCode ?: "ERROR_${e.javaClass.simpleName}"
+            println("WARN: written but not re-checked ($code)")
+            unchecked = written.map { it.loan to code }
             return plans
         }
-        for (p in plans.filter { it.writes }) {
+        unchecked = written.filter { it.loan.account in failedAfter }.map { it.loan to failedAfter.getValue(it.loan.account) }
+        unchecked.forEach { (l, c) -> println("WARN: loan ${l.account} written but not re-checked ($c)") }
+        for (p in written.filter { it.loan.account !in failedAfter }) {
             val again = gapOf(p.loan, plaidAfter)
             println("   loan ${p.loan.account}: gap now $again")
             check(again.abs() <= tolerance) { "loan-interest is not done: loan ${p.loan.account} still has a gap of $again" }
@@ -183,10 +192,30 @@ class LoanInterestRunner(
         return plans
     }
 
-    private suspend fun readPlaidOwed(loans: List<LoanConfig>): Map<Int, BigDecimal> {
+    /**
+     * LAN-54: SKIP when the state is the institution's or the user's (ITEM_ERROR, INSTITUTION_ERROR, RATE_LIMIT, 5xx, network), returning
+     * a code with no message or figures. null means ABORT: our request is wrong or our code is broken.
+     */
+    private suspend fun unavailableCode(e: Exception): String? {
+        if (e is ClientRequestException) {
+            val (type, code) = plaidApiWrapper.plaidErrorTypeAndCode(e)
+            return if (type == "ITEM_ERROR" || type == "INSTITUTION_ERROR" || type == "RATE_LIMIT") code ?: type else null
+        }
+        val cause = e.cause
+        return when {
+            e !is RuntimeException -> null
+            cause is ServerResponseException -> "HTTP_${cause.response.status.value}"
+            cause is java.io.IOException -> "NETWORK_${cause.javaClass.simpleName}"
+            else -> null
+        }
+    }
+
+    /** Plaid balances per Firefly loan account, plus the loans whose item did not answer (account -> code). An item that fails does not stop the next one. */
+    private suspend fun readPlaidOwed(loans: List<LoanConfig>): Pair<Map<Int, BigDecimal>, Map<Int, String>> {
         val (accountMap, items) = syncHelper.getAllPlaidAccessTokenAccountIdSets()
         val wanted = loans.map { it.account }.toSet()
         val out = mutableMapOf<Int, BigDecimal>()
+        val failed = mutableMapOf<Int, String>()
         for ((token, ids) in items.toList()) {
             val ours = ids.filter { accountMap[it] in wanted }
             if (ours.isEmpty()) continue
@@ -195,12 +224,16 @@ class LoanInterestRunner(
                     { it.accountsBalanceGet(AccountsBalanceGetRequest(token, null, null, AccountsBalanceGetRequestOptions(ours, null))) },
                     "balance get request",
                 ).body().accounts
-            } catch (e: ClientRequestException) {
-                throw PlaidBalanceUnavailable(plaidApiWrapper.transientPlaidError(e) ?: throw e, e)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                val code = unavailableCode(e) ?: throw e
+                ours.forEach { failed[accountMap[it]!!] = code }
+                continue
             }
             balances.forEach { b -> b.balances.current?.let { c -> accountMap[b.accountId]?.let { f -> out[f] = BigDecimal.valueOf(c) } } }
         }
-        return out
+        return out to failed
     }
 
     private suspend fun fireflyOwed(id: Int, date: LocalDate?): BigDecimal =
@@ -228,7 +261,10 @@ class LoanInterestRunner(
     /** Reads Plaid and Firefly for [loan] and decides; writes nothing. */
     internal suspend fun plan(loan: LoanConfig, plaid: Map<Int, BigDecimal>? = null): LoanPlan {
         val id = loan.account.toString()
-        val plaidOwed = (plaid ?: readPlaidOwed(listOf(loan)))[loan.account] ?: error("Plaid has no balance for loan ${loan.account}")
+        val plaidOwed = (plaid ?: readPlaidOwed(listOf(loan)).let { (owed, failed) ->
+            failed[loan.account]?.let { throw PlaidBalanceUnavailable(it, RuntimeException("Plaid did not answer")) }
+            owed
+        })[loan.account] ?: error("Plaid has no balance for loan ${loan.account}")
         val name = fireflyAccountsApi.getAccount(id, null).body().data.attributes.name
         val fireflyOwed = fireflyOwed(loan.account, null)
         val gap = plaidOwed - fireflyOwed

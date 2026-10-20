@@ -40,6 +40,8 @@ internal class LoanInterestResilienceTest {
     private val owed = mutableMapOf(2 to BigDecimal("23417.37"), 3 to BigDecimal("23417.37"))
     private val calls = mutableMapOf("tokA" to 0, "tokB" to 0)
     private val stores = mutableListOf<TransactionStore>()
+    /** tokens whose request throws an IOException before any answer (network failure) */
+    private var ioDown = setOf<String>()
     private val txApi = mock<TransactionsApi>()
     private val accountsApi = mock<AccountsApi>()
     private val syncHelper = mock<SyncHelper>()
@@ -56,6 +58,7 @@ internal class LoanInterestResilienceTest {
             val body = String(req.body.toByteArray())
             val (tok, acc, fail) = if ("tokA" in body) Triple("tokA", "plA", failA) else Triple("tokB", "plB", failB)
             val n = calls.merge(tok, 1, Int::plus)!!
+            if (tok in ioDown) throw java.io.IOException("x")
             val f = fail(n)
             if (f != null) respond(f.second, f.first, headersOf(HttpHeaders.ContentType, "application/json"))
             else respond(balance(acc), HttpStatusCode.OK, headersOf(HttpHeaders.ContentType, "application/json"))
@@ -93,6 +96,17 @@ internal class LoanInterestResilienceTest {
             }
         }
         return LoanInterestRunner(syncHelper, wrapper, accountsApi, txApi, "America/Chicago", cfg.path, 0.05, true, true, lagDir, 3)
+    }
+
+    private fun serverError(status: Int) = HttpStatusCode.fromValue(status) to "{}"
+
+    /** Runs [block] and returns what it printed to stdout. */
+    private fun printed(block: () -> Unit): String {
+        val old = System.out
+        val buf = java.io.ByteArrayOutputStream()
+        System.setOut(java.io.PrintStream(buf, true))
+        try { block() } finally { System.setOut(old) }
+        return buf.toString()
     }
 
     private val instDown = HttpStatusCode.BadRequest to errorBody("INSTITUTION_ERROR", "INSTITUTION_NOT_RESPONDING")
@@ -135,10 +149,125 @@ internal class LoanInterestResilienceTest {
     }
 
     @Test
-    fun aPermanentInstitutionErrorIsNotRetried() {
+    fun aPermanentInstitutionErrorIsSkippedNotRetried() {
         val gone = HttpStatusCode.BadRequest to errorBody("INSTITUTION_ERROR", "INSTITUTION_NOT_SUPPORTED")
-        assertThrows<ClientRequestException> { runner(failA = { gone }).run() }
+        val e = assertThrows<IllegalStateException> { runner(failA = { gone }).run() }
+        assertThat(e.message).contains("2 (INSTITUTION_NOT_SUPPORTED)")
         assertThat(calls["tokA"]).isEqualTo(1)
+        assertThat(stores.map { it.transactions.single().sourceId }).containsExactly("3")
+    }
+
+    @Test
+    fun aLoginRequiredItemIsSkippedAndTheOtherLoanIsApplied() {
+        val login = HttpStatusCode.BadRequest to errorBody("ITEM_ERROR", "ITEM_LOGIN_REQUIRED")
+        val e = assertThrows<IllegalStateException> { runner(failA = { login }).run() }
+        assertThat(e.message).contains("2 (ITEM_LOGIN_REQUIRED)").doesNotContain("private message")
+        assertThat(calls["tokA"]).isEqualTo(1)
+        assertThat(stores.map { it.transactions.single().sourceId }).containsExactly("3")
+    }
+
+    @Test
+    fun aServerErrorOnOneItemIsSkippedAndTheOtherIsApplied() {
+        var thrown: IllegalStateException? = null
+        val out = printed { thrown = assertThrows<IllegalStateException> { runner(failA = { serverError(502) }).run() } }
+        assertThat(thrown!!.message).contains("2 (HTTP_502)")
+        assertThat(out).contains("!! loan-interest: ").contains("2 (HTTP_502)")
+        assertThat(calls["tokA"]).isEqualTo(3)
+        assertThat(stores.map { it.transactions.single().sourceId }).containsExactly("3")
+    }
+
+    @Test
+    fun aNetworkFailureOnOneItemIsSkippedAndTheOtherIsApplied() {
+        ioDown = setOf("tokA")
+        val e = assertThrows<IllegalStateException> { runner(failA = { null }).run() }
+        assertThat(e.message).contains("2 (NETWORK_IOException)")
+        assertThat(calls["tokA"]).isEqualTo(3)
+        assertThat(stores.map { it.transactions.single().sourceId }).containsExactly("3")
+    }
+
+    @Test
+    fun theFirstLoanFailingDoesNotStopTheLastAndViceVersa() {
+        val e1 = assertThrows<IllegalStateException> { runner(failA = { instDown }).run() }
+        assertThat(e1.message).contains("2 (").doesNotContain("3 (")
+        assertThat(stores.map { it.transactions.single().sourceId }).containsExactly("3")
+        stores.clear(); calls.keys.forEach { calls[it] = 0 }; owed[2] = BigDecimal("23417.37"); owed[3] = BigDecimal("23417.37")
+        val e2 = assertThrows<IllegalStateException> { runner(failA = { null }, failB = { instDown }).run() }
+        assertThat(e2.message).contains("3 (").doesNotContain("2 (")
+        assertThat(stores.map { it.transactions.single().sourceId }).containsExactly("2")
+    }
+
+    @Test
+    fun whenEveryLoanFailsNothingIsWrittenAndTheRunFailsNamingAll() {
+        val lag = File(dir, "lag").path
+        val d1 = LocalDate.of(2026, 10, 1)
+        owed[2] = BigDecimal("23600.00")
+        runner(failA = { null }, lagDir = lag).also { it.today = { d1 } }.run()
+        stores.clear()
+        val r = runner(failA = { instDown }, failB = { instDown }, lagDir = lag).also { it.today = { d1.plusDays(1) } }
+        val e = assertThrows<IllegalStateException> { r.run() }
+        assertThat(e.message).contains("2 (INSTITUTION_NOT_RESPONDING)").contains("3 (INSTITUTION_NOT_RESPONDING)")
+        assertThat(stores).isEmpty()
+        assertThat(File(lag, "loan-lag.json").readText()).isEqualTo("""{"2":"2026-10-01"}""")
+    }
+
+    @Test
+    fun twoLoansOnOneDownItemAreBothSkipped() {
+        val r = runner(failA = { instDown })
+        runBlocking {
+            whenever(syncHelper.getAllPlaidAccessTokenAccountIdSets()).thenReturn(
+                Pair(mapOf("plA" to 2, "plB" to 3), sequenceOf("tokA" to listOf("plA", "plB"))))
+        }
+        val e = assertThrows<IllegalStateException> { r.run() }
+        assertThat(e.message).contains("2 (").contains("3 (")
+        assertThat(stores).isEmpty()
+    }
+
+    @Test
+    fun anUnparseableAnswerStillAbortsAndNothingIsWritten() {
+        assertThrows<Exception> { runner(failA = { HttpStatusCode.OK to "not json" }).run() }
+        assertThat(stores).isEmpty()
+    }
+
+    @Test
+    fun aReReadLoginRequiredReportsThatLoanOnlyAndTracksLag() {
+        val lag = File(dir, "lag").path
+        val login = HttpStatusCode.BadRequest to errorBody("ITEM_ERROR", "ITEM_LOGIN_REQUIRED")
+        var thrown: IllegalStateException? = null
+        val out = printed { thrown = assertThrows<IllegalStateException> { runner(failA = { if (it >= 2) login else null }, lagDir = lag).run() } }
+        assertThat(thrown!!.message).contains("WRITTEN but not re-checked").contains("2 (ITEM_LOGIN_REQUIRED)").doesNotContain("3 (")
+        assertThat(out).contains("loan 3: gap now")
+        assertThat(File(lag, "loan-lag.json")).exists()
+        assertThat(stores).hasSize(2)
+    }
+
+    @Test
+    fun aReReadInvalidAccessTokenStillTracksLagReportsAndFails() {
+        val lag = File(dir, "lag").path
+        val bad = HttpStatusCode.BadRequest to errorBody("INVALID_INPUT", "INVALID_ACCESS_TOKEN")
+        owed[3] = BigDecimal("23600.00")
+        val e = assertThrows<IllegalStateException> { runner(failA = { if (it >= 2) bad else null }, lagDir = lag).run() }
+        assertThat(e.message).contains("WRITTEN but not re-checked").contains("ERROR_ClientRequestException")
+        assertThat(stores.map { it.transactions.single().sourceId }).containsExactly("2")
+        assertThat(File(lag, "loan-lag.json").readText()).contains("\"3\"")
+    }
+
+    @Test
+    fun aReReadServerErrorTracksLagAndReports() {
+        val lag = File(dir, "lag").path
+        owed[3] = BigDecimal("23600.00")
+        val e = assertThrows<IllegalStateException> { runner(failA = { if (it >= 2) serverError(500) else null }, lagDir = lag).run() }
+        assertThat(e.message).contains("WRITTEN but not re-checked").contains("2 (HTTP_500)")
+        assertThat(stores.map { it.transactions.single().sourceId }).containsExactly("2")
+        assertThat(File(lag, "loan-lag.json").readText()).contains("\"3\"")
+    }
+
+    @Test
+    fun theNightAfterAFailedReReadWritesNothingMore() {
+        val login = HttpStatusCode.BadRequest to errorBody("ITEM_ERROR", "ITEM_LOGIN_REQUIRED")
+        assertThrows<IllegalStateException> { runner(failA = { if (it >= 2) login else null }).run() }
+        assertThat(stores).hasSize(2)
+        stores.clear(); calls.keys.forEach { calls[it] = 0 }
+        runner(failA = { null }).run()
         assertThat(stores).isEmpty()
     }
 

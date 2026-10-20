@@ -117,10 +117,16 @@ class PlaidApiWrapper(
      * [TRANSIENT_INSTITUTION_CODES]), else null. Never returns the message, which can hold user data.
      */
     suspend fun transientPlaidError(cre: ClientRequestException): String? {
+        val (type, code) = plaidErrorTypeAndCode(cre)
+        return code?.takeIf { type == "RATE_LIMIT" || it in TRANSIENT_INSTITUTION_CODES }
+    }
+
+    /** Plaid's `error_type` and `error_code` from [cre]'s body (null when absent). Never the message, which can hold user data. */
+    suspend fun plaidErrorTypeAndCode(cre: ClientRequestException): Pair<String?, String?> {
         val body = try { cre.response.bodyAsText() } catch (e: CancellationException) { throw e } catch (e: Exception) { "" }
         val type = Regex("\"error_type\"\\s*:\\s*\"([A-Z_]+)\"").find(body)?.groupValues?.get(1)
-        val code = Regex("\"error_code\"\\s*:\\s*\"([A-Z_0-9]+)\"").find(body)?.groupValues?.get(1) ?: return null
-        return code.takeIf { type == "RATE_LIMIT" || it in TRANSIENT_INSTITUTION_CODES }
+        val code = Regex("\"error_code\"\\s*:\\s*\"([A-Z_0-9]+)\"").find(body)?.groupValues?.get(1)
+        return type to code
     }
 
     companion object {
