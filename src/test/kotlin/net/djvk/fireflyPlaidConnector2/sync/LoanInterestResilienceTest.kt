@@ -56,14 +56,13 @@ internal class LoanInterestResilienceTest {
         """{"accounts":[${accs.joinToString(",") { acc -> """{"account_id":"$acc","balances":{${if (current != null) "\"current\":$current," else ""}"iso_currency_code":"USD"},"name":"x","type":"loan"}""" }}],"item":{"available_products":["balance"],"billed_products":["transactions"],"consent_expiration_time":null,"error":null,"institution_id":"ins_56","item_id":"zzz","products":["transactions"],"update_type":"background","webhook":""},"request_id":"r"}"""
 
     /** [failA]/[failB]: given the call number for that token, the (status, body) to answer with, or null for the real balance. */
-    private fun runner(failA: (Int) -> Pair<HttpStatusCode, String>?, failB: (Int) -> Pair<HttpStatusCode, String>? = { null }, lagDir: String = "", bodyOfA: io.ktor.utils.io.ByteReadChannel? = null): LoanInterestRunner {
+    private fun runner(failA: (Int) -> Pair<HttpStatusCode, String>?, failB: (Int) -> Pair<HttpStatusCode, String>? = { null }, lagDir: String = ""): LoanInterestRunner {
         val engine = MockEngine { req ->
             val body = String(req.body.toByteArray())
             val (tok, acc, fail) = if ("tokA" in body) Triple("tokA", "plA", failA) else Triple("tokB", "plB", failB)
             val n = calls.merge(tok, 1, Int::plus)!!
             requestFails[tok]?.let { throw it }
             val f = fail(n)
-            if (tok == "tokA" && bodyOfA != null) return@MockEngine respond(bodyOfA, HttpStatusCode.OK, headersOf(HttpHeaders.ContentType, "application/json"))
             if (f != null) respond(f.second, f.first, headersOf(HttpHeaders.ContentType, "application/json"))
             else respond(balance(if (sharedItem && tok == "tokA") listOf("plA", "plB") else listOf(acc)), HttpStatusCode.OK, headersOf(HttpHeaders.ContentType, "application/json"))
         }
@@ -236,12 +235,13 @@ internal class LoanInterestResilienceTest {
     }
 
     @Test
-    fun aConnectionCutWhileTheBodyIsReadIsSkipped() {
-        val cut = io.ktor.utils.io.ByteChannel(true)
-        cut.cancel(java.io.IOException("cut"))
-        val e = assertThrows<IllegalStateException> { runner(failA = { null }, bodyOfA = cut).run() }
-        assertThat(e.message).contains("2 (NETWORK_")
-        assertThat(stores.map { it.transactions.single().sourceId }).containsExactly("3")
+    fun aBareIoExceptionFromTheBodyReadIsANetworkSkipButAJsonErrorAborts() {
+        // ktor reads the body inside the call, so the mock cannot raise this after the wrapper returns; test the classifier itself
+        val r = runner(failA = { null })
+        runBlocking {
+            assertThat(r.unavailableCode(java.io.IOException("cut"))).isEqualTo("NETWORK_IOException")
+            assertThat(r.unavailableCode(com.fasterxml.jackson.core.JsonParseException(null, "bad"))).isNull()
+        }
     }
 
     @Test

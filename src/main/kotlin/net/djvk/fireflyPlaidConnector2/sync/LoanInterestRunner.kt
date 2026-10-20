@@ -212,7 +212,7 @@ class LoanInterestRunner(
      * LAN-54: SKIP when the state is the institution's or the user's (ITEM_ERROR, INSTITUTION_ERROR, RATE_LIMIT, 5xx, network), returning
      * a code with no message or figures. null means ABORT: our request is wrong or our code is broken.
      */
-    private suspend fun unavailableCode(e: Exception): String? {
+    internal suspend fun unavailableCode(e: Exception): String? {
         if (e is ClientRequestException) {
             val (type, code) = plaidApiWrapper.plaidErrorTypeAndCode(e)
             return if (type == "ITEM_ERROR" || type == "INSTITUTION_ERROR" || type == "RATE_LIMIT") code ?: type else null
