@@ -291,7 +291,17 @@ internal class TransactionConverterTest {
                     ),
 //                    expectedResult: TransactionConverter.ConvertPollSyncResult,
                     TransactionConverter.ConvertPollSyncResult(
-                        creates = listOf(),
+                        // Plaid never repeats a modified event: with no Firefly transaction it is created from Plaid's version
+                        creates = listOf(
+                            FireflyTransactionDto(null, FireflyFixtures.getTransaction(
+                                        type = TransactionTypeProperty.withdrawal,
+                                        description = "AMERICAN EXPRESS DES:ACH PMT ID : W1111 INDN:JOHN Q PUBLIC CO ID:XXXXX11111 WEB",
+                                        amount = "1111.22",
+                                        sourceId = "1",
+                                        destinationName = "Unknown Transfer Recipient",
+                                        plaidLinks = listOf(PlaidLink("plaidUpdateId", PlaidLinkLeg.single, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
+                                    ).transactions.first(), checkLegacyReference = true),
+                        ),
                         updates = listOf(),
                         deletes = listOf(),
                     ),
@@ -342,7 +352,20 @@ internal class TransactionConverterTest {
                                     destinationName = "Unknown Transfer Recipient",
                                 ).transactions.first()
                                     // M2: the user's description and counterparty, and the reconciled flag, are kept
-                                    .copy(order = null, reconciled = null, destinationName = null)
+                                    .copy(order = null, reconciled = null, destinationName = null),
+                                // if the group is gone by the time the update is sent (404), the update becomes a create
+                                fallbackCreate = FireflyTransactionDto(
+                                    null,
+                                    FireflyFixtures.getTransaction(
+                                        type = TransactionTypeProperty.withdrawal,
+                                        description = "Updated transaction name",
+                                        amount = "1111.22",
+                                        sourceId = "1",
+                                        destinationName = "Unknown Transfer Recipient",
+                                        plaidLinks = listOf(PlaidLink("plaidUpdateId", PlaidLinkLeg.single, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
+                                    ).transactions.first()
+                                ),
+                                plaidAccountId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                             ),
                         ),
                         deletes = listOf(),
@@ -1070,6 +1093,130 @@ internal class TransactionConverterTest {
         assertThat(result.updates).hasSize(1)
         assertThat(result.updates.single().tx.tags).doesNotContain("Plaid import")
     }
+
+    // region U02: a Plaid fact never ends in a log line
+
+    private val acctA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    private val acctB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+    private fun poll(
+        created: List<PlaidTransaction> = listOf(),
+        updated: List<PlaidTransaction> = listOf(),
+        deleted: List<String> = listOf(),
+        existing: List<TransactionRead> = listOf(),
+    ) = runBlocking {
+        converterWithImportTag("Plaid import").convertPollSync(PlaidFixtures.getStandardAccountMapping(), created, updated, deleted, existing)
+    }
+
+    private fun held(vararg links: PlaidLink, type: TransactionTypeProperty = TransactionTypeProperty.withdrawal, groupId: String = "ffId1") =
+        TransactionRead(
+            "thing", groupId,
+            FireflyFixtures.getTransaction(
+                type = type, amount = "5.0", sourceId = "1", destinationId = if (type == TransactionTypeProperty.transfer) "2" else null,
+                plaidLinks = links.toList(),
+            ), ObjectLink()
+        )
+
+    private fun plaidTx(id: String, amount: Double = 5.0, account: String = acctA, pendingId: String? = null) =
+        PlaidFixtures.getPaymentTransaction(accountId = account, name = "Coffee", transactionId = id, amount = amount, pendingTransactionId = pendingId)
+
+    @org.junit.jupiter.api.Test
+    fun aPlaidUpdateWithNoFireflyTransactionBecomesACreateWithItsLink() {
+        val result = poll(updated = listOf(plaidTx("tx1")))
+
+        val create = result.creates.single()
+        assertThat(create.tx.plaidLinks).containsExactly(PlaidLink("tx1", PlaidLinkLeg.single, acctA))
+        assertThat(create.checkLegacyReference).isTrue()
+        assertThat(create.tx.tags).contains("Plaid import")
+        assertThat(result.updates).isEmpty()
+    }
+
+    @org.junit.jupiter.api.Test
+    fun aPlaidUpdateForAnIdRemovedInTheSameSyncIsNotRecreated() {
+        val result = poll(updated = listOf(plaidTx("tx1")), deleted = listOf("tx1"))
+
+        assertThat(result.creates).isEmpty()
+        assertThat(result.updates).isEmpty()
+    }
+
+    @org.junit.jupiter.api.Test
+    fun aPlaidUpdateForAnIdCreatedInTheSameSyncIsNotRecreated() {
+        val result = poll(created = listOf(plaidTx("tx1")), updated = listOf(plaidTx("tx1")))
+
+        assertThat(result.creates).hasSize(1)
+    }
+
+    @org.junit.jupiter.api.Test
+    fun aPlaidUpdateForThePendingIdOfACreatedPostedTransactionIsNotRecreated() {
+        val result = poll(created = listOf(plaidTx("posted1", pendingId = "pend1")), updated = listOf(plaidTx("pend1")))
+
+        assertThat(result.creates.map { it.tx.plaidLinks?.single()?.plaidTransactionId }).containsExactly("posted1")
+    }
+
+    @org.junit.jupiter.api.Test
+    fun aPlaidUpdateOfAMultiSplitGroupIsStillNotAppliedAndFlaggedForReview() {
+        val twoSplits = TransactionRead(
+            "thing", "ffMulti",
+            net.djvk.fireflyPlaidConnector2.api.firefly.models.Transaction(
+                transactions = listOf(
+                    FireflyFixtures.getTransaction(plaidLinks = listOf(PlaidLink("tx1", PlaidLinkLeg.single, acctA))).transactions.first(),
+                    FireflyFixtures.getTransaction().transactions.first(),
+                )
+            ),
+            ObjectLink()
+        )
+
+        val result = poll(updated = listOf(plaidTx("tx1")), existing = listOf(twoSplits))
+
+        assertThat(result.creates).isEmpty()
+        assertThat(result.updates).isEmpty()
+        assertThat(result.transfersNeedingReview).contains("ffMulti")
+    }
+
+    @org.junit.jupiter.api.Test
+    fun thePlainUpdateDtosCarryAFallbackCreateWithTheLink() {
+        // plain
+        val plain = poll(updated = listOf(plaidTx("tx1")), existing = listOf(held(PlaidLink("tx1", PlaidLinkLeg.single, acctA)))).updates.single()
+        assertThat(plain.fallbackCreate?.tx?.plaidLinks).containsExactly(PlaidLink("tx1", PlaidLinkLeg.single, acctA))
+        assertThat(plain.plaidAccountId).isEqualTo(acctA)
+        assertThat(plain.fallbackOnlyWhenGone).isFalse()
+
+        // direction flip: Firefly holds a deposit, Plaid now sends an outflow
+        val flip = poll(
+            updated = listOf(plaidTx("tx2")),
+            existing = listOf(held(PlaidLink("tx2", PlaidLinkLeg.single, acctA), type = TransactionTypeProperty.deposit)),
+        ).updates.single()
+        assertThat(flip.changesType).isTrue()
+        assertThat(flip.fallbackCreate?.tx?.plaidLinks).containsExactly(PlaidLink("tx2", PlaidLinkLeg.single, acctA))
+        assertThat(flip.plaidAccountId).isEqualTo(acctA)
+        assertThat(flip.fallbackOnlyWhenGone).isFalse()
+
+        // an existing transfer: a rejected update leaves the transfer holding the money, so only 404 may create
+        val paired = poll(
+            updated = listOf(plaidTx("tx3")),
+            existing = listOf(held(PlaidLink("tx3", PlaidLinkLeg.source, acctA), PlaidLink("tx4", PlaidLinkLeg.destination, acctB), type = TransactionTypeProperty.transfer)),
+        ).updates.single()
+        assertThat(paired.fallbackCreate?.tx?.plaidLinks).containsExactly(PlaidLink("tx3", PlaidLinkLeg.single, acctA))
+        assertThat(paired.fallbackOnlyWhenGone).isTrue()
+        assertThat(paired.plaidAccountId).isEqualTo(acctA)
+    }
+
+    @org.junit.jupiter.api.Test
+    fun aTransferPromotionCarriesAFallbackCreateAndTheGoneOnlyFlag() {
+        val pendingTransfer = held(
+            PlaidLink("pend1", PlaidLinkLeg.source, acctA), PlaidLink("other", PlaidLinkLeg.destination, acctB),
+            type = TransactionTypeProperty.transfer,
+        )
+
+        val result = poll(created = listOf(plaidTx("posted1", pendingId = "pend1")), existing = listOf(pendingTransfer))
+
+        val promotion = result.updates.single()
+        assertThat(promotion.id).isEqualTo("ffId1")
+        assertThat(promotion.fallbackOnlyWhenGone).isTrue()
+        assertThat(promotion.fallbackCreate?.tx?.plaidLinks).containsExactly(PlaidLink("posted1", PlaidLinkLeg.single, acctA))
+    }
+
+    // endregion
 
     @ParameterizedTest(name = "poll mode = {0}")
     @ValueSource(booleans = [true, false])

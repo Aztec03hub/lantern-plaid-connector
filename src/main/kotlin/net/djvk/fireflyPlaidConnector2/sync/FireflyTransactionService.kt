@@ -177,18 +177,22 @@ class FireflyTransactionService(
         // Process updates. This includes converting an existing deposit/withdrawal into a transfer, which is an in-place
         //  update with type=transfer (Firefly 6.7.7 accepts that), so every Firefly write here is safe to repeat.
         for (update in updates) {
-            // An update that adds a Plaid leg to a transaction Firefly no longer has (404) creates that leg on its own
-            //  instead, so its money is not hidden behind a failed update. A pairing (the update makes a transfer) does
-            //  that on ANY permanent rejection: the existing transaction stays as it was and the new leg is recorded
-            //  nowhere else, and as a group-keyed update letter the new leg would be invisible to Plaid's later events
-            //  and lost when a retry finds the group deleted. A pending to posted update does NOT: after a 422 the
-            //  pending transaction still holds that money, and this sync's removal of the pending id was shielded, so a
-            //  posted create beside it would count it twice.
+            // An update that carries a Plaid fact (a pairing, a promotion, a plain Plaid update) creates that fact on its
+            //  own instead when the Firefly transaction is gone (404), so its money is not hidden behind a failed update.
+            //  A pairing (the update makes a transfer) does that on ANY permanent rejection: the existing transaction
+            //  stays as it was and the new leg is recorded nowhere else, and as a group-keyed update letter the new leg
+            //  would be invisible to Plaid's later events. Every other update (a transfer promotion, a pending to
+            //  posted update, a plain update) does NOT: after a 422 the old transaction still holds that money, and a
+            //  create beside it would count it twice. Those keep the fallback in their dead letter instead, so a retry
+            //  that finds the transaction gone (404) still creates it.
             val fallback = update.fallbackCreate
             guarded(
-                DeadLetter("update", update.transactionId, update.id, update.tx, update.changesType),
+                DeadLetter(
+                    "update", update.transactionId, update.id, update.tx, update.changesType,
+                    fallback = fallback?.tx, plaidAccountId = update.plaidAccountId,
+                ),
                 instead = fallback?.let { { createGuarded(it) } },
-                insteadOn = if (update.tx.isPaired()) permanent4xx else setOf(404),
+                insteadOn = if (update.tx.isPaired() && !update.fallbackOnlyWhenGone) permanent4xx else setOf(404),
             ) {
                 syncHelper.updateBatchInFirefly(listOf(update))
             }
@@ -203,6 +207,23 @@ class FireflyTransactionService(
 
     /** @return true if [create] made a new Firefly transaction (false: dead-lettered, or already imported) */
     private suspend fun createGuarded(create: FireflyTransactionDto): Boolean {
+        if (create.checkLegacyReference) {
+            val ids = create.tx.plaidLinks.orEmpty().map { it.plaidTransactionId }
+            // A create already waiting in the dead letter file gets Plaid's update applied to the letter itself (see
+            //  PolledSyncOrchestrator.reviseDeadLetteredCreates); a second create here would overwrite the letter
+            val waiting = deadLetters?.read().orEmpty().any { l ->
+                l.operation == "create" && l.split?.plaidLinks.orEmpty().any { it.plaidTransactionId in ids }
+            }
+            if (waiting) {
+                logger.info("Plaid modified $ids, which waits in the dead letter file as a create; the letter takes the change")
+                return false
+            }
+            val legacy = ids.firstOrNull { syncHelper.heldByLegacyReference(it) }
+            if (legacy != null) {
+                logger.warn("Firefly already holds a transaction made for Plaid id $legacy before the link table; not creating a second one")
+                return false
+            }
+        }
         var created = 0
         val kept = guarded(DeadLetter("create", letterKey(create.tx), null, create.tx, false)) {
             created = syncHelper.optimisticInsertBatchIntoFirefly(listOf(create))
@@ -230,8 +251,12 @@ class FireflyTransactionService(
      * file; the ones that are still rejected stay (with Firefly's latest message) until [DeadLetterStore.maxAttempts]
      * retries have failed, after which they are abandoned: no longer retried, but still in the file and still reported.
      * A create whose Plaid id is already in Firefly answers 409 and is dropped rather than inserted again.
+     *
+     * The Firefly account ids inside a letter are re-resolved from [accountMap] first, so fixing the account mapping
+     * fixes the letters waiting on it. An update letter that carries a fallback and finds its Firefly transaction gone
+     * (404) creates the fallback and only then leaves the file; one without a fallback is dropped.
      */
-    suspend fun retryDeadLetters() {
+    suspend fun retryDeadLetters(accountMap: Map<String, Int> = mapOf()) {
         val store = deadLetters ?: return
         for (letter in store.read()) {
             if (letter.abandoned) continue
@@ -243,12 +268,23 @@ class FireflyTransactionService(
                 store.add(letter.copy(abandoned = true))
                 continue
             }
-            guarded(letter, retry = true) {
-                val split = letter.split
-                when (letter.operation) {
+            val current = letter.copy(
+                split = letter.split?.withCurrentAccounts(letter.plaidAccountId, accountMap),
+                fallback = letter.fallback?.withCurrentAccounts(letter.plaidAccountId, accountMap),
+            )
+            if (current != letter) {
+                logger.info("Re-resolved the Firefly accounts of dead letter ${letter.key} from the current mapping")
+            }
+            guarded(
+                current, retry = true,
+                instead = current.fallback?.let { fb -> { createGuarded(FireflyTransactionDto(null, fb)) } },
+                insteadOn = setOf(404),
+            ) {
+                val split = current.split
+                when (current.operation) {
                     "create" -> syncHelper.optimisticInsertBatchIntoFirefly(listOf(FireflyTransactionDto(null, split!!)))
-                    "update" -> syncHelper.updateBatchInFirefly(listOf(FireflyTransactionDto(letter.fireflyId, split!!, letter.changesType)))
-                    "delete" -> syncHelper.deleteBatchInFirefly(listOf(letter.fireflyId!!))
+                    "update" -> syncHelper.updateBatchInFirefly(listOf(FireflyTransactionDto(current.fireflyId, split!!, current.changesType)))
+                    "delete" -> syncHelper.deleteBatchInFirefly(listOf(current.fireflyId!!))
                 }
             }
         }
@@ -258,7 +294,9 @@ class FireflyTransactionService(
      * Runs [write] for [letter]'s transaction; see [processFireflyTransactionUpdates] for what is and isn't dead-lettered.
      *
      * A 404 on an update or delete means the Firefly transaction is gone (the user deleted it, or a later removal
-     * did): that write can never succeed, so the letter is dropped with a WARN instead of being retried forever.
+     * did): that write can never succeed. With an [instead] (the fallback create of an update) that is run first and
+     * the letter leaves the file only after it succeeded, so a failing fallback keeps the letter. Without one the
+     * letter is dropped with a WARN instead of being retried forever.
      *
      * A 409 means Firefly already holds a Plaid id of this write (the link table refuses a second row for it): the
      * money is recorded, so the letter is dropped and nothing is retried.
@@ -297,8 +335,8 @@ class FireflyTransactionService(
             }
             if (instead != null && status in insteadOn) {
                 logger.warn("Firefly refused the ${letter.operation} of ${letter.key} (HTTP $status); creating its new Plaid leg on its own")
-                store?.remove(letter.operation, letter.key)
                 instead()
+                store?.remove(letter.operation, letter.key)
                 return false
             }
             if (store == null || status !in permanent4xx) throw cre

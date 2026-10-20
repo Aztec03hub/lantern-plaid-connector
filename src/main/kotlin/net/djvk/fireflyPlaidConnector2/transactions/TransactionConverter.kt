@@ -406,6 +406,8 @@ class TransactionConverter(
     ): ConvertPollSyncResult {
         logger.trace("Starting ${::convertPollSync.name}")
         val deletedPlaidIds = plaidDeletedTxs.toSet()
+        val createdIds = plaidCreatedTxs.map { it.transactionId }.toSet()
+        val pendingIdsOfCreates = plaidCreatedTxs.mapNotNull { it.pendingTransactionId }.toSet()
         // A transaction Plaid removes in this sync is deleted below: a new leg paired onto it would be deleted with it
         val transferCandidateExistingFireflyTxs = filterFireflyCandidateTransferTxs(existingFireflyTxs)
             .filter { candidate -> candidate.tx.plaidLinks.orEmpty().none { it.plaidTransactionId in deletedPlaidIds } }
@@ -537,7 +539,17 @@ class TransactionConverter(
         for (plaidUpdate in plaidUpdatedTxs) {
             val target = indexer.find(plaidUpdate.transactionId)
             if (target == null) {
-                logger.error("Failed to find existing Firefly transaction to update for Plaid id ${plaidUpdate.transactionId}")
+                // Plaid never repeats a modified event, so dropping it would lose the transaction for good (the user
+                //  deleted the Firefly one, or its create was lost). Create Plaid's current version instead; the link
+                //  table refuses a second copy, and the sender searches for an older import made without a link.
+                if (plaidUpdate.transactionId in deletedPlaidIds || plaidUpdate.transactionId in createdIds ||
+                    plaidUpdate.transactionId in pendingIdsOfCreates
+                ) {
+                    logger.info("Plaid modified {} but the same sync deletes or creates it; the create path owns it", plaidUpdate.transactionId)
+                    continue
+                }
+                logger.warn("Plaid modified ${plaidUpdate.transactionId} but Firefly holds no transaction for it; creating it from Plaid's version")
+                creates.add(convertSingle(plaidUpdate, accountMap, importTag, link = true).copy(checkLegacyReference = true))
                 continue
             }
             if (target.attributes.transactions.size != 1) {
@@ -548,6 +560,8 @@ class TransactionConverter(
             }
 
             val convertedUpdate = convertSingle(plaidUpdate, accountMap)
+            // What to create if the Firefly transaction is gone by the time the update is sent (404)
+            val fallback = convertSingle(plaidUpdate, accountMap, importTag, link = true)
             val existingSplit = target.attributes.transactions.singleOrNull()
             updates.add(
                 when {
@@ -558,6 +572,9 @@ class TransactionConverter(
                             target.id,
                             preserveUserFields(leg, target),
                             changesType = typeChange(leg, existingSplit),
+                            fallbackCreate = fallback,
+                            fallbackOnlyWhenGone = true,
+                            plaidAccountId = plaidUpdate.accountId,
                         )
                     }
 
@@ -574,10 +591,15 @@ class TransactionConverter(
                             preserveUserFields(convertedUpdate.tx, target, keepCounterparty = false)
                                 .copy(description = existingSplit.description),
                             changesType = true,
+                            fallbackCreate = fallback,
+                            plaidAccountId = plaidUpdate.accountId,
                         )
                     }
 
-                    else -> FireflyTransactionDto(target.id, preserveUserFields(convertedUpdate.tx, target))
+                    else -> FireflyTransactionDto(
+                        target.id, preserveUserFields(convertedUpdate.tx, target),
+                        fallbackCreate = fallback, plaidAccountId = plaidUpdate.accountId,
+                    )
                 }
             )
         }
@@ -684,6 +706,9 @@ class TransactionConverter(
                 target.id,
                 preserveUserFields(leg.copy(plaidLinks = if (swap) swapLegs(relinked) else relinked), target),
                 changesType = typeChange(leg, existingSplit),
+                // Gone (404) -> create the posted transaction; a 422 leaves the pending leg holding the money
+                fallbackCreate = convertSingle(posted, accountMap, currentImportTag(), link = true),
+                fallbackOnlyWhenGone = true,
             )
         }
         if (existingSplit.type != getFireflyTransactionDtoType(posted, false)) {

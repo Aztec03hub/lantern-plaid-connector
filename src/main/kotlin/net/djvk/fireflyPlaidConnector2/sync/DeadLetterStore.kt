@@ -5,7 +5,9 @@ import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.PlaidLinkLeg
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionSplit
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionTypeProperty
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.stereotype.Component
@@ -39,7 +41,35 @@ data class DeadLetter(
     val attempts: Int = 0,
     /** True once [attempts] reached the cap: no longer retried, still reported, and left for a person to resolve. */
     val abandoned: Boolean = false,
+    /** What to create instead when a retry finds the Firefly transaction gone (404); see FireflyTransactionService.guarded. */
+    val fallback: TransactionSplit? = null,
+    /** See FireflyTransactionDto.plaidAccountId. */
+    val plaidAccountId: String? = null,
 )
+
+/**
+ * The Firefly account ids of [this] re-resolved from [accountMap] by the Plaid account of each link (or
+ * [fallbackPlaidAccountId]). Unmapped accounts keep the stored id; only the side Plaid owns is touched.
+ */
+fun TransactionSplit.withCurrentAccounts(fallbackPlaidAccountId: String?, accountMap: Map<String, Int>): TransactionSplit {
+    var source = sourceId
+    var destination = destinationId
+    val deposit = type == TransactionTypeProperty.deposit
+    fun set(leg: PlaidLinkLeg, firefly: String) {
+        when (leg) {
+            PlaidLinkLeg.source -> source = firefly
+            PlaidLinkLeg.destination -> destination = firefly
+            PlaidLinkLeg.single -> if (deposit) destination = firefly else source = firefly
+        }
+    }
+    val links = plaidLinks.orEmpty().filter { it.plaidAccountId != null }
+    if (links.isNotEmpty()) {
+        for (link in links) accountMap[link.plaidAccountId!!]?.let { set(link.leg, it.toString()) }
+    } else if (fallbackPlaidAccountId != null) {
+        accountMap[fallbackPlaidAccountId]?.let { set(PlaidLinkLeg.single, it.toString()) }
+    }
+    return if (source == sourceId && destination == destinationId) this else copy(sourceId = source, destinationId = destination)
+}
 
 /**
  * The durable list of [DeadLetter]s, `plaid_dead_letters.json` next to the cursor file, replaced atomically and

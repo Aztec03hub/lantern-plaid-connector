@@ -505,6 +505,20 @@ internal class R2SyncTest {
         assertThat(reported.firstValue.partial).isTrue()
     }
 
+    @Test
+    fun processTransactionsRetriesLettersWithTheCurrentAccountMap() = runBlocking<Unit> {
+        whenever(plaidSyncService.processPlaidTransactions(any(), any()))
+            .thenReturn(PlaidTransactionResult(listOf(), listOf(), listOf()))
+        val orchestrator = PolledSyncOrchestrator(
+            30, syncHelper, cursorManager, plaidSyncService, fireflyTransactionService, converter, null,
+        )
+        val map = mapOf("plaidA" to 12)
+
+        orchestrator.runIteration(map, sequenceOf(), mutableMapOf())
+
+        verify(fireflyTransactionService).retryDeadLetters(eq(map))
+    }
+
     // endregion
 
     // region R11 survivor, L4-R2, N1-R2

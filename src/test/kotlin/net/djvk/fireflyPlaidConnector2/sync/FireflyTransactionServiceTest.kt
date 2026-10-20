@@ -282,6 +282,252 @@ class FireflyTransactionServiceTest {
 
     // endregion
 
+    // region U02: dead letters keep the money
+
+    private fun promotion(flag: Boolean = false, type: TransactionTypeProperty? = null) = FireflyTransactionDto(
+        "ff1", linked("posted").tx.let { if (type != null) it.copy(type = type) else it },
+        fallbackCreate = linked("posted"), fallbackOnlyWhenGone = flag,
+    )
+
+    @Test
+    fun aPromotionLetterRetriedAndGettingA404CreatesThePostedTransactionAndRemovesTheLetter() = runBlocking<Unit> {
+        val (store, service) = serviceWithStore()
+        whenever(syncHelper.updateBatchInFirefly(any())).doSuspendableAnswer { throw statusError(HttpStatusCode.UnprocessableEntity) }
+        service.processFireflyTransactionUpdates(listOf(), listOf(promotion()), listOf())
+        assertThat(store.read().single().fallback?.plaidLinks).isEqualTo(linked("posted").tx.plaidLinks)
+        verify(syncHelper, never()).optimisticInsertBatchIntoFirefly(any())
+
+        whenever(syncHelper.updateBatchInFirefly(any())).doSuspendableAnswer { throw statusError(HttpStatusCode.NotFound) }
+        service.retryDeadLetters()
+
+        val sent = argumentCaptor<List<FireflyTransactionDto>>()
+        verify(syncHelper).optimisticInsertBatchIntoFirefly(sent.capture())
+        assertThat(sent.firstValue.single().tx.plaidLinks).isEqualTo(linked("posted").tx.plaidLinks)
+        assertThat(store.read()).isEmpty()
+    }
+
+    @Test
+    fun aTransferPromotionThatGets404CreatesThePostedTransactionOnFirstAttempt() = runBlocking<Unit> {
+        val (store, service) = serviceWithStore()
+        whenever(syncHelper.updateBatchInFirefly(any())).doSuspendableAnswer { throw statusError(HttpStatusCode.NotFound) }
+
+        service.processFireflyTransactionUpdates(listOf(), listOf(promotion(true, TransactionTypeProperty.transfer)), listOf())
+
+        verify(syncHelper).optimisticInsertBatchIntoFirefly(eq(listOf(linked("posted"))))
+        assertThat(store.read()).isEmpty()
+    }
+
+    @Test
+    fun aTransferPromotionThatGets422IsDeadLetteredAndNoFallbackIsCreated() = runBlocking<Unit> {
+        val (store, service) = serviceWithStore()
+        whenever(syncHelper.updateBatchInFirefly(any())).doSuspendableAnswer { throw statusError(HttpStatusCode.UnprocessableEntity) }
+
+        service.processFireflyTransactionUpdates(listOf(), listOf(promotion(true, TransactionTypeProperty.transfer)), listOf())
+
+        verify(syncHelper, never()).optimisticInsertBatchIntoFirefly(any())
+        val letter = store.read().single()
+        assertThat(letter.operation).isEqualTo("update")
+        assertThat(letter.fallback?.plaidLinks).isEqualTo(linked("posted").tx.plaidLinks)
+    }
+
+    @Test
+    fun aRetriedLetterWhoseFallbackCreateFailsKeepsTheLetterAndFailsTheIteration() = runBlocking<Unit> {
+        val (store, service) = serviceWithStore()
+        store.add(DeadLetter("update", "ff1", "ff1", linked("posted").tx, false, "x", fallback = linked("posted").tx))
+        whenever(syncHelper.updateBatchInFirefly(any())).doSuspendableAnswer { throw statusError(HttpStatusCode.NotFound) }
+        whenever(syncHelper.optimisticInsertBatchIntoFirefly(any())).doSuspendableAnswer { throw statusError(HttpStatusCode.ServiceUnavailable) }
+
+        org.junit.jupiter.api.assertThrows<io.ktor.client.plugins.ServerResponseException> { runBlocking { service.retryDeadLetters() } }
+
+        assertThat(store.read().single().operation).isEqualTo("update")
+    }
+
+    @Test
+    fun aRetriedLetterWhoseFallbackCreateAnswers409IsRemovedWithoutADuplicate() = runBlocking<Unit> {
+        val (store, service) = serviceWithStore()
+        store.add(DeadLetter("update", "ff1", "ff1", linked("posted").tx, false, "x", fallback = linked("posted").tx))
+        whenever(syncHelper.updateBatchInFirefly(any())).doSuspendableAnswer { throw statusError(HttpStatusCode.NotFound) }
+        whenever(syncHelper.optimisticInsertBatchIntoFirefly(any())).doSuspendableAnswer { throw statusError(HttpStatusCode.Conflict) }
+
+        service.retryDeadLetters()
+
+        verify(syncHelper, times(1)).optimisticInsertBatchIntoFirefly(any())
+        assertThat(store.read()).isEmpty()
+    }
+
+    private fun splitOn(plaidAccount: String, type: TransactionTypeProperty, leg: PlaidLinkLeg, source: String?, destination: String?) =
+        FireflyFixtures.getTransaction(
+            type = type, sourceId = source, destinationId = destination,
+            plaidLinks = listOf(PlaidLink("tx9", leg, plaidAccount)),
+        ).transactions.first()
+
+    private suspend fun resentCreate(split: TransactionSplit, accountMap: Map<String, Int>): TransactionSplit {
+        val (store, service) = serviceWithStore()
+        store.add(DeadLetter("create", "tx9", null, split, false, "x"))
+        service.retryDeadLetters(accountMap)
+        val sent = argumentCaptor<List<FireflyTransactionDto>>()
+        verify(syncHelper).optimisticInsertBatchIntoFirefly(sent.capture())
+        return sent.firstValue.single().tx
+    }
+
+    @Test
+    fun aLetterRetriedAfterTheMappingWasFixedIsSentWithTheCurrentAccountId() = runBlocking<Unit> {
+        val sent = resentCreate(splitOn("plaidA", TransactionTypeProperty.withdrawal, PlaidLinkLeg.single, "11", null), mapOf("plaidA" to 12))
+
+        assertThat(sent.sourceId).isEqualTo("12")
+        assertThat(sent.destinationId).isNull()
+    }
+
+    @Test
+    fun aDepositLetterIsReResolvedOnItsDestinationSide() = runBlocking<Unit> {
+        val sent = resentCreate(splitOn("plaidA", TransactionTypeProperty.deposit, PlaidLinkLeg.single, null, "11"), mapOf("plaidA" to 12))
+
+        assertThat(sent.destinationId).isEqualTo("12")
+        assertThat(sent.sourceId).isNull()
+    }
+
+    @Test
+    fun aTransferLetterReResolvesBothLegs() = runBlocking<Unit> {
+        val split = FireflyFixtures.getTransaction(
+            type = TransactionTypeProperty.transfer, sourceId = "11", destinationId = "21",
+            plaidLinks = listOf(PlaidLink("tx9", PlaidLinkLeg.source, "plaidA"), PlaidLink("tx10", PlaidLinkLeg.destination, "plaidB")),
+        ).transactions.first()
+
+        val sent = resentCreate(split, mapOf("plaidA" to 12, "plaidB" to 22))
+
+        assertThat(sent.sourceId).isEqualTo("12")
+        assertThat(sent.destinationId).isEqualTo("22")
+    }
+
+    @Test
+    fun aLetterWhosePlaidAccountIsNotInTheMapKeepsItsStoredAccountId() = runBlocking<Unit> {
+        val sent = resentCreate(splitOn("plaidA", TransactionTypeProperty.withdrawal, PlaidLinkLeg.single, "11", null), mapOf("other" to 12))
+
+        assertThat(sent.sourceId).isEqualTo("11")
+    }
+
+    @Test
+    fun aLinklessUpdateLetterIsRetriedWithTheAccountOfItsStoredPlaidAccountId() = runBlocking<Unit> {
+        val (store, service) = serviceWithStore()
+        val bare = FireflyFixtures.getTransaction(type = TransactionTypeProperty.withdrawal, sourceId = "11").transactions.first()
+        store.add(DeadLetter("update", "ff1", "ff1", bare, false, "x", plaidAccountId = "plaidA"))
+
+        service.retryDeadLetters(mapOf("plaidA" to 12))
+
+        val sent = argumentCaptor<List<FireflyTransactionDto>>()
+        verify(syncHelper).updateBatchInFirefly(sent.capture())
+        assertThat(sent.firstValue.single().tx.sourceId).isEqualTo("12")
+    }
+
+    @Test
+    fun aStillRejectedLetterIsWrittenBackWithTheCurrentAccounts() = runBlocking<Unit> {
+        val (store, service) = serviceWithStore()
+        store.add(DeadLetter("create", "tx9", null, splitOn("plaidA", TransactionTypeProperty.withdrawal, PlaidLinkLeg.single, "11", null), false, "x"))
+        whenever(syncHelper.optimisticInsertBatchIntoFirefly(any())).doSuspendableAnswer { throw statusError(HttpStatusCode.UnprocessableEntity) }
+
+        service.retryDeadLetters(mapOf("plaidA" to 12))
+
+        val kept = store.read().single()
+        assertThat(kept.split?.sourceId).isEqualTo("12")
+        assertThat(kept.attempts).isEqualTo(1)
+    }
+
+    @Test
+    fun anAbandonedLetterWithAFallbackIsNeitherRetriedNorCreated() = runBlocking<Unit> {
+        val (store, service) = serviceWithStore()
+        store.add(DeadLetter("update", "ff1", "ff1", linked("posted").tx, false, "x", abandoned = true, fallback = linked("posted").tx))
+
+        service.retryDeadLetters()
+
+        verify(syncHelper, never()).updateBatchInFirefly(any())
+        verify(syncHelper, never()).optimisticInsertBatchIntoFirefly(any())
+        assertThat(store.read()).hasSize(1)
+    }
+
+    @Test
+    fun aLetterFileWrittenByTheOldBuildStillReads() = runBlocking<Unit> {
+        val store = DeadLetterStore(dir.toString())
+        java.nio.file.Files.writeString(
+            store.path,
+            """[{"operation":"update","key":"ff1","fireflyId":"ff1","changesType":false,"message":"old","attempts":2,"abandoned":false}]""",
+        )
+
+        val letter = store.read().single()
+
+        assertThat(letter.fallback).isNull()
+        assertThat(letter.plaidAccountId).isNull()
+        assertThat(letter.attempts).isEqualTo(2)
+    }
+
+    @Test
+    fun aLetterWithoutAFallbackStillDropsOn404() = runBlocking<Unit> {
+        val (store, service) = serviceWithStore()
+        store.add(DeadLetter("update", "ff1", "ff1", linked("posted").tx, false, "x"))
+        whenever(syncHelper.updateBatchInFirefly(any())).doSuspendableAnswer { throw statusError(HttpStatusCode.NotFound) }
+
+        service.retryDeadLetters()
+
+        verify(syncHelper, never()).optimisticInsertBatchIntoFirefly(any())
+        assertThat(store.read()).isEmpty()
+    }
+
+    @Test
+    fun aCreateStandingInForAnUnmatchedUpdateIsSkippedWhenAnOlderImportHoldsThePlaidId() = runBlocking<Unit> {
+        val (_, service) = serviceWithStore()
+        whenever(syncHelper.heldByLegacyReference("old1")).thenReturn(true)
+
+        val notCreated = service.processFireflyTransactionUpdates(listOf(linked("old1").copy(checkLegacyReference = true)), listOf(), listOf())
+
+        assertEquals(1, notCreated)
+        verify(syncHelper, never()).optimisticInsertBatchIntoFirefly(any())
+    }
+
+    @Test
+    fun aCreateStandingInForAnUnmatchedUpdateIsSentWhenNothingOlderHoldsThePlaidId() = runBlocking<Unit> {
+        val (_, service) = serviceWithStore()
+        whenever(syncHelper.heldByLegacyReference("new1")).thenReturn(false)
+
+        val notCreated = service.processFireflyTransactionUpdates(listOf(linked("new1").copy(checkLegacyReference = true)), listOf(), listOf())
+
+        assertEquals(0, notCreated)
+        verify(syncHelper).heldByLegacyReference("new1")
+        verify(syncHelper).optimisticInsertBatchIntoFirefly(any())
+    }
+
+    @Test
+    fun aLegacySearchThatFailsFailsTheIterationInsteadOfCreating() = runBlocking<Unit> {
+        val (_, service) = serviceWithStore()
+        whenever(syncHelper.heldByLegacyReference(any())).doSuspendableAnswer { throw statusError(HttpStatusCode.ServiceUnavailable) }
+
+        org.junit.jupiter.api.assertThrows<io.ktor.client.plugins.ServerResponseException> {
+            runBlocking { service.processFireflyTransactionUpdates(listOf(linked("x1").copy(checkLegacyReference = true)), listOf(), listOf()) }
+        }
+        verify(syncHelper, never()).optimisticInsertBatchIntoFirefly(any())
+    }
+
+    @Test
+    fun anOrdinaryCreateNeverRunsTheLegacySearch() = runBlocking<Unit> {
+        val (_, service) = serviceWithStore()
+
+        service.processFireflyTransactionUpdates(listOf(linked("n1")), listOf(), listOf())
+
+        verify(syncHelper, never()).heldByLegacyReference(any())
+    }
+
+    @Test
+    fun anUnmatchedUpdateCreateIsLeftToTheLetterThatAlreadyHoldsThatPlaidId() = runBlocking<Unit> {
+        val (store, service) = serviceWithStore()
+        store.add(DeadLetter("create", "w1", null, linked("w1").tx, false, "x"))
+
+        val notCreated = service.processFireflyTransactionUpdates(listOf(linked("w1").copy(checkLegacyReference = true)), listOf(), listOf())
+
+        assertEquals(1, notCreated)
+        verify(syncHelper, never()).optimisticInsertBatchIntoFirefly(any())
+        assertThat(store.read().single().key).isEqualTo("w1")
+    }
+
+    // endregion
+
     // region link lookups
 
     @Test
