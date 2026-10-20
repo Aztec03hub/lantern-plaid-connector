@@ -1,4 +1,7 @@
 fireflyPlaidConnector2:
+  # Seconds a run waits for another connector run holding persistence/connector.lock. 0 fails at once (exit 75);
+  #   a nightly may set 300 to wait for a manual run.
+  runLockWaitSeconds: 0
   # "batch" or "polled". Defaults to "polled" when unset (batch mode has none of the protections of polled mode:
   #   no failed-Item report, no dead letters, no result callback), so a missing setting can't fall back to it.
   #   Polled mode refuses to start unless pendingTag below is set.

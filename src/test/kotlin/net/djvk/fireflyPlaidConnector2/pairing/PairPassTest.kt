@@ -671,6 +671,21 @@ internal class PairPassTest {
     }
 
     @Test
+    fun pairStateIsWrittenThroughAUniqueTempFileAndConcurrentWritersNeverCorruptIt() {
+        val errors = java.util.concurrent.ConcurrentLinkedQueue<Throwable>()
+        val threads = (1..6).map { t ->
+            Thread {
+                runCatching { repeat(100) { PairStateFile.write(dir.toString(), PairState(pendingDurations = listOf(t, it))) } }.onFailure { errors.add(it) }
+            }
+        }
+        threads.forEach { it.start() }
+        threads.forEach { it.join() }
+        assertThat(errors).isEmpty()
+        assertThat(PairStateFile.read(dir.toString()).pendingDurations).hasSize(2)
+        Files.list(dir).use { s -> assertThat(s.map { it.fileName.toString() }.toList()).containsExactly("pair-state.json") }
+    }
+
+    @Test
     fun aStateFileFromANewerConnectorStopsThePass() = runBlocking<Unit> {
         Files.writeString(stateFile(), """{"version": 99}""")
         val failure = runCatching { pass(World().also { it.payment(1) }, dryRun = false).run(d.minusDays(5), today, now = now) }.exceptionOrNull()

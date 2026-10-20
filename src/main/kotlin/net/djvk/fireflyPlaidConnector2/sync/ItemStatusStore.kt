@@ -7,10 +7,9 @@ import kotlinx.coroutines.withContext
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.stereotype.Component
-import java.nio.file.Files
-import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
 import java.time.Instant
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.io.path.Path
 
 /**
@@ -72,9 +71,14 @@ class ItemStatusStore(
         try {
             val statuses = try {
                 read().toMutableMap()
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Exception) {
-                // An unreadable status file must not stall the sync; it is rebuilt from this poll on
-                logger.error("Ignoring unreadable item status file ${path.fileName}: ${e::class.simpleName}")
+                // An unreadable status file must not stall the sync, and must not be overwritten: keep it aside. If the
+                //  move fails the outer catch logs it and nothing is written.
+                val aside = moveAside(path)
+                unreadable.incrementAndGet()
+                logger.error("Item status file ${path.fileName} could not be read (${e::class.simpleName}); moved it to ${aside.fileName}. Every Item's last-success time is rebuilt from this poll; read the moved file for the earlier times.")
                 mutableMapOf()
             }
             for (ref in succeeded) {
@@ -156,20 +160,13 @@ class ItemStatusStore(
     }
 
     private suspend fun write(statuses: List<ItemStatus>) = withContext(Dispatchers.IO) {
-        val directory = path.toAbsolutePath().parent
-        Files.createDirectories(directory)
-        val temp = Files.createTempFile(directory, "item_status", ".tmp")
-        try {
-            writeDurably(temp, mapper.writerWithDefaultPrettyPrinter().writeValueAsString(statuses))
-            try {
-                Files.move(temp, path, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
-            } catch (e: java.nio.file.AtomicMoveNotSupportedException) {
-                Files.move(temp, path, StandardCopyOption.REPLACE_EXISTING)
-            }
-        } finally {
-            Files.deleteIfExists(temp)
-        }
+        writeAtomically(path, mapper.writerWithDefaultPrettyPrinter().writeValueAsString(statuses))
     }
+
+    private val unreadable = AtomicInteger(0)
+
+    /** How many unreadable status files were moved aside since the last call. */
+    fun takeUnreadableCount(): Int = unreadable.getAndSet(0)
 
     /** An Item as the status store identifies it. */
     data class ItemRef(val id: String, val institution: String, val redactedToken: String)

@@ -367,8 +367,6 @@ object PairStateFile {
         val current = dir.resolve("pair-state.json")
         val bak = dir.resolve("pair-state.json.v1.bak")
         if (Files.exists(current) && !Files.exists(bak) && !mapper.readTree(current.toFile()).has("version")) Files.copy(current, bak)
-        val tmp = dir.resolve("pair-state.json.tmp")
-        Files.writeString(tmp, mapper.writeValueAsString(state))
-        Files.move(tmp, dir.resolve("pair-state.json"), java.nio.file.StandardCopyOption.ATOMIC_MOVE, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+        net.djvk.fireflyPlaidConnector2.sync.writeAtomically(current, mapper.writeValueAsString(state))
     }
 }

@@ -112,15 +112,52 @@ internal class ItemStatusPruneTest {
     }
 
     @Test
-    fun unreadableStatusFileDoesNotStallAndNothingIsPrunedOnTop(@TempDir dir: Path) = runBlocking<Unit> {
+    fun unreadableStatusFileIsMovedAsideNotOverwrittenAndCounted(@TempDir dir: Path) = runBlocking<Unit> {
         val store = ItemStatusStore(dir.toString())
         val a = store.ref("access-fake-a", "Bank A")
         Files.writeString(store.path, "{ not json")
 
         store.poll(now, listOf(a))
 
-        // Nothing could be read, so nothing is pruned; the file is rebuilt from the poll
+        // Nothing could be read, so nothing is pruned; the file is rebuilt from the poll, the old bytes are kept aside
         assertEquals(setOf(a.id), store.read().keys)
+        val asides = asides(dir)
+        assertEquals(1, asides.size)
+        assertEquals("{ not json", Files.readString(asides[0]))
+        assertEquals(1, store.takeUnreadableCount())
+        assertEquals(0, store.takeUnreadableCount())
+    }
+
+    private fun asides(dir: Path) = Files.list(dir).use { s -> s.filter { it.fileName.toString().startsWith("item_status.unreadable-") }.toList() }
+
+    @Test
+    fun ifTheStatusFileCannotBeMovedAsideNothingIsWritten(@TempDir dir: Path) = runBlocking<Unit> {
+        org.junit.jupiter.api.Assumptions.assumeFalse(System.getProperty("user.name") == "root")
+        val store = ItemStatusStore(dir.toString())
+        val a = store.ref("access-fake-a", "Bank A")
+        Files.writeString(store.path, "{ not json")
+        val ro = PosixFilePermissions.fromString("r-x------")
+        Files.setPosixFilePermissions(dir, ro)
+        try {
+            store.poll(now, listOf(a))
+        } finally {
+            Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("rwx------"))
+        }
+        assertEquals("{ not json", Files.readString(store.path))
+        assertEquals(emptyList(), asides(dir))
+    }
+
+    @Test
+    fun twoUnreadableFilesGetTwoAsides(@TempDir dir: Path) = runBlocking<Unit> {
+        val store = ItemStatusStore(dir.toString())
+        val a = store.ref("access-fake-a", "Bank A")
+        Files.writeString(store.path, "{ not json")
+        store.poll(now, listOf(a))
+        Thread.sleep(5)
+        Files.writeString(store.path, "[ also bad")
+        store.poll(now, listOf(a))
+
+        assertEquals(setOf("{ not json", "[ also bad"), asides(dir).map { Files.readString(it) }.toSet())
     }
 
     @Test
