@@ -40,8 +40,8 @@ internal class LoanInterestResilienceTest {
     private val owed = mutableMapOf(2 to BigDecimal("23417.37"), 3 to BigDecimal("23417.37"))
     private val calls = mutableMapOf("tokA" to 0, "tokB" to 0)
     private val stores = mutableListOf<TransactionStore>()
-    /** tokens whose request throws an IOException before any answer (network failure) */
-    private var ioDown = setOf<String>()
+    /** token -> exception its request throws before any answer (a network failure, or a request-building bug) */
+    private var requestFails = mapOf<String, Exception>()
     private val txApi = mock<TransactionsApi>()
     private val accountsApi = mock<AccountsApi>()
     private val syncHelper = mock<SyncHelper>()
@@ -58,7 +58,7 @@ internal class LoanInterestResilienceTest {
             val body = String(req.body.toByteArray())
             val (tok, acc, fail) = if ("tokA" in body) Triple("tokA", "plA", failA) else Triple("tokB", "plB", failB)
             val n = calls.merge(tok, 1, Int::plus)!!
-            if (tok in ioDown) throw java.io.IOException("x")
+            requestFails[tok]?.let { throw it }
             val f = fail(n)
             if (f != null) respond(f.second, f.first, headersOf(HttpHeaders.ContentType, "application/json"))
             else respond(balance(acc), HttpStatusCode.OK, headersOf(HttpHeaders.ContentType, "application/json"))
@@ -178,7 +178,7 @@ internal class LoanInterestResilienceTest {
 
     @Test
     fun aNetworkFailureOnOneItemIsSkippedAndTheOtherIsApplied() {
-        ioDown = setOf("tokA")
+        requestFails = mapOf("tokA" to java.io.IOException("x"))
         val e = assertThrows<IllegalStateException> { runner(failA = { null }).run() }
         assertThat(e.message).contains("2 (NETWORK_IOException)")
         assertThat(calls["tokA"]).isEqualTo(3)
@@ -219,6 +219,14 @@ internal class LoanInterestResilienceTest {
         }
         val e = assertThrows<IllegalStateException> { r.run() }
         assertThat(e.message).contains("2 (").contains("3 (")
+        assertThat(stores).isEmpty()
+    }
+
+    @Test
+    fun aRequestBuildingBugStillAborts() {
+        requestFails = mapOf("tokA" to IllegalStateException("bug"))
+        val e = assertThrows<RuntimeException> { runner(failA = { null }).run() }
+        assertThat(e.message).contains("failed after 3 attempts")
         assertThat(stores).isEmpty()
     }
 
