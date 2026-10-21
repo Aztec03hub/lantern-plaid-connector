@@ -62,6 +62,14 @@ internal class LegacyReferenceTest {
     }
 
     @Test
+    fun anIdWithAQuoteOrBackslashIsNeverSearchedNorStrippedIntoAnotherId() = runBlocking<Unit> {
+        assertThat(helper(search).heldByLegacyReference("ab\"c")).isFalse()
+        assertThat(helper(search).heldByLegacyReference("ab\\c")).isFalse()
+
+        org.mockito.kotlin.verifyNoInteractions(search)
+    }
+
+    @Test
     fun withoutASearchApiTheAnswerIsAnErrorNotAGuess() {
         val e = AtomicReference<Throwable?>()
         runBlocking { runCatching { helper(null).heldByLegacyReference("plaid3") }.onFailure { e.set(it) } }

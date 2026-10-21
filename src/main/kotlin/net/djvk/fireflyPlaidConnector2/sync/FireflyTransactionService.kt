@@ -209,18 +209,32 @@ class FireflyTransactionService(
     private suspend fun createGuarded(create: FireflyTransactionDto): Boolean {
         if (create.checkLegacyReference) {
             val ids = create.tx.plaidLinks.orEmpty().map { it.plaidTransactionId }
-            // A create already waiting in the dead letter file gets Plaid's update applied to the letter itself (see
-            //  PolledSyncOrchestrator.reviseDeadLetteredCreates); a second create here would overwrite the letter
+            // A letter of any kind already holding one of these ids (a create, or a promotion update whose split carries
+            //  the posted id) gets Plaid's change from the letter itself; a create here would sit beside the pending twin
             val waiting = deadLetters?.read().orEmpty().any { l ->
-                l.operation == "create" && l.split?.plaidLinks.orEmpty().any { it.plaidTransactionId in ids }
+                listOfNotNull(l.split, l.fallback).any { s -> s.plaidLinks.orEmpty().any { it.plaidTransactionId in ids } }
             }
             if (waiting) {
-                logger.info("Plaid modified $ids, which waits in the dead letter file as a create; the letter takes the change")
+                logger.info("Plaid modified $ids, which waits in the dead letter file; the letter takes the change")
                 return false
             }
-            val legacy = ids.firstOrNull { syncHelper.heldByLegacyReference(it) }
+            val legacy = try {
+                ids.firstOrNull { syncHelper.heldByLegacyReference(it) }
+            } catch (cre: ClientRequestException) {
+                val status = cre.response.status.value
+                val store = deadLetters
+                if (store == null || status !in permanent4xx) throw cre
+                // A search Firefly rejects for good would stall every poll of this Item. Keep the create as an ABANDONED
+                //  letter (reported in the poll result, never auto-sent: it could duplicate an older import) and go on.
+                logger.error("Legacy search for Plaid id(s) $ids failed (HTTP $status); create kept as an abandoned dead letter: check it by hand")
+                store.add(DeadLetter("create", letterKey(create.tx), null, create.tx, false, "legacy search failed: HTTP $status", abandoned = true))
+                return false
+            }
             if (legacy != null) {
-                logger.warn("Firefly already holds a transaction made for Plaid id $legacy before the link table; not creating a second one")
+                logger.warn(
+                    "Firefly already holds a transaction made for Plaid id $legacy before the link table; not creating a second one " +
+                            "(Plaid's version dated ${create.tx.date}, amount ${create.tx.amount}, is not applied to it)"
+                )
                 return false
             }
         }

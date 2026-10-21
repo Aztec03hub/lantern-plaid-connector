@@ -574,7 +574,8 @@ class TransactionConverter(
                             changesType = typeChange(leg, existingSplit),
                             fallbackCreate = fallback,
                             fallbackOnlyWhenGone = true, // the transfer keeps the money after a 422
-                            plaidAccountId = plaidUpdate.accountId,
+                            // no plaidAccountId: transferLegUpdate keeps the transfer's own accounts, and re-resolving
+                            //  them on a retry would overwrite the payer side with this leg's account
                         )
                     }
 

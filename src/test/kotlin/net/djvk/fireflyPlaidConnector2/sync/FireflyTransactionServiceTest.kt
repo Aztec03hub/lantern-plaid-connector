@@ -526,6 +526,73 @@ class FireflyTransactionServiceTest {
         assertThat(store.read().single().key).isEqualTo("w1")
     }
 
+    @Test
+    fun aPairedUpdateLetterWithNoStoredAccountKeepsItsAccountsOnRetry() = runBlocking<Unit> {
+        val (store, service) = serviceWithStore()
+        val leg = splitOn("plaidB", TransactionTypeProperty.withdrawal, PlaidLinkLeg.single, "11", "20").copy(plaidLinks = null)
+        store.add(DeadLetter("update", "ff1", "ff1", leg, false, "x"))
+
+        service.retryDeadLetters(mapOf("plaidA" to 11, "plaidB" to 20))
+
+        val sent = argumentCaptor<List<FireflyTransactionDto>>()
+        verify(syncHelper).updateBatchInFirefly(sent.capture())
+        assertThat(sent.firstValue.single().tx.sourceId).isEqualTo("11")
+        assertThat(sent.firstValue.single().tx.destinationId).isEqualTo("20")
+    }
+
+    @Test
+    fun aRetriedLettersFallbackIsCreatedOnTheCurrentAccount() = runBlocking<Unit> {
+        val (store, service) = serviceWithStore()
+        val fb = splitOn("plaidA", TransactionTypeProperty.withdrawal, PlaidLinkLeg.single, "11", null)
+        store.add(DeadLetter("update", "ff1", "ff1", linked("posted").tx, false, "x", fallback = fb))
+        whenever(syncHelper.updateBatchInFirefly(any())).doSuspendableAnswer { throw statusError(HttpStatusCode.NotFound) }
+
+        service.retryDeadLetters(mapOf("plaidA" to 12))
+
+        val sent = argumentCaptor<List<FireflyTransactionDto>>()
+        verify(syncHelper).optimisticInsertBatchIntoFirefly(sent.capture())
+        assertThat(sent.firstValue.single().tx.sourceId).isEqualTo("12")
+    }
+
+    @Test
+    fun aRetriedUpdateLetterRejectedAgainWith422DoesNotCreateItsFallback() = runBlocking<Unit> {
+        val (store, service) = serviceWithStore()
+        store.add(DeadLetter("update", "ff1", "ff1", linked("posted").tx, false, "x", fallback = linked("posted").tx))
+        whenever(syncHelper.updateBatchInFirefly(any())).doSuspendableAnswer { throw statusError(HttpStatusCode.UnprocessableEntity) }
+
+        service.retryDeadLetters()
+
+        verify(syncHelper, never()).optimisticInsertBatchIntoFirefly(any())
+        assertThat(store.read().single().attempts).isEqualTo(1)
+    }
+
+    @Test
+    fun aPromotionUpdateLetterHoldingThePostedIdBlocksTheCreateStandingInForAModifiedEvent() = runBlocking<Unit> {
+        val (store, service) = serviceWithStore()
+        store.add(DeadLetter("update", "ff1", "ff1", linked("posted").tx, false, "x"))
+
+        val notCreated = service.processFireflyTransactionUpdates(listOf(linked("posted").copy(checkLegacyReference = true)), listOf(), listOf())
+
+        assertEquals(1, notCreated)
+        verify(syncHelper, never()).optimisticInsertBatchIntoFirefly(any())
+        verify(syncHelper, never()).heldByLegacyReference(any())
+    }
+
+    @Test
+    fun aLegacySearchRejectedForGoodKeepsTheCreateAsAnAbandonedLetterAndTheIterationGoesOn() = runBlocking<Unit> {
+        val (store, service) = serviceWithStore()
+        whenever(syncHelper.heldByLegacyReference(any())).doSuspendableAnswer { throw statusError(HttpStatusCode.BadRequest) }
+
+        val notCreated = service.processFireflyTransactionUpdates(listOf(linked("s1").copy(checkLegacyReference = true)), listOf(), listOf())
+
+        assertEquals(1, notCreated)
+        verify(syncHelper, never()).optimisticInsertBatchIntoFirefly(any())
+        val letter = store.read().single()
+        assertThat(letter.abandoned).isTrue()
+        assertThat(letter.message).isEqualTo("legacy search failed: HTTP 400")
+        assertThat(letter.key).isEqualTo("s1")
+    }
+
     // endregion
 
     // region link lookups
