@@ -48,11 +48,13 @@ data class PollResult(
     val deadLetterFilesUnreadable: Int = 0,
     /** Firefly transfers whose legs disagree after a Plaid change, left untouched for a person to check. */
     val transfersNeedingReview: Int = 0,
+    /** Own-account routings skipped because the target has Plaid transactions of its own; a person must fix the rule. */
+    val routingsRefused: Int = 0,
 ) {
     /** True when the poll ran but something needs attention: a bank is failing, a write is dead-lettered. */
     @get:com.fasterxml.jackson.annotation.JsonIgnore
     val partial: Boolean get() = failedItems.isNotEmpty() || deadLetters > 0 || investmentFailures > 0 ||
-            deadLetterFilesUnreadable > 0 || transfersNeedingReview > 0
+            deadLetterFilesUnreadable > 0 || transfersNeedingReview > 0 || routingsRefused > 0
 }
 
 /**

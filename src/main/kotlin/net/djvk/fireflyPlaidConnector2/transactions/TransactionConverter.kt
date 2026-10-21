@@ -124,6 +124,9 @@ class TransactionConverter(
     @Volatile
     var accountKinds: Map<String, AccountKind> = emptyMap()
 
+    /** Own-account routings skipped because the target has Plaid inflow of its own; the poll resets it and reports it as partial. */
+    var routingsRefused: Int = 0
+
     private val timeZone = TimeZone.getTimeZone(timeZoneString)
     private val zoneId = timeZone.toZoneId()
 
@@ -930,6 +933,7 @@ class TransactionConverter(
             // A payment to one of our own accounts that Plaid has no other side for: ONE link, leg source (never a pairing candidate)
             val routed = fireflyAccountId.toIntOrNull()?.let {
                 ownAccounts.target(it, tx.originalDescription ?: tx.name, Math.round(tx.amount * 100), tx.date)
+                    ?.takeUnless { target -> refusesRouting(it, target, tx, accountMap) }
             }
             if (routed != null) {
                 logger.info("Routing ${tx.transactionId} (${tx.amount} on ${tx.date}) from account $fireflyAccountId to own account $routed")
@@ -948,6 +952,23 @@ class TransactionConverter(
             importTag = importTag,
             plaidLinks = if (link) listOf(PlaidLink(tx.transactionId, leg, tx.accountId)) else null,
         )
+    }
+
+    /**
+     * True when routing [tx] to [target] must be skipped: [target] is an ASSET account with Plaid transactions of its own
+     * (it is in [accountMap]), so it would get the routed payment AND its own inflow, and a routed payment is never
+     * paired. The transaction is then imported as if no rule matched; counted in [routingsRefused] so the poll is
+     * reported partial. Loans are fine (Plaid gives them a balance only); an account of unknown kind is not refused.
+     */
+    private fun refusesRouting(from: Int, target: Int, tx: PlaidTransaction, accountMap: Map<PlaidAccountId, FireflyAccountId>): Boolean {
+        if (accountKinds[target.toString()] != AccountKind.ASSET || target !in accountMap.values) return false
+        routingsRefused++
+        val rule = ownAccounts.ruleFor(from, tx.originalDescription ?: tx.name)
+        logger.warn(
+            "Not routing ${tx.transactionId} from account $from: own-account rule /${rule?.match}/ targets account $target, " +
+                "which has Plaid transactions of its own (they would pair); importing it unrouted. Remove $target from the routing rules"
+        )
+        return true
     }
 
     protected suspend fun convertDoublePlaid(

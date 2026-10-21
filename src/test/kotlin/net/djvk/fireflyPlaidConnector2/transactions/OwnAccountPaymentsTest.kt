@@ -94,6 +94,61 @@ internal class OwnAccountPaymentsTest {
         assertThat(s.plaidLinks!!.single().leg).isEqualTo(PlaidLinkLeg.source)
     }
 
+    private val fixed = """{"ownAccountPayments":[{"fromAccount":1,"match":"XXXX0198","toAccount":2}]}"""
+
+    private fun convertMapped(c: TransactionConverter, mapped: Map<String, Int>) =
+        runBlocking { c.convertBatchSync(listOf(tx(400.0)), mapped).single().tx }
+
+    @Test
+    fun aTargetWithPlaidInflowIsImportedUnroutedAndCounted() {
+        val c = converter(fixed).also { it.accountKinds = mapOf("1" to AccountKind.ASSET, "2" to AccountKind.ASSET) }
+        val s = convertMapped(c, mapOf("plaid1" to 1, "plaid2" to 2))
+        assertThat(s.destinationId).isNull()
+        assertThat(s.destinationName).isNotNull()
+        assertThat(s.plaidLinks!!.single().leg).isEqualTo(PlaidLinkLeg.single)
+        assertThat(c.routingsRefused).isEqualTo(1)
+    }
+
+    @Test
+    fun onlyTheRefusedTransactionIsSkipped() {
+        val c = converter(fixed).also { it.accountKinds = mapOf("1" to AccountKind.ASSET, "2" to AccountKind.ASSET) }
+        val other = tx(5.0).copy(originalDescription = "COFFEE", name = "COFFEE")
+        val out = runBlocking { c.convertBatchSync(listOf(tx(400.0), other), mapOf("plaid1" to 1, "plaid2" to 2)) }
+        assertThat(out).hasSize(2)
+        assertThat(c.routingsRefused).isEqualTo(1)
+    }
+
+    @Test
+    fun aPlaidMappedLoanTargetStillRoutes() {
+        val c = converter(fixed).also { it.accountKinds = mapOf("1" to AccountKind.ASSET, "2" to AccountKind.LIABILITY) }
+        assertThat(convertMapped(c, mapOf("plaid1" to 1, "plaid2" to 2)).destinationId).isEqualTo("2")
+        assertThat(c.routingsRefused).isEqualTo(0)
+    }
+
+    @Test
+    fun anUnmappedAssetTargetStillRoutes() {
+        val c = converter(fixed).also { it.accountKinds = mapOf("1" to AccountKind.ASSET, "2" to AccountKind.ASSET) }
+        val s = convertMapped(c, mapOf("plaid1" to 1))
+        assertThat(s.destinationId).isEqualTo("2")
+        assertThat(s.plaidLinks!!.single().leg).isEqualTo(PlaidLinkLeg.source)
+        assertThat(c.routingsRefused).isEqualTo(0)
+    }
+
+    @Test
+    fun aTargetOfUnknownKindStillRoutes() {
+        val c = converter(fixed)
+        assertThat(convertMapped(c, mapOf("plaid1" to 1, "plaid2" to 2)).destinationId).isEqualTo("2")
+        assertThat(c.routingsRefused).isEqualTo(0)
+    }
+
+    @Test
+    fun aScheduledCandidateWithPlaidInflowIsSkipped() {
+        val c = converter(json).also { it.accountKinds = mapOf("1" to AccountKind.ASSET, "2" to AccountKind.ASSET) }
+        val s = convertMapped(c, mapOf("plaid1" to 1, "plaid2" to 2))
+        assertThat(s.destinationId).isNull()
+        assertThat(c.routingsRefused).isEqualTo(1)
+    }
+
     @Test
     fun anInRowWithTheSameTextIsNotRouted() {
         val s = convert(converter(json), tx(-400.0)).tx

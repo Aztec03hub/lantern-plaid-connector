@@ -268,6 +268,7 @@ class PolledSyncOrchestrator(
         syncHelper.validatePlaidLinksEndpoint()
         // A liability account added to Firefly since startup is typed correctly from this poll on
         converter.accountKinds = syncHelper.fetchAccountKinds()
+        converter.routingsRefused = 0
 
         // Writes Firefly rejected in earlier polls are retried first, so a newer write for the same transaction
         //  (below) always lands after the stale one
@@ -376,6 +377,7 @@ class PolledSyncOrchestrator(
             fireflyDeleted = convertResult.deletes.size,
             failedItems = recordItemOutcomes(accessTokens, plaidTransactions.failedItems),
             transfersNeedingReview = convertResult.transfersNeedingReview.size,
+            routingsRefused = converter.routingsRefused,
         ).withDeadLetters()
     }
 
@@ -479,6 +481,10 @@ class PolledSyncOrchestrator(
         }
         webhookService?.post(iterationStart, Instant.now(), reported, failure)
         if (failure != null) throw failure
+        // Everything was imported, but a routing rule points at a Plaid-synced asset: the one-shot exit code must show it
+        if ((reported?.routingsRefused ?: 0) > 0) {
+            throw IllegalStateException("${reported?.routingsRefused} own-account routing(s) refused, see the WARN lines")
+        }
     }
 
     /**

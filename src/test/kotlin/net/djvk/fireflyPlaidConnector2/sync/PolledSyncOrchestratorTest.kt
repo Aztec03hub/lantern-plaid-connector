@@ -392,6 +392,26 @@ internal class PolledSyncOrchestratorTest {
         verify(webhookService).post(any(), any(), isNull(), any<IllegalStateException>())
     }
 
+    /** A refused own-account routing is imported, reported "partial" to the callback, and fails the iteration (exit code 1). */
+    @Test
+    fun aRefusedRoutingMakesThePollPartialAndFailsTheIteration() = runBlocking<Unit> {
+        val webhookService: WebhookService = mock()
+        val (accountMap, sequence, cursorMap) = stubOneCreateIteration()
+        whenever(converter.routingsRefused).thenReturn(2)
+        val orchestrator = PolledSyncOrchestrator(
+            30, syncHelper, cursorManager, plaidSyncService, fireflyTransactionService, converter, webhookService
+        )
+
+        assertThrows<IllegalStateException> { orchestrator.runIteration(accountMap, sequence, cursorMap) }
+
+        val result = argumentCaptor<PollResult>()
+        verify(webhookService).post(any(), any(), result.capture(), isNull())
+        assertEquals(2, result.firstValue.routingsRefused)
+        assertEquals(true, result.firstValue.partial)
+        verify(fireflyTransactionService).processFireflyTransactionUpdates(any(), any(), any())
+        verify(converter).routingsRefused = 0
+    }
+
     /**
      * With no callback configured the iteration still completes and nothing is posted.
      */
