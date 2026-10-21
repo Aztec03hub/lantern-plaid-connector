@@ -1198,7 +1198,8 @@ internal class TransactionConverterTest {
         ).updates.single()
         assertThat(paired.fallbackCreate?.tx?.plaidLinks).containsExactly(PlaidLink("tx3", PlaidLinkLeg.single, acctA))
         assertThat(paired.fallbackOnlyWhenGone).isTrue()
-        assertThat(paired.plaidAccountId).isEqualTo(acctA)
+        // the transfer keeps its own accounts; a stored account id would let a retry overwrite the payer side (H1)
+        assertThat(paired.plaidAccountId).isNull()
     }
 
     @org.junit.jupiter.api.Test

@@ -173,7 +173,10 @@ class SyncHelper(
      */
     suspend fun heldByLegacyReference(plaidId: String): Boolean {
         val api = checkNotNull(fireflySearchApi) { "No Firefly search API to look for an older import of $plaidId" }
-        val quoted = plaidId.replace("\\", "").replace("\"", "")
+        // Never strip: two ids that differ only by a quote would search the same value. Plaid ids are [A-Za-z0-9_-];
+        //  anything else skips the search and leaves the link table as the only guard.
+        if (plaidId.any { it == '"' || it == '\\' }) return false
+        val quoted = plaidId
         return listOf("external_id_is", "internal_reference_is").any { operator ->
             api.searchTransactions("$operator:\"$quoted\"", null).body().data.isNotEmpty()
         }
