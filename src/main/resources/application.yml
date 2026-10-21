@@ -95,6 +95,9 @@ fireflyPlaidConnector2:
     # For accounts marked "investment: true" (see accounts below): how many days back to re-read investment transactions
     #   on every poll. Defaults to 14.
     investmentLookbackDays: 14
+    # Longest read-back after an outage: a poll reads back to the Item's last good investment sync (investment_sync.json),
+    #   but never more than this many days. The larger of this and investmentLookbackDays applies. Defaults to 90.
+    investmentMaxLookbackDays: 90
   batch:
     # The number of days in the past to pull data for.
     maxSyncDays: 5
@@ -218,7 +221,7 @@ fireflyPlaidConnector2:
       #   (buys, sells, dividends, fees, ...) instead of bank transactions. Polled mode only.
       # The Plaid Item must have been linked with the "investments" product. Only the cash effect of each transaction is
       #   recorded in Firefly (Firefly has no securities); quantity, price, fees and security id go in the notes.
-      # Plaid has no change feed for these, so each poll re-reads polled.investmentLookbackDays days and inserts new ones.
+      # Plaid has no change feed for these, so each poll re-reads polled.investmentLookbackDays days (more after an outage, see investmentMaxLookbackDays) and inserts new ones.
       #   Later corrections of an already imported investment transaction are not propagated.
       # Defaults to false.
 #      investment: false
