@@ -186,6 +186,24 @@ internal class LoanInterestResilienceTest {
         assertThat(stores.map { it.transactions.single().sourceId }).containsExactly("3")
     }
 
+    private fun a429WithBodyIsSkipped(body: String) {
+        val e = assertThrows<IllegalStateException> { runner(failA = { HttpStatusCode.TooManyRequests to body }).run() }
+        assertThat(e.message).contains("2 (HTTP_429)")
+        assertThat(stores.map { it.transactions.single().sourceId }).containsExactly("3")
+    }
+
+    @Test
+    fun aPersistent429WithAnEmptyJsonBodyIsSkippedToo() = a429WithBodyIsSkipped("{}")
+
+    @Test
+    fun aPersistent429WithANonJsonBodyIsSkippedToo() = a429WithBodyIsSkipped("<html>slow down</html>")
+
+    @Test
+    fun aPermanentCodeIsSkippedUnderAnyErrorType() {
+        val out = printed { runner(failA = { HttpStatusCode.BadRequest to errorBody("API_ERROR", "INSTITUTION_NOT_SUPPORTED") }).run() }
+        assertThat(out).contains("permanent")
+    }
+
     @Test
     fun aSharedItemFailingOnTheReReadMarksBothLoansUnchecked() {
         sharedItem = true

@@ -16,10 +16,10 @@ import org.junit.jupiter.api.assertThrows
 internal class PlaidApiWrapperRateLimitTest {
     private var calls = 0
 
-    private fun wrapper(maxRetries: Int = 3, cap: Long = 0, answer: (Int) -> Pair<HttpStatusCode, String>): PlaidApiWrapper {
+    private fun wrapper(maxRetries: Int = 3, cap: Long = 0, retryAfter: String = "3600", answer: (Int) -> Pair<HttpStatusCode, String>): PlaidApiWrapper {
         val engine = MockEngine {
             val (status, body) = answer(++calls)
-            respond(body, status, io.ktor.http.Headers.build { append(HttpHeaders.ContentType, "application/json"); append(HttpHeaders.RetryAfter, "3600") })
+            respond(body, status, io.ktor.http.Headers.build { append(HttpHeaders.ContentType, "application/json"); append(HttpHeaders.RetryAfter, retryAfter) })
         }
         return PlaidApiWrapper("https://plaid.test", maxRetries, "id", "secret", engine, ApiConfiguration().getClientConfig(), 0, cap)
     }
@@ -47,6 +47,13 @@ internal class PlaidApiWrapperRateLimitTest {
         assertThrows<ClientRequestException> { call(wrapper(cap = 20) { limited }) }  // Retry-After says 3600 s each time
         assertThat((System.nanoTime() - t0) / 1_000_000).isLessThan(5_000)
         assertThat(calls).isEqualTo(3)
+    }
+
+    @Test
+    fun aHugeRetryAfterStillWaitsTheCapAndDoesNotOverflowToNoWait() {
+        val t0 = System.nanoTime()
+        assertThrows<ClientRequestException> { call(wrapper(cap = 300, retryAfter = "9223372036854776") { limited }) }
+        assertThat((System.nanoTime() - t0) / 1_000_000).isGreaterThanOrEqualTo(550)  // 2 waits of the 300 ms cap
     }
 
     @Test

@@ -90,7 +90,7 @@ class PlaidApiWrapper(
                 // LAN-54: the budget shrinks on every 429, so a persistent one ends after maxRetries attempts and the caller sees the exception
                 logger.error("429 rate limiting error encountered while calling $logString; ${remainingRetries - 1} retries remaining.", cre)
                 if (remainingRetries <= 1) throw cre
-                val retryAfter = cre.response.headers[HttpHeaders.RetryAfter]?.trim()?.toLongOrNull()?.let { it.coerceAtLeast(0) * 1000 }
+                val retryAfter = cre.response.headers[HttpHeaders.RetryAfter]?.trim()?.toLongOrNull()?.let { it.coerceIn(0, 3600) * 1000 }
                 delay(minOf(retryAfter ?: rateLimitWaitMillis, rateLimitWaitMillis))
                 return executeRequest(request, logString, remainingRetries - 1)
             }

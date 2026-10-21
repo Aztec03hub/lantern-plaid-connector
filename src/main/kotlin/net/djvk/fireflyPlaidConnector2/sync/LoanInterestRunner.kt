@@ -3,6 +3,7 @@ package net.djvk.fireflyPlaidConnector2.sync
 import com.fasterxml.jackson.databind.ObjectMapper
 import io.ktor.client.plugins.ClientRequestException
 import io.ktor.client.plugins.ServerResponseException
+import io.ktor.http.HttpStatusCode
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.runBlocking
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.AccountsApi
@@ -214,8 +215,13 @@ class LoanInterestRunner(
      */
     internal suspend fun unavailableCode(e: Exception): String? {
         if (e is ClientRequestException) {
+            // M1 (r2): a 429 is skippable whatever its body (a gateway page has no Plaid error_type), so check the status first
+            if (e.response.status == HttpStatusCode.TooManyRequests) {
+                return runCatching { plaidApiWrapper.plaidErrorTypeAndCode(e).let { it.second ?: it.first } }.getOrNull() ?: "HTTP_429"
+            }
             val (type, code) = plaidApiWrapper.plaidErrorTypeAndCode(e)
-            return if (type == "ITEM_ERROR" || type == "INSTITUTION_ERROR" || type == "RATE_LIMIT") code ?: type else null
+            // L3 (r2): the permanent codes skip whatever error_type they arrive under
+            return if (type == "ITEM_ERROR" || type == "INSTITUTION_ERROR" || type == "RATE_LIMIT" || code in PERMANENT_CODES) code ?: type else null
         }
         val cause = e.cause
         return when {
