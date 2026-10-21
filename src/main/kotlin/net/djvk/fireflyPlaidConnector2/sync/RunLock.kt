@@ -41,7 +41,7 @@ class RunLock private constructor(
         /** Throws [RunLockBusyException] (message names the holder) or IOException. Waits up to [waitSeconds], polling every 500 ms. */
         fun acquire(dir: Path, mode: String, waitSeconds: Long = 0): RunLock {
             Files.createDirectories(dir)
-            val file = dir.toAbsolutePath().normalize().resolve(FILE_NAME)
+            val file = dir.toRealPath().resolve(FILE_NAME)
             val deadline = System.nanoTime() + waitSeconds * 1_000_000_000L
             while (true) {
                 tryOnce(file, mode)?.let { return it }

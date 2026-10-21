@@ -73,7 +73,7 @@ class ItemStatusStore(
                 read().toMutableMap()
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
-            } catch (e: Exception) {
+            } catch (e: com.fasterxml.jackson.core.JsonProcessingException) {
                 // An unreadable status file must not stall the sync, and must not be overwritten: keep it aside. If the
                 //  move fails the outer catch logs it and nothing is written.
                 val aside = moveAside(path)

@@ -20,7 +20,12 @@ internal fun writeAtomically(target: Path, text: String) {
     } finally {
         Files.deleteIfExists(temp)
     }
+    // Make the rename itself durable; some platforms refuse to open a directory, which is fine
+    runCatching { java.nio.channels.FileChannel.open(dir, java.nio.file.StandardOpenOption.READ).use { it.force(true) } }
 }
+
+/** How many `.unreadable-` copies of one file are kept; older ones are deleted when a new one is made. */
+internal const val KEEP_ASIDES = 5
 
 /**
  * Renames [path] to `<name>.unreadable-<epochMillis><ext>` in the same directory (kept for a person), returns the new path.
@@ -32,5 +37,12 @@ internal fun moveAside(path: Path, clock: () -> Long = System::currentTimeMillis
     val (stem, ext) = if (dot > 0) name.substring(0, dot) to name.substring(dot) else name to ""
     val aside = path.resolveSibling("$stem.unreadable-${clock()}$ext")
     Files.move(path, aside)
+    runCatching {
+        val prefix = "$stem.unreadable-"
+        Files.list(path.toAbsolutePath().parent).use { s ->
+            s.filter { it.fileName.toString().startsWith(prefix) && it.fileName.toString().endsWith(ext) }
+                .sorted(compareBy<Path> { it.fileName.toString().length }.thenBy { it.fileName.toString() }).toList()
+        }.dropLast(KEEP_ASIDES).forEach { Files.deleteIfExists(it) }
+    }
     return aside
 }

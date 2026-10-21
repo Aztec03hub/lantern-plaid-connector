@@ -78,6 +78,15 @@ internal class RunLockTest {
     }
 
     @Test
+    fun aSymlinkedSpellingOfTheDirectoryIsStillBusy(@TempDir dir: Path) {
+        val real = Files.createDirectory(dir.resolve("real"))
+        val link = Files.createSymbolicLink(dir.resolve("link"), real)
+        RunLock.acquire(real, "poll").use {
+            assertThrows<RunLockBusyException> { RunLock.acquire(link, "pair") }
+        }
+    }
+
+    @Test
     fun missingDirectoryIsCreated(@TempDir dir: Path) {
         RunLock.acquire(dir.resolve("a/b"), "poll").close()
         assertTrue(Files.exists(dir.resolve("a/b/connector.lock")))

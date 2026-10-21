@@ -148,6 +148,23 @@ internal class ItemStatusPruneTest {
     }
 
     @Test
+    fun aFileThatCannotBeReadAtAllIsNotMovedAside(@TempDir dir: Path) = runBlocking<Unit> {
+        org.junit.jupiter.api.Assumptions.assumeFalse(System.getProperty("user.name") == "root")
+        val store = ItemStatusStore(dir.toString())
+        val a = store.ref("access-fake-a", "Bank A")
+        Files.writeString(store.path, "[]")
+        Files.setPosixFilePermissions(store.path, emptySet())
+        try {
+            store.poll(now, listOf(a))
+        } finally {
+            Files.setPosixFilePermissions(store.path, PosixFilePermissions.fromString("rw-------"))
+        }
+        assertEquals("[]", Files.readString(store.path))
+        assertEquals(emptyList(), asides(dir))
+        assertEquals(0, store.takeUnreadableCount())
+    }
+
+    @Test
     fun twoUnreadableFilesGetTwoAsides(@TempDir dir: Path) = runBlocking<Unit> {
         val store = ItemStatusStore(dir.toString())
         val a = store.ref("access-fake-a", "Bank A")

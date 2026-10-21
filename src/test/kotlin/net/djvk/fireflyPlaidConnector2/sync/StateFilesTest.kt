@@ -52,4 +52,14 @@ internal class StateFilesTest {
         assertEquals("three", Files.readString(f))
         assertEquals("two", Files.readString(second))
     }
+
+    @Test
+    fun onlyTheNewestAsidesAreKept(@TempDir dir: Path) {
+        val f = dir.resolve("a.json")
+        for (i in 1L..10L) {
+            Files.writeString(f, "v$i")
+            moveAside(f) { i }
+        }
+        assertEquals(listOf("a.unreadable-10.json", "a.unreadable-6.json", "a.unreadable-7.json", "a.unreadable-8.json", "a.unreadable-9.json"), names(dir))
+    }
 }
