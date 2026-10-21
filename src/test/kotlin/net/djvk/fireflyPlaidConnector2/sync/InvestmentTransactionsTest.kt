@@ -18,6 +18,7 @@ import net.djvk.fireflyPlaidConnector2.transactions.InvestmentTransactionConvert
 import net.djvk.fireflyPlaidConnector2.transactions.TransactionConverter
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.io.TempDir
 import org.mockito.kotlin.any
 import org.mockito.kotlin.argumentCaptor
 import org.mockito.kotlin.doReturn
@@ -173,10 +174,99 @@ internal class InvestmentTransactionsTest {
     private val plaidSyncService: PlaidSyncService = mock()
     private val fireflyTransactionService: FireflyTransactionService = mock()
 
-    private fun orchestrator(withInvestments: Boolean = true) = PolledSyncOrchestrator(
+    @TempDir
+    lateinit var dir: java.io.File
+
+    private fun store() = InvestmentSyncStore(dir.path, ItemStatusStore(dir.path))
+
+    private fun orchestrator(
+        withInvestments: Boolean = true,
+        store: InvestmentSyncStore? = null,
+        maxLookback: Long = 90,
+    ) = PolledSyncOrchestrator(
         30, syncHelper, mock(), plaidSyncService, fireflyTransactionService, mock<TransactionConverter>(),
         investmentConverter = if (withInvestments) converter else null,
+        investmentSyncStore = store,
+        investmentMaxLookbackDays = maxLookback,
     )
+
+    private val today = LocalDate.of(2026, 3, 30)
+
+    private fun oneBroker() = whenever(syncHelper.getInvestmentAccessTokenAccountIdSets())
+        .thenReturn(sequenceOf(Pair("tokBroker", listOf("brokerage"))))
+
+    private suspend fun startOfReadWith(seed: LocalDate?, maxLookback: Long = 90): LocalDate {
+        oneBroker()
+        whenever(plaidSyncService.fetchInvestmentTransactions(any(), any(), any(), any())).thenReturn(emptyList())
+        val s = store()
+        if (seed != null) s.record(mapOf(s.itemId("tokBroker") to seed))
+        orchestrator(store = s, maxLookback = maxLookback).syncInvestments(mapOf("brokerage" to 3), today)
+        val start = argumentCaptor<LocalDate>()
+        verify(plaidSyncService).fetchInvestmentTransactions(eq("tokBroker"), any(), start.capture(), eq(today))
+        return start.firstValue
+    }
+
+    @Test
+    fun anOutageLongerThanTheWindowReadsBackToTheLastSuccess() = runBlocking<Unit> {
+        assertThat(startOfReadWith(LocalDate.of(2026, 3, 10))).isEqualTo(LocalDate.of(2026, 3, 10))
+    }
+
+    @Test
+    fun aNormalRunKeepsTheFixedWindow() = runBlocking<Unit> {
+        assertThat(startOfReadWith(LocalDate.of(2026, 3, 29))).isEqualTo(LocalDate.of(2026, 3, 16))
+    }
+
+    @Test
+    fun anItemWithoutARecordKeepsTheFixedWindow() = runBlocking<Unit> {
+        assertThat(startOfReadWith(null)).isEqualTo(LocalDate.of(2026, 3, 16))
+    }
+
+    @Test
+    fun theReadBackIsCappedAtTheMaximum() = runBlocking<Unit> {
+        assertThat(startOfReadWith(LocalDate.of(2025, 12, 1))).isEqualTo(LocalDate.of(2025, 12, 30))
+    }
+
+    @Test
+    fun aCapBelowTheFixedWindowNeverShrinksIt() = runBlocking<Unit> {
+        assertThat(startOfReadWith(LocalDate.of(2026, 3, 10), maxLookback = 5)).isEqualTo(LocalDate.of(2026, 3, 16))
+    }
+
+    @Test
+    fun aGoodRunIsRecordedAndTheNextRunUsesIt() = runBlocking<Unit> {
+        oneBroker()
+        whenever(plaidSyncService.fetchInvestmentTransactions(any(), any(), any(), any())).thenReturn(emptyList())
+        val s = store()
+        val o = orchestrator(store = s)
+
+        o.syncInvestments(mapOf("brokerage" to 3), today)
+        // An empty answer is still a good sync
+        assertThat(s.read()).isEqualTo(mapOf(s.itemId("tokBroker") to today))
+
+        o.syncInvestments(mapOf("brokerage" to 3), today.plusDays(20))
+        verify(plaidSyncService).fetchInvestmentTransactions(
+            eq("tokBroker"), any(), eq(today), eq(today.plusDays(20))
+        )
+    }
+
+    @Test
+    fun aFailedItemIsNotRecordedAndKeepsItsOldDate() = runBlocking<Unit> {
+        whenever(syncHelper.getInvestmentAccessTokenAccountIdSets()).thenReturn(
+            sequenceOf(Pair("tokBad", listOf("a")), Pair("tokGood", listOf("b")))
+        )
+        whenever(fireflyTransactionService.heldPlaidIds(any())).thenReturn(setOf())
+        whenever(plaidSyncService.fetchInvestmentTransactions(eq("tokBad"), any(), any(), any()))
+            .doSuspendableAnswer { throw RuntimeException("PRODUCTS_NOT_SUPPORTED") }
+        whenever(plaidSyncService.fetchInvestmentTransactions(eq("tokGood"), any(), any(), any()))
+            .thenReturn(listOf(invTx("g1", account = "b", amount = 9.0)))
+        val s = store()
+        val old = LocalDate.of(2026, 3, 1)
+        s.record(mapOf(s.itemId("tokBad") to old, s.itemId("tokGood") to old))
+
+        val e = runCatching { orchestrator(store = s).syncInvestments(mapOf("a" to 1, "b" to 2), today) }.exceptionOrNull()
+
+        assertThat(e).isInstanceOf(IllegalStateException::class.java)
+        assertThat(s.read()).isEqualTo(mapOf(s.itemId("tokBad") to old, s.itemId("tokGood") to today))
+    }
 
     @Test
     fun onlyInvestmentTransactionsNotAlreadyInFireflyAreInserted() = runBlocking<Unit> {

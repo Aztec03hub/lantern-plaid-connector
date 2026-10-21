@@ -17,6 +17,8 @@ import org.springframework.beans.factory.annotation.Value
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty
 import org.springframework.stereotype.Component
 import java.time.Instant
+import java.time.LocalDate
+import java.time.temporal.ChronoUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.minutes
@@ -86,6 +88,12 @@ class PolledSyncOrchestrator(
 
     /** How the one-shot mode (`maxIterations > 0`) ends the process; a lambda so tests can see the exit code. */
     private val exit: (Int) -> Unit = { kotlin.system.exitProcess(it) },
+
+    /** Each investment Item's last good sync date; null (tests) means the fixed window is always used. */
+    private val investmentSyncStore: InvestmentSyncStore? = null,
+    /** Longest read-back after an outage; the read-back never goes past this many days even if the Item was silent longer. */
+    @Value("\${fireflyPlaidConnector2.polled.investmentMaxLookbackDays:90}")
+    private val investmentMaxLookbackDays: Long = 90,
 ) : Runner, DisposableBean {
     private val logger = LoggerFactory.getLogger(this::class.java)
 
@@ -131,16 +139,25 @@ class PolledSyncOrchestrator(
         }
     }
 
+    /** First day to read: the fixed window, widened back to [lastSuccess] when the Item was silent longer, never past the cap. */
+    internal fun investmentStart(today: LocalDate, lastSuccess: LocalDate?): LocalDate {
+        val fixed = today.minusDays(investmentLookbackDays)
+        if (lastSuccess == null || !lastSuccess.isBefore(fixed)) return fixed
+        return maxOf(lastSuccess, today.minusDays(maxOf(investmentLookbackDays, investmentMaxLookbackDays)))
+    }
+
     /**
      * Syncs accounts configured with `investment: true` (upstream issue #68): reads their recent investment
      * transactions from Plaid and inserts the ones Firefly doesn't have yet.
      *
      * Plaid has no cursor or change events for investment transactions, so each poll re-reads the last
-     * [investmentLookbackDays] days. The ones Firefly already holds (a link lookup) are skipped; a 409 on the insert is
-     * tolerated. Later corrections or cancellations of an already-imported investment transaction are not propagated.
+     * [investmentLookbackDays] days, widened back to the Item's last good sync (kept in [InvestmentSyncStore]) when it
+     * was silent for longer, but never past [investmentMaxLookbackDays] (the gap beyond that is logged at WARN). The
+     * ones Firefly already holds (a link lookup) are skipped; a 409 on the insert is tolerated. Later corrections or
+     * cancellations of an already-imported investment transaction are not propagated.
      *
      * One Item failing (for example because it wasn't linked with the investments product) does not stop the other
-     * Items; once all have been tried, an exception reports the failed ones.
+     * Items; once all have been tried, an exception reports the failed ones. A failed Item keeps its old sync date.
      */
     suspend fun syncInvestments(
         accountMap: Map<PlaidAccountId, FireflyAccountId>,
@@ -151,13 +168,31 @@ class PolledSyncOrchestrator(
         if (investmentItems.isEmpty()) return
 
         val failedItems = mutableListOf<String>()
+        val lastOk = investmentSyncStore?.read().orEmpty()
+        val synced = mutableMapOf<String, LocalDate>()
 
         for ((accessToken, accountIds) in investmentItems) {
             try {
-                val plaidTxs = plaidSyncService.fetchInvestmentTransactions(
-                    accessToken, accountIds, today.minusDays(investmentLookbackDays), today
-                )
-                if (plaidTxs.isEmpty()) continue
+                val id = investmentSyncStore?.itemId(accessToken)
+                val last = id?.let { lastOk[it] }
+                val start = investmentStart(today, last)
+                if (start.isBefore(today.minusDays(investmentLookbackDays))) {
+                    logger.info(
+                        "Investments for ${Utilities.redactAccessToken(accessToken)}: widening the read-back to " +
+                                "${ChronoUnit.DAYS.between(start, today)} days after a gap since $last"
+                    )
+                    if (last != null && last.isBefore(start)) {
+                        logger.warn(
+                            "Investments for ${Utilities.redactAccessToken(accessToken)}: gap since $last exceeds " +
+                                    "investmentMaxLookbackDays=$investmentMaxLookbackDays; older transactions are not read"
+                        )
+                    }
+                }
+                val plaidTxs = plaidSyncService.fetchInvestmentTransactions(accessToken, accountIds, start, today)
+                if (plaidTxs.isEmpty()) {
+                    id?.let { synced[it] = today }
+                    continue
+                }
                 val held = fireflyTransactionService.heldPlaidIds(plaidTxs.map { it.investmentTransactionId })
                 val creates = plaidTxs
                     .filter { it.investmentTransactionId !in held }
@@ -175,6 +210,7 @@ class PolledSyncOrchestrator(
                             "${creates.size} new"
                 )
                 syncHelper.optimisticInsertBatchIntoFirefly(creates)
+                id?.let { synced[it] = today }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -184,8 +220,11 @@ class PolledSyncOrchestrator(
                 failedItems.add(Utilities.redactAccessToken(accessToken))
             }
         }
+        // The good Items are stamped even when another Item fails the iteration; a failed Item keeps its old date, so
+        //  its next poll still reads back to it.
+        investmentSyncStore?.record(synced)
         // Every Item gets its turn, but a failure is not silent: it fails the iteration, so it is reported through the
-        //  result callback and logged by the poll loop (an outage longer than the lookback loses transactions).
+        //  result callback and logged by the poll loop.
         if (failedItems.isNotEmpty()) {
             throw InvestmentSyncException(failedItems)
         }
@@ -444,7 +483,7 @@ class PolledSyncOrchestrator(
      * callback and then rethrown, so the callback is notified before the exception leaves the loop.
      *
      * Banks and investments are independent: each is tried even if the other fails, so a bank outage doesn't starve
-     * investment syncing (which only looks back [investmentLookbackDays]) and a failing investment Item doesn't hide
+     * investment syncing (which reads back to its Item's last good sync, see [syncInvestments]) and a failing investment Item doesn't hide
      * a bank sync that worked. One callback carries both outcomes, then the first failure is rethrown.
      */
     suspend fun runIteration(
