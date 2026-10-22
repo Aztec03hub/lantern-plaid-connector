@@ -351,6 +351,16 @@ internal class RehomeNamesRunnerTest {
     }
 
     @Test
+    fun containsEndsAndSourceActionAndToTriggersAllBlock() {
+        rules = listOf(rule("C", trigger = RuleTriggerKeyword.toAccountContains to "volv cons"))
+        assertThat(applyBlocked()).isEmpty()
+        rules = listOf(rule("E", trigger = RuleTriggerKeyword.fromAccountEnds to "ULTING"))
+        assertThat(applyBlocked()).containsExactly("3")
+        rules = listOf(rule("S", action = RuleActionKeyword.setSourceAccount to "evolv consulting"))
+        assertThat(applyBlocked()).containsExactly("3")
+    }
+
+    @Test
     fun aRecurrenceUsingTheDuplicateByIdBlocks() {
         recurrences = listOf(recurrence("r1", destination = "1"), recurrence("r2", source = "3"), recurrence("r3", destination = "99"))
         assertThat(applyBlocked()).isEmpty()
