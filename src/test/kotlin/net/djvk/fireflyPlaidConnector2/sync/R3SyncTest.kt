@@ -91,7 +91,6 @@ internal class R3SyncTest {
         enableDetailedCategorization = false,
         detailedCategoryPrefix = "plaid-detailed-cat-",
         timeZoneString = "America/New_York",
-        transferMatchWindowDays = 3L,
         txStyle = TransactionStyleConfig(null),
         pendingTag = pendingTag,
     )

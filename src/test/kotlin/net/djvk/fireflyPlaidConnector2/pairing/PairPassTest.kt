@@ -189,6 +189,18 @@ internal class PairPassTest {
         assertThat(reviewItems()).isEmpty()
     }
 
+    /** U46: the import no longer pairs; the two single journals a poll leaves behind are paired by this pass. */
+    @Test
+    fun theSettledPassPairsTheTwoSinglesAPollImported() = runBlocking<Unit> {
+        val w = World()
+        w.add("pollOut", 1, true, d, 25_000, "AC CHASE CREDIT CRD AUTOPAY")
+        w.add("pollIn", 2, false, d.plusDays(1), 25_000, "Payment Thank You")
+        val report = pass(w, dryRun = false).run(d.minusDays(5), today, now = now)
+        assertThat(w.merges).containsExactly("pollOut" to "pollIn")
+        assertThat(w.requests).hasSize(1)
+        assertThat(report.merged).hasSize(1)
+    }
+
     @Test
     fun theQueueIsRewrittenEmptyWhenItsPairIsGone() = runBlocking<Unit> {
         val w = World().also { it.review() }

@@ -36,7 +36,6 @@ internal class BatchSyncRunnerTest {
             val defaultTransactionConverter = TransactionConverter(
                 useNameForDestination = false,
                 timeZoneString = "America/New_York",
-                transferMatchWindowDays = 5,
                 enablePrimaryCategorization = true,
                 primaryCategoryPrefix = "primary-",
                 enableDetailedCategorization = true,

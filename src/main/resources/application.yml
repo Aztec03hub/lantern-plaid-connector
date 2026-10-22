@@ -34,16 +34,13 @@ fireflyPlaidConnector2:
   #   transaction posts. Blank or omitted disables it.
   # When a pending transaction posts, the connector updates the existing Firefly transaction in place (keeping your
   #   categories, budgets, notes and your own tags) instead of deleting and re-creating it. Pending transactions are
-  #   never matched as transfers.
+  #   never part of a transfer until they post.
   # pendingTag: "pending"
   # Firefly uses a timestamp for when transactions occurred, but Plaid does not always provide a timestamp
   #   for transactions; often it only provides a date. In those cases, we need a time zone to apply so that
   #   the timestamp that shows up in Firefly properly spans the specified date in the user's timezone.
   # Acceptable values are any time zone name from https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
   timeZone: America/New_York
-  # The maximum number of days apart transactions can be and still be candidates for matching up as a Firefly transfer.
-  # Must be less than fireflyPlaidConnector2.polled.existingFireflyPullWindowDays.
-  transferMatchWindowDays: 3
   # Transfer pairing (docs/design/transfer-pairer.md in the Lantern repo). syncMode "pair" runs one pass and exits.
   #   Every pass is a DRY RUN (prints the plan, writes nothing) until dryRun is false. afterRun adds a pass after every
   #   batch run and poll (off by default). Account mask / roles / institutionName in the accounts list feed its
@@ -55,9 +52,8 @@ fireflyPlaidConnector2:
     # How often to run the poll sync process
     syncFrequencyMinutes: 10
     # How many days in the past we should pull existing Firefly transactions for.
-    # These Firefly transactions are used for searching for targets for Plaid updates and deletes, as well as for
-    #   searching for transfer matches.
-    # Must be more than fireflyPlaidConnector2.transferMatchWindowDays
+    # These Firefly transactions are used for searching for targets for Plaid updates and deletes, pending promotion
+    #   and retried creates.
     existingFireflyPullWindowDays: 5
     # Path to a directory that the application can use to store a file that tracks the state of the Plaid sync cursors.
     # This path needs to be writeable by the application's user and needs to be persistent. If you're using Docker,
@@ -144,8 +140,7 @@ fireflyPlaidConnector2:
 #    clientId: HI I'M A CLIENT ID
 #    secret: SECRETZ
     # The number of transactions to fetch from Plaid at a time.
-    # This doesn't have a major effect as in both batch and sync mode we have to retain data sets larger
-    #   than just the Plaid transaction batch in memory to try to match up transfers.
+    # This doesn't have a major effect on the result.
     # Larger batch sizes can reduce rate limiting issues.
     batchSize: 100
     # The number of times to retry a failed API call.

@@ -5,7 +5,6 @@ import net.djvk.fireflyPlaidConnector2.api.plaid.models.Transaction
 import java.time.OffsetDateTime
 import java.time.ZoneId
 import java.util.function.Supplier
-import kotlin.math.abs
 
 /**
  * Represents a single transaction, including both the Plaid and the Firefly representation of it.
@@ -138,50 +137,6 @@ sealed interface PlaidFireflyTransaction {
         override val fireflyAccountId get() = getFireflyAccountId(fireflyTransaction)
         override fun getTimestamp(zoneId: ZoneId): OffsetDateTime {
             return getPlaidTransactionDate(plaidTransaction, zoneId)
-        }
-    }
-
-    /**
-     * This subtype represents a pair of two transactions that we believe to be a transfer from one account into a
-     * different account.
-     */
-    data class Transfer private constructor(
-        val deposit: PlaidFireflyTransaction,
-        val withdrawal: PlaidFireflyTransaction,
-    ): PlaidFireflyTransaction {
-        companion object {
-            fun create(first: PlaidFireflyTransaction, second: PlaidFireflyTransaction): Transfer {
-                if ((first.amount > 0) == (second.amount > 0)) {
-                    throw IllegalArgumentException("A transfer must have one withdrawal and one deposit")
-                }
-                if (abs(first.amount) != abs(second.amount)) {
-                    throw IllegalArgumentException("A transfer must have the same withdrawal and deposit amounts")
-                }
-                if (first.fireflyAccountId == second.fireflyAccountId) {
-                    throw IllegalArgumentException("A transfer must not have the same Firefly account IDs")
-                }
-
-                return if (first.amount >= 0) {
-                    Transfer(
-                        deposit = first,
-                        withdrawal = second,
-                    )
-                } else {
-                    Transfer(
-                        deposit = second,
-                        withdrawal = first,
-                    )
-                }
-            }
-        }
-
-        override val plaidTransaction = deposit.plaidTransaction ?: withdrawal.plaidTransaction
-        override val fireflyTransaction = deposit.fireflyTransaction ?: withdrawal.fireflyTransaction
-        override val amount = abs(deposit.amount)
-        override val transactionId = deposit.transactionId
-        override val fireflyAccountId get() = throw RuntimeException("Can not get Firefly account ID for a transfer")
-        override fun getTimestamp(zoneId: ZoneId): OffsetDateTime {
-            return deposit.getTimestamp(zoneId)
         }
     }
 }

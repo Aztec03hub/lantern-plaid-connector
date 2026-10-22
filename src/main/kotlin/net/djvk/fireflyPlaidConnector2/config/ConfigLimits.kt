@@ -48,15 +48,17 @@ internal fun configProblems(get: (String) -> String?): List<String> {
     val auto = numbers["pair.autoMin"] ?: 4
     val review = numbers["pair.reviewMin"] ?: 3
     if (auto < review) problems += "${P}pair.autoMin must be at least ${P}pair.reviewMin"
-    val pull = numbers["polled.existingFireflyPullWindowDays"]
-    val transfer = get(P + "transferMatchWindowDays")?.trim()?.toLongOrNull()
-    if (pull != null && transfer != null && pull <= transfer) {
-        problems += "${P}polled.existingFireflyPullWindowDays must be greater than ${P}transferMatchWindowDays"
-    }
     val pat = get(P + "firefly.personalAccessToken")
     if (pat != null && pat.isBlank()) problems += "${P}firefly.personalAccessToken must not be blank"
     return problems
 }
+
+/** Keys that used to change behaviour and now do nothing (transfers are paired by the settled pair pass, U46). */
+private val REMOVED_KEYS = listOf("transferMatchWindowDays", "reconcileTransfers")
+
+/** One message per removed key that is still set (the key only, never its value). A leftover key warns and never fails. */
+internal fun removedKeyWarnings(get: (String) -> String?): List<String> = REMOVED_KEYS.filter { get(P + it) != null }
+    .map { "$P$it is no longer used: transfers are paired by the settled pair pass (syncMode=pair), not at import; remove it" }
 
 /**
  * One warning per existing path that has a GROUP or OTHERS permission bit set (file name and mode only, never contents or
@@ -94,6 +96,7 @@ class ConfigLimits(env: Environment) {
         val dir = env.getProperty(P + "polled.cursorFileDirectoryPath")?.let { Path.of(it) }
         val log = LoggerFactory.getLogger(ConfigLimits::class.java)
         permissionWarnings(startupPermissionPaths(files, dir)).forEach { log.warn(it) }
+        removedKeyWarnings(env::getProperty).forEach { log.warn(it) }
         val url = env.getProperty(P + "firefly.url")
         if (url != null && !url.startsWith("https://") && !Regex("^http://(localhost|127\\.0\\.0\\.1|\\[::1])([:/]|$)").containsMatchIn(url)) {
             LoggerFactory.getLogger(ConfigLimits::class.java)

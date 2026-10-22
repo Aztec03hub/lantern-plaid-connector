@@ -183,18 +183,7 @@ class BatchSyncRunner(
             /**
              * Iterate through batches of Plaid transactions
              *
-             * We're storing all this data in memory so we can try to match up offsetting transfers before inserting
-             *  into Firefly.
-             * Note that the heap size may need to be increased if you're handling a ton of transactions.
-             */
-            /**
-             * Iterate through batches of Plaid transactions
-             *
-             * We're storing all this data in memory so we can try to match up offsetting transfers before inserting
-             *  into Firefly.
-             * We don't use fireflyPlaidConnector2.transferMatchWindowDays here because if we did we'd have to
-             *  do some complex rolling window shenanigans that I have no interest in implementing, and it's
-             *  easy to run batch mode once on a high-spec machine.
+             * We're storing all this data in memory before inserting into Firefly.
              * Note that the heap size may need to be increased if you're handling a ton of transactions.
              */
             val request = TransactionsGetRequest(

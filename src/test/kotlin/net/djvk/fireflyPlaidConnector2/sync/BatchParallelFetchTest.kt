@@ -91,7 +91,7 @@ internal class BatchParallelFetchTest {
         val runner = BatchSyncRunner(
             5, false, null, 100, plaid.wrapper, helper, firefly.accountsApi,
             net.djvk.fireflyPlaidConnector2.transactions.TransactionConverter(
-                false, "America/New_York", 5, false, "p-", false, "d-", net.djvk.fireflyPlaidConnector2.config.properties.TransactionStyleConfig(),
+                false, "America/New_York", false, "p-", false, "d-", net.djvk.fireflyPlaidConnector2.config.properties.TransactionStyleConfig(),
             ),
             pairPass, net.djvk.fireflyPlaidConnector2.pairing.PairSettings(dryRun = false, afterRun = true), configurationApi, true, "tok",
         )
@@ -120,7 +120,7 @@ internal class BatchParallelFetchTest {
         BatchSyncRunner(
             5, false, null, 100, plaid.wrapper, helper, firefly.accountsApi,
             net.djvk.fireflyPlaidConnector2.transactions.TransactionConverter(
-                false, "America/New_York", 5, false, "p-", false, "d-", net.djvk.fireflyPlaidConnector2.config.properties.TransactionStyleConfig(),
+                false, "America/New_York", false, "p-", false, "d-", net.djvk.fireflyPlaidConnector2.config.properties.TransactionStyleConfig(),
             ),
             null, null, configurationApi, disableRunningBalance, "tok",
         )
@@ -144,7 +144,7 @@ internal class BatchParallelFetchTest {
         val runner = BatchSyncRunner(
             5, false, null, 100, plaid.wrapper, helper, firefly.accountsApi,
             net.djvk.fireflyPlaidConnector2.transactions.TransactionConverter(
-                false, "America/New_York", 5, false, "p-", false, "d-", net.djvk.fireflyPlaidConnector2.config.properties.TransactionStyleConfig(),
+                false, "America/New_York", false, "p-", false, "d-", net.djvk.fireflyPlaidConnector2.config.properties.TransactionStyleConfig(),
             ),
             pairPass, net.djvk.fireflyPlaidConnector2.pairing.PairSettings(dryRun = false, afterRun = true), configurationApi, true, "tok",
         )

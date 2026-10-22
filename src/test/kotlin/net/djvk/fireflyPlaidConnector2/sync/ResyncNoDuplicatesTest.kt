@@ -74,7 +74,6 @@ internal class ResyncNoDuplicatesTest {
         enableDetailedCategorization = false,
         detailedCategoryPrefix = "plaid-detailed-cat-",
         timeZoneString = "America/New_York",
-        transferMatchWindowDays = 3L,
         txStyle = TransactionStyleConfig(null),
         pendingTag = "pending",
     )

@@ -73,7 +73,7 @@ internal class OwnAccountPaymentsTest {
         return TransactionConverter(
             useNameForDestination = true, enablePrimaryCategorization = false, primaryCategoryPrefix = "p-",
             enableDetailedCategorization = false, detailedCategoryPrefix = "d-", timeZoneString = "America/Chicago",
-            transferMatchWindowDays = 3, txStyle = TransactionStyleConfig(null), pairConfigFile = path,
+            txStyle = TransactionStyleConfig(null), pairConfigFile = path,
         )
     }
 
@@ -125,7 +125,7 @@ internal class OwnAccountPaymentsTest {
     private class Probe(path: String) : TransactionConverter(
         useNameForDestination = true, enablePrimaryCategorization = false, primaryCategoryPrefix = "p-",
         enableDetailedCategorization = false, detailedCategoryPrefix = "d-", timeZoneString = "America/Chicago",
-        transferMatchWindowDays = 3, txStyle = TransactionStyleConfig(null), pairConfigFile = path,
+        txStyle = TransactionStyleConfig(null), pairConfigFile = path,
     ) {
         suspend fun single(t: net.djvk.fireflyPlaidConnector2.api.plaid.models.Transaction, m: Map<String, Int>, link: Boolean) =
             convertSingle(t, m, link = link)

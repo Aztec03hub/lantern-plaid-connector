@@ -103,7 +103,7 @@ class FireflyTransactionService(
              *  up to update and delete requests.
              *
              * See [TransactionConverter.filterFireflyCandidateTransferTxs] for the filtering we do
-             *  before trying to match up transfers.
+             *  before using them as the join pool of a retried create.
              */
             val filteredTxs = response.data
             logger.debug("Fetched ${filteredTxs.size} existing Firefly single-split, non transfer transactions with window starting at $transferWindowStart")

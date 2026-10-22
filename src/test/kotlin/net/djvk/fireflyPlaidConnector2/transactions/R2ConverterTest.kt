@@ -30,7 +30,6 @@ internal class R2ConverterTest {
         enableDetailedCategorization = false,
         detailedCategoryPrefix = "plaid-detailed-cat-",
         timeZoneString = "America/New_York",
-        transferMatchWindowDays = 3L,
         txStyle = TransactionStyleConfig(null),
         pendingTag = pendingTag,
     )
@@ -71,27 +70,29 @@ internal class R2ConverterTest {
     // region H1-R2
 
     @Test
-    fun aTransferBuiltFromTwoPlaidLegsLinksBothIds() = runBlocking<Unit> {
+    fun twoPlaidLegsImportAsTwoSinglesEachLinkingItsOwnId() = runBlocking<Unit> {
         val result = converter().convertPollSync(
             accountMap, listOf(plaid(accountA, "wd", 50.0), plaid(accountB, "dep", -50.0)), listOf(), listOf(), listOf()
         )
 
-        val tx = result.creates.single().tx
-        assertThat(tx.externalId).describedAs("the connector no longer writes external_id").isNull()
-        assertThat(tx.internalReference).isNull()
-        assertThat(tx.plaidLinks).containsExactly(wdLink, depLink)
+        assertThat(result.creates).hasSize(2)
+        result.creates.forEach {
+            assertThat(it.tx.externalId).describedAs("the connector no longer writes external_id").isNull()
+            assertThat(it.tx.internalReference).isNull()
+        }
+        assertThat(result.creates.flatMap { it.tx.plaidLinks.orEmpty() })
+            .containsExactlyInAnyOrder(wdLink.copy(leg = PlaidLinkLeg.single), depLink.copy(leg = PlaidLinkLeg.single))
     }
 
     @Test
-    fun convertingAnExistingLegToATransferKeepsItsLinkAsTheOtherLeg() = runBlocking<Unit> {
+    fun anExistingLegIsNotConvertedWhenTheOtherLegArrives() = runBlocking<Unit> {
         val result = converter().convertPollSync(
             accountMap, listOf(plaid(accountB, "dep", -50.0)), listOf(), listOf(),
             listOf(existing("ff1", TransactionTypeProperty.withdrawal, single("wd")))
         )
 
-        val update = result.updates.single()
-        assertThat(update.id).isEqualTo("ff1")
-        assertThat(update.tx.plaidLinks).containsExactly(wdLink, depLink)
+        assertThat(result.updates).isEmpty()
+        assertThat(result.creates.single().tx.plaidLinks).containsExactly(depLink.copy(leg = PlaidLinkLeg.single))
     }
 
     /** Live finding: step 2 of the double transfer. The withdrawal leg alone must not be created again. */
@@ -133,12 +134,9 @@ internal class R2ConverterTest {
         assertThat(result.creates).isEmpty()
     }
 
-    /**
-     * A retried pair whose transfer already holds both legs is NOT skipped here: a two-link create is left to Firefly's
-     * 409 (the whole write conflicts, nothing is written), so the converter still emits it with both links.
-     */
+    /** A retried pair whose transfer already holds both legs creates nothing: each leg is a single create that is skipped. */
     @Test
-    fun aTwoLinkCreateIsNotSkippedEvenWhenATransferAlreadyHoldsBothLegs() = runBlocking<Unit> {
+    fun aRetriedPairWhoseTransferAlreadyHoldsBothLegsCreatesNothing() = runBlocking<Unit> {
         val older = existing("ff1", TransactionTypeProperty.transfer, transferLinks)
 
         val result = converter().convertPollSync(
@@ -146,7 +144,7 @@ internal class R2ConverterTest {
         )
 
         assertThat(result.updates).isEmpty()
-        assertThat(result.creates.single().tx.plaidLinks).containsExactly(wdLink, depLink)
+        assertThat(result.creates).isEmpty()
     }
 
     @Test
@@ -413,14 +411,15 @@ internal class R2ConverterTest {
     }
 
     @Test
-    fun aSettledTransactionIsStillConvertedIntoATransfer() = runBlocking<Unit> {
+    fun aSettledSingleIsNotConvertedIntoATransferAtImport() = runBlocking<Unit> {
         val settled = existing("ffS", TransactionTypeProperty.withdrawal, single("wd"), tags = listOf("my-tag"))
 
         val result = converter(pendingTag = "pending").convertPollSync(
             accountMap, listOf(plaid(accountB, "dep", -50.0)), listOf(), listOf(), listOf(settled)
         )
 
-        assertThat(result.updates.single().tx.type).isEqualTo(TransactionTypeProperty.transfer)
+        assertThat(result.updates).isEmpty()
+        assertThat(result.creates.single().tx.type).isEqualTo(TransactionTypeProperty.deposit)
     }
 
     @Test
@@ -455,17 +454,18 @@ internal class R2ConverterTest {
     }
 
     /**
-     * A6 characterization (U10 Step 0): the replaced pending leg is dropped from the candidates, but the two new Plaid legs
-     * pair with each other, so the transfer exists. Only the old untagged Firefly leg is deleted (its own user fields go).
+     * A6 characterization, U46: the replaced pending leg is promoted in place or deleted by the removal and the other new
+     * leg is a single; nothing is paired at import. (The settled pair pass pairs the two singles later.)
      */
     @Test
-    fun aPendingLegReplacedInTheSameSyncStillEndsAsOneTransfer() {
+    fun aPendingLegReplacedInTheSameSyncImportsEachLegAsASingle() {
         val result = replacedPendingSync()
-        val transfer = result.creates.single()
-        assertThat(transfer.tx.type).isEqualTo(TransactionTypeProperty.transfer)
-        assertThat(transfer.tx.plaidLinks!!.map { it.plaidTransactionId }).containsExactlyInAnyOrder("q1", "c1")
-        assertThat(result.updates).isEmpty()
-        assertThat(result.deletes).containsExactly("ff1")
+        assertThat(result.creates.single().tx.plaidLinks!!.map { it.plaidTransactionId to it.leg }).containsExactly("c1" to PlaidLinkLeg.single)
+        val promoted = result.updates.single()
+        assertThat(promoted.id).isEqualTo("ff1")
+        assertThat(promoted.tx.type).isEqualTo(TransactionTypeProperty.withdrawal)
+        assertThat(promoted.tx.plaidLinks!!.map { it.plaidTransactionId to it.leg }).containsExactly("q1" to PlaidLinkLeg.single)
+        assertThat(result.deletes).isEmpty()
     }
 
     // endregion

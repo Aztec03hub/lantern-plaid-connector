@@ -68,7 +68,7 @@ internal class LinkTableLiveFireflyTest {
     private val converter = TransactionConverter(
         useNameForDestination = true, enablePrimaryCategorization = false, primaryCategoryPrefix = "p-",
         enableDetailedCategorization = false, detailedCategoryPrefix = "d-", timeZoneString = "UTC",
-        transferMatchWindowDays = 3L, txStyle = TransactionStyleConfig(null), pendingTag = "pending",
+        txStyle = TransactionStyleConfig(null), pendingTag = "pending",
     )
 
     /** A TransactionsApi whose Nth store (1-based) fails like a dropped connection, after the first N-1 went through. */
@@ -583,7 +583,7 @@ internal class LinkTableLiveFireflyTest {
         val bare = TransactionConverter(
             useNameForDestination = true, enablePrimaryCategorization = false, primaryCategoryPrefix = "p-",
             enableDetailedCategorization = false, detailedCategoryPrefix = "d-", timeZoneString = "UTC",
-            transferMatchWindowDays = 3L, txStyle = TransactionStyleConfig(null), pendingTag = "pending",
+            txStyle = TransactionStyleConfig(null), pendingTag = "pending",
             disableAccountAssignment = true,
         )
         val store = DeadLetterStore(dir.toString())

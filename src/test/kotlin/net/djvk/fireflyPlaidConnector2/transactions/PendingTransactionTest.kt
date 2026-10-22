@@ -30,7 +30,6 @@ internal class PendingTransactionTest {
         enableDetailedCategorization = false,
         detailedCategoryPrefix = "plaid-detailed-cat-",
         timeZoneString = "America/New_York",
-        transferMatchWindowDays = 3L,
         txStyle = TransactionStyleConfig(null),
         pendingTag = pendingTag,
     )
@@ -189,7 +188,7 @@ internal class PendingTransactionTest {
     }
 
     @Test
-    fun pendingTransactionsAreNeverMatchedAsTransfers() = runBlocking<Unit> {
+    fun neitherPendingNorSettledLegsAreMatchedAsTransfersAtImport() = runBlocking<Unit> {
         val out = PlaidFixtures.getPaymentTransaction(
             accountId = plaidAccount, transactionId = "pOut", pendingTransactionId = null,
             amount = 100.0, pending = true,
@@ -203,11 +202,12 @@ internal class PendingTransactionTest {
         assertThat(pendingResult.creates.map { it.tx.type })
             .containsExactlyInAnyOrder(TransactionTypeProperty.withdrawal, TransactionTypeProperty.deposit)
 
-        // The same pair, once posted, is still matched as a transfer
+        // U46: the same pair, once posted, is imported as two singles too; the settled pair pass pairs it afterwards
         val settledResult = converter().convertPollSync(
             accountMap, listOf(out.copy(pending = false), into.copy(pending = false)), listOf(), listOf(), listOf()
         )
-        assertThat(settledResult.creates.map { it.tx.type }).containsExactly(TransactionTypeProperty.transfer)
+        assertThat(settledResult.creates.map { it.tx.type })
+            .containsExactlyInAnyOrder(TransactionTypeProperty.withdrawal, TransactionTypeProperty.deposit)
     }
 
     @Test
@@ -232,20 +232,6 @@ internal class PendingTransactionTest {
 
         assertThat(result.updates.single().tx.tags).contains("my-own-tag", "plaid-primary-cat-food-and-drink")
         assertThat(result.updates.single().tx.plaidLinks).describedAs("a modify sends no links").isNull()
-    }
-
-    @Test
-    fun onlyASettledTransactionThatMayBeATransferIsALookupCandidateForPairing() {
-        val c = converter()
-        val transfer = posted().copy(
-            personalFinanceCategory = net.djvk.fireflyPlaidConnector2.transactions.PersonalFinanceCategoryEnum.TRANSFER_OUT_ACCOUNT_TRANSFER.toPersonalFinanceCategory()
-        )
-        assertThat(c.mightPairAsTransfer(transfer)).isTrue()
-        assertThat(c.mightPairAsTransfer(transfer.copy(pending = true))).describedAs("pending ones are never paired").isFalse()
-        val groceries = posted().copy(
-            personalFinanceCategory = net.djvk.fireflyPlaidConnector2.transactions.PersonalFinanceCategoryEnum.FOOD_AND_DRINK_COFFEE.toPersonalFinanceCategory()
-        )
-        assertThat(c.mightPairAsTransfer(groceries)).describedAs("a category that rules a transfer out").isFalse()
     }
 
     @Test

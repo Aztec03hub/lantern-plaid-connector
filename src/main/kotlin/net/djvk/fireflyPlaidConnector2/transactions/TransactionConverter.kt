@@ -63,8 +63,6 @@ class TransactionConverter(
     private val useNameForDestination: Boolean,
     @Value("\${fireflyPlaidConnector2.timeZone}")
     private val timeZoneString: String,
-    @Value("\${fireflyPlaidConnector2.transferMatchWindowDays}")
-    private val transferMatchWindowDays: Long,
 
     @Value("\${fireflyPlaidConnector2.categorization.primary.enable:false}")
     private val enablePrimaryCategorization: Boolean,
@@ -149,7 +147,6 @@ class TransactionConverter(
      * The import tag for a run starting now, or null if none is configured.
      */
     fun currentImportTag(): String? = renderImportTag(importTagTemplate, ZonedDateTime.now(zoneId))
-    private val transferMatcher = TransferMatcher(timeZoneString, transferMatchWindowDays)
 
     companion object {
         /**
@@ -346,8 +343,7 @@ class TransactionConverter(
     /**
      * Convert a batch of Plaid transactions to Firefly transactions in batch syncing mode, as opposed to [convertPollSync]
      *
-     * A batch should include the widest date range possible and should include transactions from
-     *  all available Plaid accounts to enable matching of transfer transactions.
+     * Every transaction imports as a single; the settled pair pass (syncMode=pair) pairs the transfer legs later.
      */
     suspend fun convertBatchSync(
         txs: List<PlaidTransaction>,
@@ -355,29 +351,10 @@ class TransactionConverter(
     ): List<FireflyTransactionDto> {
         logger.debug("Batch sync converting Plaid transactions to Firefly transactions")
         val importTag = currentImportTag()
-        return transferMatcher.match(PlaidFireflyTransaction.normalizeByTransactionId(txs, listOf(), accountMap)).map {
-            when (it) {
-                is PlaidFireflyTransaction.Transfer -> {
-                    convertDoublePlaid(
-                        requirePlaidTransaction(it.withdrawal),
-                        requirePlaidTransaction(it.deposit),
-                        accountMap,
-                        importTag,
-                    )
-                }
-                else -> {
-                    convertSingle(requirePlaidTransaction(it), accountMap, importTag, link = true)
-                }
-            }
+        return PlaidFireflyTransaction.normalizeByTransactionId(txs, listOf(), accountMap).map {
+            convertSingle(requirePlaidTransaction(it), accountMap, importTag, link = true)
         }
     }
-
-    /**
-     * Whether a Plaid create could end up as one leg of a transfer: a settled transaction whose category does not rule
-     * it out. The poll looks these up by link even outside the pull window, so a leg imported by an earlier, partly
-     * failed iteration is paired instead of being recorded twice.
-     */
-    fun mightPairAsTransfer(tx: PlaidTransaction): Boolean = !tx.pending && transferMatcher.isPossibleTransfer(tx)
 
     data class ConvertPollSyncResult(
         val creates: List<FireflyTransactionDto>,
@@ -397,8 +374,7 @@ class TransactionConverter(
      * Convert a batch of Plaid change events and existing Firefly transactions to Firefly creates, updates, and
      *  deletes in poll syncing mode, as opposed to [convertBatchSync]
      *
-     * [existingFireflyTxs] should include transactions from fireflyPlaidConnector2.transferMatchWindowDays ago for
-     *  transfer matching purposes.
+     * [existingFireflyTxs] should cover the pull window, so a retried create or a pending promotion finds its journal.
      */
     suspend fun convertPollSync(
         accountMap: Map<PlaidAccountId, FireflyAccountId>,
@@ -431,27 +407,20 @@ class TransactionConverter(
         val markChanges = linkedMapOf<FireflyTransactionId, FlipMark?>()
 
         /**
-         * Don't pass in [plaidUpdatedTxs] here because we're not going to try to update transfers for now
-         *  because it's more complexity than I want to deal with, and I haven't seen any Plaid updates in the wild yet
-         *
-         * Pending transactions are never matched as transfers: they are provisional, and keeping them as plain
-         *  deposits/withdrawals is what allows them to be updated in place when they post (Firefly can't change a
-         *  transaction's type on update).
+         * Every create imports as a single: transfers are paired afterwards by the settled pair pass (syncMode=pair),
+         *  never at import. Pending creates stay plain deposits/withdrawals, which is what allows them to be updated
+         *  in place when they post (Firefly can't change a transaction's type on update).
          */
         val (pendingCreates, settledCreates) = plaidCreatedTxs.partition { it.pending }
-        val wrappedCreates = transferMatcher.match(
-            PlaidFireflyTransaction.normalizeByTransactionId(settledCreates, transferCandidateExistingFireflyTxs, accountMap)
-        ) + PlaidFireflyTransaction.normalizeByTransactionId(pendingCreates, transferCandidateExistingFireflyTxs, accountMap)
-            // Existing Firefly transactions are only needed here to recognize pending creates we already imported
-            .filter { it !is PlaidFireflyTransaction.FireflyTransaction }
-        logger.debug(
-            "{} call to transferMatcher returned {} transactions",
-            ::convertPollSync.name,
-            wrappedCreates.size,
+        val wrappedCreates = PlaidFireflyTransaction.normalizeByTransactionId(
+            settledCreates + pendingCreates, transferCandidateExistingFireflyTxs, accountMap
         )
+            // Existing Firefly transactions are only needed here to recognize creates we already imported
+            .filter { it !is PlaidFireflyTransaction.FireflyTransaction }
+        logger.debug("{} normalised {} created transactions", ::convertPollSync.name, wrappedCreates.size)
 
         /**
-         * Handle singles, which are transactions that didn't have any transfer pair matches
+         * Handle the created transactions, each of them a single
          */
         for (create in wrappedCreates) {
             val convertedSingle = when (create) {
@@ -478,41 +447,6 @@ class TransactionConverter(
                         create.fireflyTransaction.id,
                     )
                     continue
-                }
-
-                is PlaidFireflyTransaction.Transfer -> {
-                    if (create.withdrawal.fireflyTransaction != null && create.deposit.fireflyTransaction != null) {
-                        logger.debug("TransferMatcher found multiple existing Firefly transactions that appear to "
-                                + "be a transfer. Converting multiple existing Firefly transactions to a transfer is "
-                                + "not supported. Skipping: {}", create)
-                        continue
-                    }
-
-                    val fireflyComponent = create.fireflyTransaction
-                    if (fireflyComponent != null) {
-                        val converted = convertDoubleFirefly(
-                            requirePlaidTransaction(create),
-                            fireflyComponent,
-                            accountMap,
-                            importTag,
-                        )
-                        // Converted in place, so keep the user's tags and reconciliation on the existing transaction
-                        val target = existingFireflyTxs.firstOrNull { it.id == converted.id }
-                        // If Firefly refuses the pairing, the new leg is created on its own instead of being lost
-                        val fallback = convertSingle(requirePlaidTransaction(create), accountMap, importTag, link = true)
-                        if (target == null) converted.copy(fallbackCreate = fallback)
-                        else FireflyTransactionDto(
-                            converted.id, preserveUserFields(converted.tx, target, keepCounterparty = false),
-                            changesType = converted.changesType, fallbackCreate = fallback,
-                        )
-                    } else {
-                        convertDoublePlaid(
-                            requirePlaidTransaction(create.deposit),
-                            requirePlaidTransaction(create.withdrawal),
-                            accountMap,
-                            importTag,
-                        )
-                    }
                 }
             }
 
@@ -943,6 +877,10 @@ class TransactionConverter(
         return (userTags + (plaidTags ?: listOf())).distinct()
     }
 
+    /**
+     * The join pool for [PlaidFireflyTransaction.normalizeByTransactionId]: single-split, convertible, unpaired,
+     * not pending-tagged journals, so a retried create finds the single it already made. (Not a transfer filter any more.)
+     */
     fun filterFireflyCandidateTransferTxs(
         input: List<TransactionRead>,
     ): List<FireflyTransactionDto> {
@@ -1045,105 +983,6 @@ class TransactionConverter(
                 "which has Plaid transactions of its own (they would pair); $what. Remove $target from the routing rules"
         )
         return true
-    }
-
-    protected suspend fun convertDoublePlaid(
-        a: PlaidTransaction,
-        b: PlaidTransaction,
-        accountMap: Map<PlaidAccountId, FireflyAccountId>,
-        importTag: String? = null,
-    ): FireflyTransactionDto {
-        val (sourceTx, destinationTx) = if (a.amount < 0.0) Pair(b, a) else Pair(a, b)
-        return convert(
-            // The destination transaction tends to have the most relevant categorization information
-            tx = destinationTx,
-            isPair = true,
-            sourceId = accountMap[sourceTx.accountId]?.toString()
-                ?: throw RuntimeException("Failed to find Firefly account mapping for Plaid account ${sourceTx.accountId}"),
-            destinationId = accountMap[destinationTx.accountId]?.toString()
-                ?: throw RuntimeException("Failed to find Firefly account mapping for Plaid account ${destinationTx.accountId}"),
-            importTag = importTag,
-            // One transaction, both legs' ids: either leg, arriving in any later poll, finds this transfer
-            plaidLinks = listOf(
-                PlaidLink(sourceTx.transactionId, PlaidLinkLeg.source, sourceTx.accountId),
-                PlaidLink(destinationTx.transactionId, PlaidLinkLeg.destination, destinationTx.accountId),
-            ),
-        )
-    }
-
-    protected suspend fun convertDoubleFirefly(
-        plaidTx: PlaidTransaction,
-        fireflyTx: FireflyTransactionDto,
-        accountMap: Map<PlaidAccountId, FireflyAccountId>,
-        importTag: String? = null,
-    ): FireflyTransactionDto {
-        val plaidTxFireflyAccountId = accountMap[plaidTx.accountId]
-            ?: throw RuntimeException("Failed to find Firefly account mapping for Plaid account ${plaidTx.accountId}")
-
-        /**
-         * With transfers, the two component transactions are the inverse of each other.
-         * Since we know the transaction amounts have opposite signs, we know, in Firefly terms, one is a deposit
-         *  and one is a withdrawal.
-         *
-         * For Plaid transactions, we can only be confident in the accuracy of the account the transaction is
-         *  "on," the rest is just based on the name field, which isn't super accurate.
-         * For Firefly transactions, it depends;
-         * - Withdrawal: positive Plaid value. The Firefly tx would have the source account right, and the
-         *  destination account would be garbage.
-         * - Deposit: negative Plaid value. The Firefly tx would have the destination account right, and the
-         *  source account would be garbage.
-         */
-        val sourceId: String?
-        val sourceName: String?
-        val destinationId: String?
-        val destinationName: String?
-        when (fireflyTx.tx.type) {
-            TransactionTypeProperty.withdrawal -> {
-                sourceName = fireflyTx.tx.sourceName
-                sourceId = fireflyTx.tx.sourceId
-
-                destinationName = null
-                destinationId = plaidTxFireflyAccountId.toString()
-            }
-
-            TransactionTypeProperty.deposit -> {
-                sourceName = null
-                sourceId = plaidTxFireflyAccountId.toString()
-
-                destinationName = fireflyTx.tx.destinationName
-                destinationId = fireflyTx.tx.destinationId
-            }
-
-            else -> throw IllegalArgumentException(
-                "Unable to convert an existing Firefly transaction of type " +
-                        "${fireflyTx.tx.type} to a transfer."
-            )
-        }
-
-        // The Plaid transaction is the destination leg when the existing Firefly one was a withdrawal (the existing one
-        //  is the source leg) and the source leg when it was a deposit. The full link set is sent: the existing
-        //  transaction's own link (none for a manually entered one) with its role, plus the new one.
-        val (existingLeg, newLeg) = if (fireflyTx.tx.type == TransactionTypeProperty.withdrawal) {
-            Pair(PlaidLinkLeg.source, PlaidLinkLeg.destination)
-        } else {
-            Pair(PlaidLinkLeg.destination, PlaidLinkLeg.source)
-        }
-        val converted = convert(
-            tx = plaidTx,
-            isPair = true,
-            sourceId = sourceId,
-            sourceName = sourceName,
-            destinationId = destinationId,
-            destinationName = destinationName,
-            fireflyTx = fireflyTx,
-            importTag = importTag,
-            plaidLinks = fireflyTx.tx.plaidLinks.orEmpty().map { it.copy(leg = existingLeg) } +
-                    PlaidLink(plaidTx.transactionId, newLeg, plaidTx.accountId),
-        )
-        // A liability end can turn the existing withdrawal into a deposit (or the reverse), which is sent as a type change
-        return converted.copy(
-            changesType = converted.tx.type != TransactionTypeProperty.transfer && converted.tx.type != fireflyTx.tx.type
-        )
     }
 
     /**

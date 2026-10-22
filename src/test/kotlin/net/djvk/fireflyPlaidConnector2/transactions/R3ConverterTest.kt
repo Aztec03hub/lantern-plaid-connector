@@ -28,7 +28,6 @@ internal class R3ConverterTest {
         enableDetailedCategorization = false,
         detailedCategoryPrefix = "plaid-detailed-cat-",
         timeZoneString = "America/New_York",
-        transferMatchWindowDays = 3L,
         txStyle = TransactionStyleConfig(null),
     )
 
@@ -127,22 +126,18 @@ internal class R3ConverterTest {
         assertThat(update.tx.plaidLinks).isEmpty()
     }
 
-    /**
-     * The legs hold for a conversion too: an existing DEPOSIT (account 2) paired with a Plaid withdrawal leg (account 1)
-     * has its link as the destination leg and the Plaid leg's as the source leg.
-     */
+    /** U46: an existing DEPOSIT (account 2) is left alone when a Plaid withdrawal leg (account 1) arrives; the leg is a single. */
     @Test
-    fun convertingAnExistingDepositKeepsTheDestinationLegAsTheExternalId() = runBlocking<Unit> {
+    fun anExistingDepositIsNotConvertedWhenTheWithdrawalLegArrives() = runBlocking<Unit> {
         val result = converter().convertPollSync(
             accountMap, listOf(plaid(accountA, "wd", 50.0)), listOf(), listOf(),
             listOf(existing("ff2", TransactionTypeProperty.deposit, listOf(PlaidLink("dep", PlaidLinkLeg.single, accountB))))
         )
 
-        val update = result.updates.single()
-        assertThat(update.tx.type).isEqualTo(TransactionTypeProperty.transfer)
-        assertThat(update.tx.sourceId).isEqualTo("1")
-        assertThat(update.tx.destinationId).isEqualTo("2")
-        assertThat(update.tx.plaidLinks).containsExactly(depLink, wdLink)
+        assertThat(result.updates).isEmpty()
+        val create = result.creates.single()
+        assertThat(create.tx.type).isEqualTo(TransactionTypeProperty.withdrawal)
+        assertThat(create.tx.plaidLinks).containsExactly(wdLink.copy(leg = PlaidLinkLeg.single))
     }
 
     /** ...and the removal that follows keeps the right account: the deposit leg survives on account 2. */
@@ -158,16 +153,16 @@ internal class R3ConverterTest {
         assertThat(update.tx.plaidLinks).containsExactly(depLink.copy(leg = PlaidLinkLeg.single))
     }
 
-    /** A withdrawal converted by a Plaid deposit leg: the existing link is the source leg, the Plaid leg the destination. */
+    /** U46: an existing withdrawal is left alone when a Plaid deposit leg arrives; the leg is a single. */
     @Test
-    fun convertingAnExistingWithdrawalLinksThePlaidLegAsTheDestination() = runBlocking<Unit> {
+    fun anExistingWithdrawalIsNotConvertedWhenTheDepositLegArrives() = runBlocking<Unit> {
         val result = converter().convertPollSync(
             accountMap, listOf(plaid(accountB, "dep", -50.0)), listOf(), listOf(),
             listOf(existing("ff1", TransactionTypeProperty.withdrawal, listOf(PlaidLink("wd", PlaidLinkLeg.single, accountA))))
         )
 
-        val update = result.updates.single()
-        assertThat(update.tx.plaidLinks).containsExactly(wdLink, depLink)
+        assertThat(result.updates).isEmpty()
+        assertThat(result.creates.single().tx.plaidLinks).containsExactly(depLink.copy(leg = PlaidLinkLeg.single))
     }
 
     /**

@@ -239,7 +239,6 @@ internal class SyncCorrectnessTest {
             enableDetailedCategorization = false,
             detailedCategoryPrefix = "b",
             timeZoneString = "America/New_York",
-            transferMatchWindowDays = 3L,
             txStyle = net.djvk.fireflyPlaidConnector2.config.properties.TransactionStyleConfig(null),
         )
         val txs = listOf(10_000_000.0, 12_345_678.9, 12.5, 100.0).mapIndexed { i, amount ->

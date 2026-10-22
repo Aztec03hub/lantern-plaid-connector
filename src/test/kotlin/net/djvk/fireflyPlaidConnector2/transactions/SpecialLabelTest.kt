@@ -15,7 +15,7 @@ internal class SpecialLabelTest {
     private class Probe : TransactionConverter(
         useNameForDestination = true, enablePrimaryCategorization = false, primaryCategoryPrefix = "p-",
         enableDetailedCategorization = false, detailedCategoryPrefix = "d-", timeZoneString = "America/Chicago",
-        transferMatchWindowDays = 3, txStyle = TransactionStyleConfig(null), pairConfigFile = "",
+        txStyle = TransactionStyleConfig(null), pairConfigFile = "",
     ) {
         suspend fun create(t: net.djvk.fireflyPlaidConnector2.api.plaid.models.Transaction) =
             convert(t, false, sourceId = "1", plaidLinks = listOf(PlaidLink(t.transactionId, PlaidLinkLeg.single, t.accountId))).tx

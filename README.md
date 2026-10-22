@@ -27,7 +27,6 @@ When started in this mode, the connector will not pull any past transactions, bu
 The last sync position of each account will be stored in `persistence/plaid_sync_cursors.txt`.
 
 ## Firefly Transfers
-The most complex part of the connector by far is the transfer matching logic.
 Firefly has a notion of [transfers](https://docs.firefly-iii.org/firefly-iii/concepts/transactions/#transfers),
 which are special transactions that instead of the usual flow of money from an asset account into an expense account
 or from a revenue account into an asset account, represent the flow of money from one asset account into another.
@@ -37,15 +36,17 @@ up as asset accounts instead of liability accounts because that's how Firefly wo
 
 Plaid has no notion of inter-account transactions; transaction data only references the account that it's on.
 
-We try to bridge these by matching two Plaid transactions on different asset accounts and converting them into a single
-Firefly transfer. You can see the full logic in `TransactionConverter.sortByPairs`, but the summary is that the
-connector searches for pairs of Plaid transfer-type transactions with inverse amounts (i.e. $100 and -$100)
-that are within `fireflyPlaidConnector2.transferMatchWindowDays` of each other. This isn't flawless, but
-is sufficient in most cases.
+The connector does not pair transfer legs when it imports. Every Plaid transaction, in batch and in polled mode, is
+imported as a single withdrawal or deposit carrying its own Plaid link. The settled pair pass (`syncMode=pair`, design in
+`docs/design/transfer-pairer.md` in the Lantern repo) then pairs the two legs of a transfer from evidence: amounts,
+dates, account roles and markers in the descriptions. It runs after the poll in the nightly job, and after every run
+when `fireflyPlaidConnector2.pair.afterRun` is on. Until it runs, the two legs show as a withdrawal plus a deposit.
 
-Note that if the connector attempts to convert an existing non-transfer Firefly transaction and an incoming Plaid
-transaction to a Firefly transfer, the existing Firefly transaction will be deleted and the new transfer
-transaction will be created because the Firefly API does not support converting existing transaction types.
+Importing a second bank's whole history in batch mode therefore leaves every old transfer as two singles until a pair
+pass whose `pair.lookbackDays` covers that history has run.
+
+The old import-time matcher and its `fireflyPlaidConnector2.transferMatchWindowDays` setting are gone. A leftover
+`transferMatchWindowDays` (or `reconcileTransfers`) in your config does nothing and logs one warning at startup.
 
 ## Initial Balances
 **Note**: Given that the balance endpoint is now $0.10 per call, this feature isn't really worth using anymore

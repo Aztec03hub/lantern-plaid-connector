@@ -34,7 +34,7 @@ internal class TransactionConverterTest {
             return listOf(
                 Arguments.of(
 //                    testName: String,
-                    "Existing Firefly withdrawal",
+                    "Existing Firefly withdrawal is left alone, the new deposit leg is a single",
 //                    accountMap: Map<PlaidAccountId, FireflyAccountId>,
                     PlaidFixtures.getStandardAccountMapping(),
 //                    plaidCreatedTxs: List<PlaidTransaction>,
@@ -106,42 +106,27 @@ internal class TransactionConverterTest {
                     ),
 //                    expectedResult: TransactionConverter.ConvertPollSyncResult,
                     TransactionConverter.ConvertPollSyncResult(
-                        creates = listOf(),
-                        updates = listOf(
+                        // U46: an existing single is no longer converted into a transfer at import; the new leg is a single
+                        creates = listOf(
                             FireflyTransactionDto(
-                                "fireflyTransactionId",
+                                null,
                                 FireflyFixtures.getTransaction(
-                                    type = TransactionTypeProperty.transfer,
+                                    type = TransactionTypeProperty.deposit,
+                                    description = "AMERICAN EXPRESS DES:ACH PMT ID : W1111 INDN:JOHN Q PUBLIC CO ID:XXXXX11111 WEB",
                                     amount = "1111.22",
-                                    plaidLinks = listOf(
-                                        PlaidLink("existingPlaidId", PlaidLinkLeg.source, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-                                        PlaidLink("plaidTransactionId", PlaidLinkLeg.destination, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-                                    ),
-                                    sourceId = "2",
+                                    sourceName = "Unknown Transfer Source",
                                     destinationId = "1",
+                                    plaidLinks = listOf(PlaidLink("plaidTransactionId", PlaidLinkLeg.single, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
                                 ).transactions.first()
-                                    // An in-place update never re-sends the reconciled flag or order (M2)
-                                    .copy(order = null, reconciled = null),
-                                // If Firefly refuses the pairing, the new Plaid leg is created on its own
-                                fallbackCreate = FireflyTransactionDto(
-                                    null,
-                                    FireflyFixtures.getTransaction(
-                                        type = TransactionTypeProperty.deposit,
-                                        description = "AMERICAN EXPRESS DES:ACH PMT ID : W1111 INDN:JOHN Q PUBLIC CO ID:XXXXX11111 WEB",
-                                        amount = "1111.22",
-                                        sourceName = "Unknown Transfer Source",
-                                        destinationId = "1",
-                                        plaidLinks = listOf(PlaidLink("plaidTransactionId", PlaidLinkLeg.single, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
-                                    ).transactions.first()
-                                ),
-                            )
+                            ),
                         ),
+                        updates = listOf(),
                         deletes = listOf(),
                     ),
                 ),
                 Arguments.of(
 //                    testName: String,
-                    "Existing Firefly deposit",
+                    "Existing Firefly deposit is left alone, the new withdrawal leg is a single",
 //                    accountMap: Map<PlaidAccountId, FireflyAccountId>,
                     PlaidFixtures.getStandardAccountMapping(),
 //                    plaidCreatedTxs: List<PlaidTransaction>,
@@ -170,42 +155,27 @@ internal class TransactionConverterTest {
                     ),
 //                    expectedResult: TransactionConverter.ConvertPollSyncResult,
                     TransactionConverter.ConvertPollSyncResult(
-                        creates = listOf(),
-                        updates = listOf(
+                        // U46: an existing single is no longer converted into a transfer at import; the new leg is a single
+                        creates = listOf(
                             FireflyTransactionDto(
-                                "fireflyTransactionId",
+                                null,
                                 FireflyFixtures.getTransaction(
-                                    type = TransactionTypeProperty.transfer,
+                                    type = TransactionTypeProperty.withdrawal,
+                                    description = "AMERICAN EXPRESS DES:ACH PMT ID : W1111 INDN:JOHN Q PUBLIC CO ID:XXXXX11111 WEB",
                                     amount = "1111.22",
-                                    plaidLinks = listOf(
-                                        PlaidLink("existingPlaidId", PlaidLinkLeg.destination, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-                                        PlaidLink("plaidTransactionId", PlaidLinkLeg.source, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-                                    ),
                                     sourceId = "1",
-                                    destinationId = "2",
+                                    destinationName = "Unknown Transfer Recipient",
+                                    plaidLinks = listOf(PlaidLink("plaidTransactionId", PlaidLinkLeg.single, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
                                 ).transactions.first()
-                                    // An in-place update never re-sends the reconciled flag or order (M2)
-                                    .copy(order = null, reconciled = null),
-                                // If Firefly refuses the pairing, the new Plaid leg is created on its own
-                                fallbackCreate = FireflyTransactionDto(
-                                    null,
-                                    FireflyFixtures.getTransaction(
-                                        type = TransactionTypeProperty.withdrawal,
-                                        description = "AMERICAN EXPRESS DES:ACH PMT ID : W1111 INDN:JOHN Q PUBLIC CO ID:XXXXX11111 WEB",
-                                        amount = "1111.22",
-                                        sourceId = "1",
-                                        destinationName = "Unknown Transfer Recipient",
-                                        plaidLinks = listOf(PlaidLink("plaidTransactionId", PlaidLinkLeg.single, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
-                                    ).transactions.first()
-                                ),
-                            )
+                            ),
                         ),
+                        updates = listOf(),
                         deletes = listOf(),
                     ),
                 ),
                 Arguments.of(
 //                    testName: String,
-                    "Incoming Plaid Deposit and Withdrawal",
+                    "Incoming Plaid Deposit and Withdrawal import as two singles",
 //                    accountMap: Map<PlaidAccountId, FireflyAccountId>,
                     PlaidFixtures.getStandardAccountMapping(),
 //                    plaidCreatedTxs: List<PlaidTransaction>,
@@ -240,19 +210,28 @@ internal class TransactionConverterTest {
                     ),
 //                    expectedResult: TransactionConverter.ConvertPollSyncResult,
                     TransactionConverter.ConvertPollSyncResult(
+                        // U46: the import never pairs; the settled pair pass does that later
                         creates = listOf(
                             FireflyTransactionDto(
                                 null,
                                 FireflyFixtures.getTransaction(
-                                    type = TransactionTypeProperty.transfer,
+                                    type = TransactionTypeProperty.withdrawal,
+                                    description = "Plaid Withdrawal Tx",
                                     amount = "1111.22",
-                                    plaidLinks = listOf(
-                                        PlaidLink("plaidWithdrawalId", PlaidLinkLeg.source, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-                                        PlaidLink("plaidDepositId", PlaidLinkLeg.destination, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-                                    ),
-                                    description = "Plaid Deposit Tx",
                                     sourceId = "1",
+                                    destinationName = "Unknown Transfer Recipient",
+                                    plaidLinks = listOf(PlaidLink("plaidWithdrawalId", PlaidLinkLeg.single, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
+                                ).transactions.first()
+                            ),
+                            FireflyTransactionDto(
+                                null,
+                                FireflyFixtures.getTransaction(
+                                    type = TransactionTypeProperty.deposit,
+                                    description = "Plaid Deposit Tx",
+                                    amount = "1111.22",
+                                    sourceName = "Unknown Transfer Source",
                                     destinationId = "2",
+                                    plaidLinks = listOf(PlaidLink("plaidDepositId", PlaidLinkLeg.single, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")),
                                 ).transactions.first()
                             ),
                         ),
@@ -908,7 +887,6 @@ internal class TransactionConverterTest {
                 enableDetailedCategorization = false,
                 detailedCategoryPrefix = "b",
                 timeZoneString = "America/New_York",
-                transferMatchWindowDays = 10L,
                 txStyle = defaultStyle,
             )
             val actual = converter.convertPollSync(
@@ -942,7 +920,6 @@ internal class TransactionConverterTest {
                 enableDetailedCategorization = false,
                 detailedCategoryPrefix = "b",
                 timeZoneString = "America/New_York",
-                transferMatchWindowDays = 10L,
                 txStyle = defaultStyle,
             )
             val actual = converter.convertBatchSync(listOf(input), accountMap)
@@ -966,7 +943,6 @@ internal class TransactionConverterTest {
             enableDetailedCategorization = true,
             detailedCategoryPrefix = "dcat-",
             timeZoneString = "America/New_York",
-            transferMatchWindowDays = 10L,
             txStyle = defaultStyle,
         )
 
@@ -1028,7 +1004,6 @@ internal class TransactionConverterTest {
         enableDetailedCategorization = false,
         detailedCategoryPrefix = "b",
         timeZoneString = "America/New_York",
-        transferMatchWindowDays = 10L,
         txStyle = defaultStyle,
         importTagTemplate = template,
     )
@@ -1229,7 +1204,6 @@ internal class TransactionConverterTest {
             enableDetailedCategorization = false,
             detailedCategoryPrefix = "b",
             timeZoneString = "America/New_York",
-            transferMatchWindowDays = 10L,
             txStyle = defaultStyle,
             disableAccountAssignment = true,
         )
@@ -1275,7 +1249,6 @@ internal class TransactionConverterTest {
             enableDetailedCategorization = false,
             detailedCategoryPrefix = "b",
             timeZoneString = "America/New_York",
-            transferMatchWindowDays = 10L,
             txStyle = defaultStyle,
         )
 
@@ -1320,7 +1293,6 @@ internal class TransactionConverterTest {
             enableDetailedCategorization = false,
             detailedCategoryPrefix = "b",
             timeZoneString = "America/New_York",
-            transferMatchWindowDays = 10L,
             txStyle = defaultStyle,
         )
 
@@ -1359,7 +1331,6 @@ internal class TransactionConverterTest {
             enableDetailedCategorization = false,
             detailedCategoryPrefix = "b",
             timeZoneString = "America/New_York",
-            transferMatchWindowDays = 10L,
             txStyle = txStyle,
         )
 

@@ -43,7 +43,6 @@ internal class RetryIdempotencyTest {
         enableDetailedCategorization = false,
         detailedCategoryPrefix = "plaid-detailed-cat-",
         timeZoneString = "America/New_York",
-        transferMatchWindowDays = 3L,
         txStyle = TransactionStyleConfig(null),
     )
 
@@ -84,9 +83,9 @@ internal class RetryIdempotencyTest {
         assertThat(result.updates).isEmpty()
     }
 
-    /** Both legs are retried together: they pair up again into a transfer carrying both links, which Firefly refuses (409). */
+    /** Both legs are retried together after they were paired into a transfer: each is skipped, nothing is sent. */
     @Test
-    fun aRetriedPlaidPairThatBecameATransferIsSentWithBothLinksForTheDatabaseToRefuse() = runBlocking<Unit> {
+    fun aRetriedPlaidPairThatBecameATransferIsSkippedBothLegsAreRecorded() = runBlocking<Unit> {
         val withdrawal = PlaidFixtures.getPaymentTransaction(accountId = accountA, transactionId = "wd", amount = 50.0)
         val deposit = PlaidFixtures.getPaymentTransaction(accountId = accountB, transactionId = "dep", amount = -50.0)
 
@@ -95,7 +94,7 @@ internal class RetryIdempotencyTest {
             listOf(existing("ff1", listOf("dep", "wd"), TransactionTypeProperty.transfer)),
         )
 
-        assertThat(result.creates.single().tx.plaidLinks?.map { it.plaidTransactionId }).containsExactlyInAnyOrder("wd", "dep")
+        assertThat(result.creates).isEmpty()
         assertThat(result.updates).isEmpty()
     }
 
@@ -175,34 +174,26 @@ internal class RetryIdempotencyTest {
             .thenReturn(TransactionConverter.ConvertPollSyncResult(listOf(), listOf(), listOf()))
     }
 
-    /**
-     * An old create that could be a transfer leg is paired from ONE dated range read ending the day before the window
-     * (a link lookup only finds its own record, never the other leg); an old create that cannot pair is not read for.
-     */
+    /** U46: transfer legs are paired by the settled pair pass, so the poll reads no old Firefly history for them. */
     @Test
-    fun onlyOldCreatesThatMightPairAsATransferAreRangeRead() = runBlocking<Unit> {
+    fun thePollReadsNoOldFireflyHistoryForTransferLegs() = runBlocking<Unit> {
         val sequence = sequenceOf(Pair("tok", listOf(accountA)))
         val cursorMap = mutableMapOf<String, String>()
         val old = PlaidFixtures.getPaymentTransaction(accountId = accountA, transactionId = "old", pendingTransactionId = null, date = LocalDate.now().minusDays(400))
         val oldPlain = PlaidFixtures.getPaymentTransaction(accountId = accountA, transactionId = "oldPlain", pendingTransactionId = null, date = LocalDate.now().minusDays(500))
         val recent = PlaidFixtures.getPaymentTransaction(accountId = accountA, transactionId = "recent", pendingTransactionId = null, date = LocalDate.now())
         stubEmptyFirefly(PlaidTransactionResult(listOf(old, oldPlain, recent), listOf(), listOf()), sequence, cursorMap)
-        whenever(mockConverter.mightPairAsTransfer(old)).thenReturn(true)
 
         orchestrator().processTransactions(mapOf(accountA to 1), sequence, cursorMap)
 
-        val start = argumentCaptor<LocalDate>()
-        val end = argumentCaptor<LocalDate>()
-        verify(fireflyTransactionService, times(1)).fetchFireflyTransactionsBetween(start.capture(), end.capture(), any())
-        assertThat(start.firstValue).isEqualTo(LocalDate.now().minusDays(401))
-        assertThat(end.firstValue).isEqualTo(LocalDate.now().minusDays(6))
+        verify(fireflyTransactionService, org.mockito.kotlin.never()).fetchFireflyTransactionsBetween(any(), any(), any())
         val ids = argumentCaptor<Collection<String>>()
         verify(fireflyTransactionService).fetchMissingByPlaidId(ids.capture(), any())
-        assertThat(ids.firstValue).containsExactly("old")
+        assertThat(ids.firstValue).isEmpty()
     }
 
     @Test
-    fun noRangeReadIsMadeWhenNoOldCreateCanPair() = runBlocking<Unit> {
+    fun noRangeReadIsMadeForAnOldPlainCreate() = runBlocking<Unit> {
         val sequence = sequenceOf(Pair("tok", listOf(accountA)))
         val cursorMap = mutableMapOf<String, String>()
         val old = PlaidFixtures.getPaymentTransaction(accountId = accountA, transactionId = "old", pendingTransactionId = null, date = LocalDate.now().minusDays(400))
@@ -214,7 +205,7 @@ internal class RetryIdempotencyTest {
     }
 
     @Test
-    fun theLinkLookupCoversUpdatedRemovedPendingPostedAndPossibleTransferIds() = runBlocking<Unit> {
+    fun theLinkLookupCoversUpdatedRemovedPendingAndPostedIdsButNotPlainCreates() = runBlocking<Unit> {
         val sequence = sequenceOf(Pair("tok", listOf(accountA)))
         val cursorMap = mutableMapOf<String, String>()
         val leg = PlaidFixtures.getPaymentTransaction(accountId = accountA, transactionId = "leg", pendingTransactionId = null)
@@ -222,20 +213,19 @@ internal class RetryIdempotencyTest {
         val plain = PlaidFixtures.getPaymentTransaction(accountId = accountA, transactionId = "plain", pendingTransactionId = null)
         val modified = PlaidFixtures.getPaymentTransaction(accountId = accountA, transactionId = "mod", pendingTransactionId = null)
         stubEmptyFirefly(PlaidTransactionResult(listOf(leg, posted, plain), listOf(modified), listOf("gone")), sequence, cursorMap)
-        whenever(mockConverter.mightPairAsTransfer(leg)).thenReturn(true)
 
         orchestrator().processTransactions(mapOf(accountA to 1), sequence, cursorMap)
 
         val ids = argumentCaptor<Collection<String>>()
         // LAN-110: the stub finds nothing, so the posted create's pending id "pend" is looked up a second time
         verify(fireflyTransactionService, times(2)).fetchMissingByPlaidId(ids.capture(), any())
-        assertThat(ids.firstValue).containsExactlyInAnyOrder("mod", "gone", "pend", "posted", "leg")
+        assertThat(ids.firstValue).containsExactlyInAnyOrder("mod", "gone", "pend", "posted")
         assertThat(ids.secondValue).containsExactly("pend")
     }
 
-    /** R4 survivor: only the authorized date is before the window, and that is the date Firefly will carry. */
+    /** R4 survivor, U46: even a create whose authorized date is before the window causes no range read. */
     @Test
-    fun aCreateWhoseAuthorizedDateIsBeforeTheWindowIsReadByRangeToo() = runBlocking<Unit> {
+    fun aCreateWhoseAuthorizedDateIsBeforeTheWindowIsNotRangeReadEither() = runBlocking<Unit> {
         val sequence = sequenceOf(Pair("tok", listOf(accountA)))
         val cursorMap = mutableMapOf<String, String>()
         val create = PlaidFixtures.getPaymentTransaction(
@@ -243,11 +233,10 @@ internal class RetryIdempotencyTest {
             date = LocalDate.now(), authorizedDate = LocalDate.now().minusDays(20),
         )
         stubEmptyFirefly(PlaidTransactionResult(listOf(create), listOf(), listOf()), sequence, cursorMap)
-        whenever(mockConverter.mightPairAsTransfer(create)).thenReturn(true)
 
         orchestrator().processTransactions(mapOf(accountA to 1), sequence, cursorMap)
 
-        verify(fireflyTransactionService).fetchFireflyTransactionsBetween(eq(LocalDate.now().minusDays(21)), any(), any())
+        verify(fireflyTransactionService, org.mockito.kotlin.never()).fetchFireflyTransactionsBetween(any(), any(), any())
     }
 
     // endregion

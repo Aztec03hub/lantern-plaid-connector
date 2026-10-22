@@ -14,7 +14,7 @@ internal class ConverterNamesTest {
     private val converter = TransactionConverter(
         useNameForDestination = true, enablePrimaryCategorization = false, primaryCategoryPrefix = "p-",
         enableDetailedCategorization = false, detailedCategoryPrefix = "d-", timeZoneString = "America/Chicago",
-        transferMatchWindowDays = 3, txStyle = TransactionStyleConfig(null),
+        txStyle = TransactionStyleConfig(null),
     )
 
     private fun tx(name: String, merchant: String? = null, counterparty: String? = null) = PlaidFixtures.getTransaction(

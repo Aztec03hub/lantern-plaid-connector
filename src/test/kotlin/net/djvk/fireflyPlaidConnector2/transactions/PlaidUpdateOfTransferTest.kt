@@ -25,7 +25,6 @@ internal class PlaidUpdateOfTransferTest {
         enableDetailedCategorization = false,
         detailedCategoryPrefix = "b",
         timeZoneString = "America/New_York",
-        transferMatchWindowDays = 3L,
         txStyle = TransactionStyleConfig(null),
     )
 
