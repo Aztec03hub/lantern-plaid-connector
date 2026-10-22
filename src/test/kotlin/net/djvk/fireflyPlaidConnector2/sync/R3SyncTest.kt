@@ -292,6 +292,50 @@ internal class R3SyncTest {
         assertThat(result.partial).isTrue()
     }
 
+    /** N1: a create kept because the legacy search was rejected must stay abandoned, or a retry skips the legacy check. */
+    @Test
+    fun aCreateKeptBecauseTheLegacySearchWasRejectedStaysAbandonedAndIsNeverSentUnchecked() = runBlocking<Unit> {
+        emptyFirefly()
+        val store = DeadLetterStore(dir.toString())
+        whenever(helper.heldByLegacyReference(any())).doSuspendableAnswer { throw statusError(HttpStatusCode.UnprocessableEntity) }
+        whenever(plaidSyncService.processPlaidTransactions(any(), any())).thenReturn(plaidResult(updated = listOf(plaid(accountA, "tx1", 50.0))))
+        val orchestrator = orchestrator(service(store), store)
+        val sequence = sequenceOf(Pair("tok-12345678", listOf(accountA)))
+
+        val first = orchestrator.processTransactions(accountMap, sequence, mutableMapOf())
+        assertThat(first.deadLettersAbandoned).isEqualTo(1)
+
+        // the search now answers: an older import holds the id; the abandoned create must not be sent
+        whenever(helper.heldByLegacyReference(any())).thenReturn(true)
+        whenever(plaidSyncService.processPlaidTransactions(any(), any())).thenReturn(plaidResult())
+        orchestrator.processTransactions(accountMap, sequence, mutableMapOf())
+
+        verify(helper, never()).optimisticInsertBatchIntoFirefly(any())
+        assertThat(store.read().single().abandoned).isTrue()
+    }
+
+    /** M1: a waiting update/promotion letter takes Plaid's later values in its split and its fallback. */
+    @Test
+    fun aWaitingUpdateLetterTakesEachLaterModifiedEventOfItsPlaidId() = runBlocking<Unit> {
+        emptyFirefly()
+        val store = DeadLetterStore(dir.toString())
+        whenever(helper.updateBatchInFirefly(any())).doSuspendableAnswer { throw statusError(HttpStatusCode.UnprocessableEntity) }
+        store.add(DeadLetter("update", "ff1", "ff1", create("tx1", "50.0").tx, false, "x", fallback = create("tx1", "50.0").tx))
+        val orchestrator = orchestrator(service(store), store)
+        val sequence = sequenceOf(Pair("tok-12345678", listOf(accountA)))
+
+        for (amount in listOf(51.0, 52.0, 53.0)) {
+            whenever(plaidSyncService.processPlaidTransactions(any(), any())).thenReturn(plaidResult(updated = listOf(plaid(accountA, "tx1", amount))))
+            orchestrator.processTransactions(accountMap, sequence, mutableMapOf())
+        }
+
+        val letter = store.read().single()
+        assertThat(letter.operation).isEqualTo("update")
+        assertThat(letter.split?.amount).isEqualTo("53.0")
+        assertThat(letter.fallback?.amount).isEqualTo("53.0")
+        verify(helper, never()).optimisticInsertBatchIntoFirefly(any())
+    }
+
     @Test
     fun aModifiedPlaidTransactionWhoseCreateFailsWith503KeepsTheCursorWhereItWas() = runBlocking<Unit> {
         emptyFirefly()

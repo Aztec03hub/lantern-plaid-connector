@@ -541,6 +541,23 @@ class FireflyTransactionServiceTest {
     }
 
     @Test
+    fun aSwappedPairedUpdateLetterKeepsItsSwappedAccountsOnRetry() = runBlocking<Unit> {
+        val (store, service) = serviceWithStore()
+        val swapped = FireflyFixtures.getTransaction(
+            type = TransactionTypeProperty.transfer, sourceId = "20", destinationId = "11",
+            plaidLinks = listOf(PlaidLink("tx1", PlaidLinkLeg.source, "plaidB"), PlaidLink("tx2", PlaidLinkLeg.destination, "plaidA")),
+        ).transactions.first()
+        store.add(DeadLetter("update", "ff1", "ff1", swapped, false, "x"))
+
+        service.retryDeadLetters(mapOf("plaidA" to 11, "plaidB" to 20))
+
+        val sent = argumentCaptor<List<FireflyTransactionDto>>()
+        verify(syncHelper).updateBatchInFirefly(sent.capture())
+        assertThat(sent.firstValue.single().tx.sourceId).isEqualTo("20")
+        assertThat(sent.firstValue.single().tx.destinationId).isEqualTo("11")
+    }
+
+    @Test
     fun aRetriedLettersFallbackIsCreatedOnTheCurrentAccount() = runBlocking<Unit> {
         val (store, service) = serviceWithStore()
         val fb = splitOn("plaidA", TransactionTypeProperty.withdrawal, PlaidLinkLeg.single, "11", null)

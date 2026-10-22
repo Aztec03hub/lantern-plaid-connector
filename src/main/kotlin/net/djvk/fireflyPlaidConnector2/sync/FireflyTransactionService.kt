@@ -227,7 +227,7 @@ class FireflyTransactionService(
                 // A search Firefly rejects for good would stall every poll of this Item. Keep the create as an ABANDONED
                 //  letter (reported in the poll result, never auto-sent: it could duplicate an older import) and go on.
                 logger.error("Legacy search for Plaid id(s) $ids failed (HTTP $status); create kept as an abandoned dead letter: check it by hand")
-                store.add(DeadLetter("create", letterKey(create.tx), null, create.tx, false, "legacy search failed: HTTP $status", abandoned = true))
+                store.add(DeadLetter("create", letterKey(create.tx), null, create.tx, false, "legacy search failed: HTTP $status", abandoned = true, legacyUnchecked = true))
                 return false
             }
             if (legacy != null) {
