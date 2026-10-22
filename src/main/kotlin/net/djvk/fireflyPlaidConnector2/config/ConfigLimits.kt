@@ -1,6 +1,9 @@
 package net.djvk.fireflyPlaidConnector2.config
 
 import org.slf4j.LoggerFactory
+import java.nio.file.Files
+import java.nio.file.Path
+import java.nio.file.attribute.PosixFilePermissions
 import org.springframework.core.env.Environment
 import org.springframework.stereotype.Component
 
@@ -55,12 +58,37 @@ internal fun configProblems(get: (String) -> String?): List<String> {
     return problems
 }
 
+/**
+ * One warning per existing path that has a GROUP or OTHERS permission bit set (file name and mode only, never contents or
+ * the directory). Skips missing paths and filesystems without POSIX permissions. Warn-only: the caller never fails on it.
+ */
+internal fun permissionWarnings(paths: List<Path>): List<String> = paths.mapNotNull { p ->
+    val perms = try {
+        if (Files.exists(p)) Files.getPosixFilePermissions(p) else return@mapNotNull null
+    } catch (e: UnsupportedOperationException) {
+        return@mapNotNull null
+    } catch (e: java.io.IOException) {
+        return@mapNotNull null
+    }
+    val open = perms.any { it.name.startsWith("GROUP") || it.name.startsWith("OTHERS") }
+    if (open) "${p.fileName} is readable by group or others (mode ${PosixFilePermissions.toString(perms)}); it holds credentials, chmod 600" else null
+}
+
+/** Files named in `spring.config.location` / `additional-location` (comma separated, `optional:` and `file:` prefixes stripped); directories are skipped. */
+internal fun configFilePaths(vararg locations: String?): List<Path> = locations.filterNotNull().flatMap { it.split(",") }
+    .map { it.trim().removePrefix("optional:").removePrefix("file:") }.filter { it.isNotEmpty() }
+    .map { Path.of(it) }.filter { Files.isRegularFile(it) }
+
 /** Fails the Spring context at startup, with every problem at once, instead of an hour into the nightly. */
 @Component
 class ConfigLimits(env: Environment) {
     init {
         val problems = configProblems(env::getProperty)
         check(problems.isEmpty()) { "Invalid configuration:\n" + problems.joinToString("\n") }
+        val files = configFilePaths(env.getProperty("spring.config.location"), env.getProperty("spring.config.additional-location"))
+        val dir = env.getProperty(P + "polled.cursorFileDirectoryPath")?.let { Path.of(it) }
+        val log = LoggerFactory.getLogger(ConfigLimits::class.java)
+        permissionWarnings(files + listOfNotNull(dir)).forEach { log.warn(it) }
         val url = env.getProperty(P + "firefly.url")
         if (url != null && !url.startsWith("https://") && !Regex("^http://(localhost|127\\.0\\.0\\.1|\\[::1])([:/]|$)").containsMatchIn(url)) {
             LoggerFactory.getLogger(ConfigLimits::class.java)

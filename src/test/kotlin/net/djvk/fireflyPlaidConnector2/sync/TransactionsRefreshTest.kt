@@ -11,6 +11,7 @@ import net.djvk.fireflyPlaidConnector2.api.ApiConfiguration
 import net.djvk.fireflyPlaidConnector2.api.plaid.PlaidApiWrapper
 import net.djvk.fireflyPlaidConnector2.transactions.TransactionConverter
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.io.TempDir
 import org.mockito.kotlin.any
 import org.mockito.kotlin.eq
 import org.mockito.kotlin.mock
@@ -100,5 +101,43 @@ internal class TransactionsRefreshTest {
         orchestrator.refreshItemsDue(items, t0.plusSeconds(61 * 60))
         verify(plaidSyncService, times(2)).refreshTransactions(eq("token-a"))
         verify(plaidSyncService, times(2)).refreshTransactions(eq("token-b"))
+    }
+
+    @TempDir
+    lateinit var dir: java.nio.file.Path
+
+    private fun storeAndOrchestrator(): Pair<RefreshTimeStore, PolledSyncOrchestrator> {
+        val store = RefreshTimeStore(dir.toString(), ItemStatusStore(dir.toString()))
+        return store to PolledSyncOrchestrator(
+            30, mock<SyncHelper>(), mock<CursorManager>(), plaidSyncService, mock<FireflyTransactionService>(),
+            mock<TransactionConverter>(), refreshIntervalMinutes = 60, refreshTimeStore = store,
+        )
+    }
+
+    @Test
+    fun twoRunsInsideTheIntervalRefreshOnce() = runBlocking<Unit> {
+        val one = sequenceOf(Pair("token-a", listOf("acct1")))
+        storeAndOrchestrator().second.refreshItemsDue(one, t0)
+        storeAndOrchestrator().second.refreshItemsDue(one, t0.plusSeconds(30 * 60))
+        verify(plaidSyncService, times(1)).refreshTransactions(eq("token-a"))
+        storeAndOrchestrator().second.refreshItemsDue(one, t0.plusSeconds(61 * 60))
+        verify(plaidSyncService, times(2)).refreshTransactions(eq("token-a"))
+    }
+
+    @Test
+    fun theRefreshFileHoldsNoAccessToken() = runBlocking<Unit> {
+        val (store, orchestrator) = storeAndOrchestrator()
+        orchestrator.refreshItemsDue(sequenceOf(Pair("token-a", listOf("acct1"))), t0)
+        val text = java.nio.file.Files.readString(store.path)
+        assertFalse(text.contains("token-a"))
+        assertTrue(text.contains(ItemStatusStore(dir.toString()).itemId("token-a")))
+    }
+
+    @Test
+    fun anUnreadableRefreshFileDoesNotStopTheRefresh() = runBlocking<Unit> {
+        val (store, orchestrator) = storeAndOrchestrator()
+        java.nio.file.Files.writeString(store.path, "{not json")
+        orchestrator.refreshItemsDue(sequenceOf(Pair("token-a", listOf("acct1"))), t0)
+        verify(plaidSyncService, times(1)).refreshTransactions(eq("token-a"))
     }
 }

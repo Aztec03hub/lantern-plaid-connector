@@ -1,7 +1,9 @@
 package net.djvk.fireflyPlaidConnector2.config
 
 import org.assertj.core.api.Assertions.assertThat
+import org.junit.jupiter.api.Assumptions.assumeTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.io.TempDir
 import org.junit.jupiter.api.assertThrows
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.CsvSource
@@ -88,5 +90,34 @@ class ConfigLimitsTest {
     @Test
     fun `thresholds above ten are accepted`() {
         assertThat(problems("pair.autoMin" to "12", "pair.reviewMin" to "8")).isEmpty()
+    }
+
+    @TempDir
+    lateinit var tmp: java.nio.file.Path
+
+    private fun fileWithMode(name: String, mode: String): java.nio.file.Path {
+        assumeTrue(java.nio.file.FileSystems.getDefault().supportedFileAttributeViews().contains("posix"))
+        val f = tmp.resolve(name)
+        java.nio.file.Files.writeString(f, "secret-content")
+        java.nio.file.Files.setPosixFilePermissions(f, java.nio.file.attribute.PosixFilePermissions.fromString(mode))
+        return f
+    }
+
+    @ParameterizedTest
+    @CsvSource("rw-r--r--", "rw-r-----", "rw----r--")
+    fun `a group or others readable file gets one warning with the file name only`(mode: String) {
+        val w = permissionWarnings(listOf(fileWithMode("app.yml", mode)))
+        assertThat(w).singleElement().asString().startsWith("app.yml is readable by group or others").contains(mode).doesNotContain("secret-content").doesNotContain(tmp.toString())
+    }
+
+    @Test
+    fun `an owner only file and a missing path give no warning`() {
+        assertThat(permissionWarnings(listOf(fileWithMode("ok.yml", "rw-------"), tmp.resolve("missing.yml")))).isEmpty()
+    }
+
+    @Test
+    fun `config locations are split and stripped and directories skipped`() {
+        val f = tmp.resolve("a.yml").also { java.nio.file.Files.writeString(it, "x") }
+        assertThat(configFilePaths("optional:file:$f, $tmp", null)).containsExactly(f)
     }
 }
