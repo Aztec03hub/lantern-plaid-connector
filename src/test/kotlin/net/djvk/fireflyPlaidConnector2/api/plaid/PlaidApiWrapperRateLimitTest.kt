@@ -98,4 +98,10 @@ internal class PlaidApiWrapperRateLimitTest {
         assertThrows<ClientRequestException> { call(wrapper(cap = 40) { HttpStatusCode.BadRequest to """{"error_code":"RATE_LIMIT"}""" }) }
         assertThat(calls).isEqualTo(1)
     }
+
+    @Test
+    fun a400RateLimitDoesNotMakeALater429BoundOnThePollPath() {
+        call(wrapper(cap = 0) { if (it == 1) limited400 else if (it <= 6) limited else ok }, bound = false)  // maxRetries is 3
+        assertThat(calls).isEqualTo(7)
+    }
 }
