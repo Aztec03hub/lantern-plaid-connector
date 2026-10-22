@@ -60,6 +60,17 @@ internal class LiabilityPairTest {
         }
     }
 
+    /** U46: the import no longer types a pair, but the pair pass still does; one cell per kind combination (Firefly 6.7.7 rules). */
+    @Test
+    fun pairedTransactionTypeFollowsFirefliesTableForEveryKindCombination() {
+        val a = AccountKind.ASSET
+        val l = AccountKind.LIABILITY
+        assertThat(pairedTransactionType(a, a)).isEqualTo(TransactionTypeProperty.transfer)
+        assertThat(pairedTransactionType(a, l)).isEqualTo(TransactionTypeProperty.withdrawal)
+        assertThat(pairedTransactionType(l, a)).isEqualTo(TransactionTypeProperty.deposit)
+        assertThat(pairedTransactionType(l, l)).isEqualTo(TransactionTypeProperty.transfer)
+    }
+
     /** U46 (was: a manual withdrawal paired with a liability leg at import): the manual single is left alone, the leg is a single. */
     @Test
     fun aManualWithdrawalIsLeftAloneWhenALiabilityLegArrives() = runBlocking<Unit> {

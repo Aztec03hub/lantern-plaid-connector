@@ -169,7 +169,7 @@ class RepairPlanner(
             if (split.type == TransactionTypeProperty.openingBalance) continue
             val links = split.plaidLinks.orEmpty()
             if (links.isEmpty()) continue
-            // A pair carries the destination leg's date (that leg has the best categorization, see convertDoublePlaid);
+            // A pair carries the destination leg's date (that leg has the best categorization);
             //  when that leg is not in Plaid's history the source leg's record is used
             // A merged transfer (core's pair merge) keeps the OUT leg's date, and the merged journal has the same two links as a
             //  connector-made pair; so a pair whose stored date is already one of its own legs' posted instants is left on that leg.
