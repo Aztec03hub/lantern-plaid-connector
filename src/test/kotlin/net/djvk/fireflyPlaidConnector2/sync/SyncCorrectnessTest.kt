@@ -76,7 +76,7 @@ internal class SyncCorrectnessTest {
                 page(totalPages, it.getArgument<Int>(0))
             }
         }
-        return FireflyTransactionService(txApi, mock(), 5, "UTC", mock())
+        return FireflyTransactionService(txApi, mock(), 5, "UTC", mock(), maxReadPages = 20)
     }
 
     @Test
