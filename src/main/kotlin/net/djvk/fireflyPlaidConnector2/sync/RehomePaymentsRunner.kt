@@ -22,6 +22,12 @@ import java.math.BigDecimal
 import java.time.LocalDate
 import java.time.OffsetDateTime
 
+/** Appends [line] and fsyncs, so a crash right after cannot lose the undo record. */
+internal fun appendDurably(file: File, line: String) {
+    file.absoluteFile.parentFile.mkdirs()
+    java.io.FileOutputStream(file, true).use { it.write(line.toByteArray()); it.fd.sync() }
+}
+
 /** One withdrawal to an outside payee that a rule matches; [to] is null when the rule cannot route it. */
 data class PaymentMove(val journalId: String, val splitId: String?, val date: LocalDate, val cents: Long, val description: String, val from: Int, val oldDestination: String?, val to: Int?, val link: PlaidLink)
 
@@ -117,8 +123,8 @@ class RehomePaymentsRunner(
         return out
     }
 
-    private fun log(vararg fields: Pair<String, Any?>) = logFile.also { it.absoluteFile.parentFile.mkdirs() }
-        .appendText(mapper.writeValueAsString(linkedMapOf<String, Any?>(*fields, "at" to OffsetDateTime.now().toString())) + "\n")
+    private fun log(vararg fields: Pair<String, Any?>) =
+        appendDurably(logFile, mapper.writeValueAsString(linkedMapOf<String, Any?>(*fields, "at" to OffsetDateTime.now().toString())) + "\n")
 
     /** Each move logs an `intent` line first and a `done` line after the update succeeded, so a failed update is not mistaken for a move. */
     internal suspend fun applyPlan(plan: List<PaymentMove>) {
@@ -139,31 +145,65 @@ class RehomePaymentsRunner(
         }
     }
 
-    /** `rehome.reverse=true`: puts every `done` move back, newest first, and logs a `reversed` line for each. */
+    /**
+     * `rehome.reverse=true`: puts every `done` move back, and every OPEN `intent` (no later `done` for its journal and split: a crash after
+     * the update), newest first, and logs a `reversed` line for each. Before writing, the journal is read: it is put back only while its
+     * destination is still the one the move set and its link leg is `source`; otherwise somebody edited it (or the update never landed)
+     * and it is left alone and reported. A skipped line writes no log line, so the next reverse reports it again.
+     */
     internal suspend fun reverseLog() {
         val lines = if (logFile.exists()) logFile.readLines().filter { it.isNotBlank() }.map { mapper.readTree(it) } else listOf()
-        // N11: a `reversed` line names the `done` line it undid by that line's `at`, so a move made AFTER a reverse is reversed next time
-        // W5: an old `reversed` line (no `undoes`) covers every earlier `done` line of the same journal and split, the old rule
+        fun key(l: com.fasterxml.jackson.databind.JsonNode) = l["journal"]?.asText() + "|" + l["split"]?.takeIf { !it.isNull }?.asText()
+        // N11: a `reversed` line names the line it undid by that line's `at`, so a move made AFTER a reverse is reversed next time
+        // W5: an old `reversed` line (no `undoes`) covers every earlier line of the same journal and split, the old rule
         val reversedLines = lines.withIndex().filter { it.value["status"]?.asText() == "reversed" }
         val undone = reversedLines.mapNotNull { it.value["undoes"]?.asText() }.toSet()
         fun coveredByOldReverse(i: Int, l: com.fasterxml.jackson.databind.JsonNode) = reversedLines.any { (j, r) ->
             j > i && r["undoes"] == null && r["journal"]?.asText() == l["journal"]?.asText() && r["split"]?.asText() == l["split"]?.asText()
         }
-        val todo = lines.withIndex().filter { (i, l) -> l["status"]?.asText() == "done" && l["at"]?.asText() !in undone && !coveredByOldReverse(i, l) }.map { it.value }.reversed()
-        println("== Reverse: ${todo.size} moves to put back")
-        todo.forEach { println("   journal ${it["journal"].asText()}: back to destination ${it["oldDestination"].asText()} and leg ${it["oldLeg"].asText()}") }
-        if (!apply) { println("DRY RUN: nothing was changed. Add --fireflyPlaidConnector2.repair.apply=true to apply."); return }
+        fun openIntent(i: Int, l: com.fasterxml.jackson.databind.JsonNode) =
+            l["status"]?.asText() == "intent" && lines.withIndex().none { (j, d) -> j > i && d["status"]?.asText() == "done" && key(d) == key(l) }
+        val todo = lines.withIndex()
+            .filter { (i, l) -> (l["status"]?.asText() == "done" || openIntent(i, l)) && l["at"]?.asText() !in undone && !coveredByOldReverse(i, l) }
+            .map { it.value }.reversed()
+        println("== Reverse: ${todo.size} candidate moves")
+        // the destination and leg we expect to find per journal and split; first use reads Firefly, then each reversal updates it
+        val state = mutableMapOf<String, Pair<String?, PlaidLinkLeg?>>()
+        var reversed = 0
         for (e in todo) {
+            val j = e["journal"].asText()
+            val open = e["status"].asText() == "intent"
             val old = e["oldDestination"]?.takeIf { !it.isNull }?.asText()
-            if (old == null) { println("   journal ${e["journal"].asText()} had no destination id; not reversed"); continue }
-            val link = PlaidLink(e["plaidTx"].asText(), PlaidLinkLeg.valueOf(e["oldLeg"].asText()), e["plaidAccount"]?.takeIf { !it.isNull }?.asText())
-            fireflyTxApi.updateTransaction(
-                e["journal"].asText(),
-                TransactionUpdate(applyRules = false, fireWebhooks = false, transactions = listOf(TransactionSplitUpdate(transactionJournalId = e["split"]?.takeIf { !it.isNull }?.asText(), destinationId = old, plaidLinks = listOf(link)))),
-            )
-            log("status" to "reversed", "journal" to e["journal"].asText(), "split" to e["split"]?.takeIf { !it.isNull }?.asText(), "undoes" to e["at"].asText())
+            if (old == null) { println("   journal $j had no destination id; not reversed"); continue }
+            val splitId = e["split"]?.takeIf { !it.isNull }?.asText()
+            val expected = state.getOrPut(key(e)) {
+                val splits = fireflyTxApi.getTransaction(j).body().data.attributes.transactions
+                val sp = if (splitId == null) splits.singleOrNull() else splits.firstOrNull { it.transactionJournalId == splitId }
+                Pair(sp?.destinationId, sp?.plaidLinks.orEmpty().singleOrNull()?.leg)
+            }
+            val newDest = e["newDestination"].asText()
+            if (expected.first != newDest || expected.second != PlaidLinkLeg.source) {
+                println(
+                    if (open && expected.first != newDest) "   journal $j: intent only, not moved; nothing to reverse"
+                    else "   journal $j: destination is now ${expected.first}, expected $newDest (link leg ${expected.second}); edited since the move, not reversed",
+                )
+                continue
+            }
+            val oldLeg = PlaidLinkLeg.valueOf(e["oldLeg"].asText())
+            println("   journal $j: ${if (apply) "back" else "would go back"} to destination $old and leg ${oldLeg.value}${if (open) " (recovered: moved but never logged done)" else ""}")
+            if (apply) {
+                val link = PlaidLink(e["plaidTx"].asText(), oldLeg, e["plaidAccount"]?.takeIf { !it.isNull }?.asText())
+                fireflyTxApi.updateTransaction(
+                    j,
+                    TransactionUpdate(applyRules = false, fireWebhooks = false, transactions = listOf(TransactionSplitUpdate(transactionJournalId = splitId, destinationId = old, plaidLinks = listOf(link)))),
+                )
+                log("status" to "reversed", "journal" to j, "split" to splitId, "undoes" to e["at"].asText())
+                reversed++
+            }
+            state[key(e)] = Pair(old, oldLeg)
         }
-        println("REVERSED ${todo.size} moves.")
+        if (!apply) { println("DRY RUN: nothing was changed. Add --fireflyPlaidConnector2.repair.apply=true to apply."); return }
+        println("REVERSED $reversed moves.")
     }
 
     private fun print(plan: List<PaymentMove>) {

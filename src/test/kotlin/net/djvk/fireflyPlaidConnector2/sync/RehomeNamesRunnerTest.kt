@@ -2,7 +2,21 @@ package net.djvk.fireflyPlaidConnector2.sync
 
 import kotlinx.coroutines.runBlocking
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.AccountsApi
+import net.djvk.fireflyPlaidConnector2.api.firefly.apis.RecurrencesApi
+import net.djvk.fireflyPlaidConnector2.api.firefly.apis.RulesApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.TransactionsApi
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.Recurrence
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.RecurrenceArray
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.RecurrenceRead
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.RecurrenceTransaction
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.Rule
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.RuleAction
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.RuleActionKeyword
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.RuleArray
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.RuleRead
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.RuleTrigger
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.RuleTriggerKeyword
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.RuleTriggerType
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.Account
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.AccountArray
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.AccountRead
@@ -47,6 +61,10 @@ internal class RehomeNamesRunnerTest {
     private val accountsApi = mock<AccountsApi>()
     private val txApi = mock<TransactionsApi>()
     private val syncHelper = mock<SyncHelper>()
+    private val rulesApi = mock<RulesApi>()
+    private val recurrencesApi = mock<RecurrencesApi>()
+    private var rules = listOf<RuleRead>()
+    private var recurrences = listOf<RecurrenceRead>()
 
     private val paycheck = listOf(
         "EVOLV CONSULTING",
@@ -148,6 +166,8 @@ internal class RehomeNamesRunnerTest {
             ff.journals.getOrPut(to) { mutableListOf() }.add(old)
             createFireflyResponse(net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionSingle(old))
         }
+        whenever(rulesApi.listRule(anyOrNull())).doSuspendableAnswer { createFireflyResponse(RuleArray(rules, Meta(), PageLink())) }
+        whenever(recurrencesApi.listRecurrence(anyOrNull())).doSuspendableAnswer { createFireflyResponse(RecurrenceArray(recurrences, Meta(), PageLink())) }
         whenever(accountsApi.renameAccount(any(), any())).doSuspendableAnswer {
             val id = it.getArgument<String>(0).toInt()
             ff.accounts[id] = it.getArgument<String>(1) to ff.accounts.getValue(id).second
@@ -163,7 +183,7 @@ internal class RehomeNamesRunnerTest {
 
     @TempDir lateinit var dir: java.io.File
 
-    private fun runner(apply: Boolean) = RehomeNamesRunner(syncHelper, accountsApi, txApi, converter, apply, dir.path)
+    private fun runner(apply: Boolean) = RehomeNamesRunner(syncHelper, accountsApi, txApi, converter, rulesApi, recurrencesApi, apply, dir.path)
 
     private fun paycheckFirefly() = Firefly(
         mutableMapOf(1 to ("EVOLV CONSULTING" to AccountTypeFilter.revenue), 2 to (paycheck[1] to AccountTypeFilter.revenue), 3 to (paycheck[2] to AccountTypeFilter.revenue)),
@@ -279,6 +299,121 @@ internal class RehomeNamesRunnerTest {
         // an account the fake refuses to delete: every delete leaves it in place
         runBlocking { whenever(accountsApi.deleteAccount(any())).doSuspendableAnswer { createFireflyResponse(Unit) } }
         assertThatThrownBy { runner(true).run() }.hasMessageContaining("groups of duplicate accounts are left")
+    }
+
+    // endregion
+
+    // region rules and recurrences keep a duplicate alive
+
+    private fun rule(title: String, trigger: Pair<RuleTriggerKeyword, String>? = null, action: Pair<RuleActionKeyword, String>? = null) = RuleRead(
+        "rules", title, Rule(
+            title, "1", RuleTriggerType.storeMinusJournal,
+            listOfNotNull(trigger?.let { RuleTrigger(it.first, it.second) }),
+            listOfNotNull(action?.let { RuleAction(it.first, it.second) }),
+        ), ObjectLink(),
+    )
+
+    private fun recurrence(id: String, source: String? = null, destination: String? = null) = RecurrenceRead(
+        "recurrences", id, Recurrence(transactions = listOf(RecurrenceTransaction("d", "1.00", sourceId = source, destinationId = destination))), ObjectLink(),
+    )
+
+    private fun log() = java.io.File(dir, "rehome_names_log.jsonl").readLines()
+
+    private fun applyBlocked(): MutableList<String> {
+        val deleted = mutableListOf<String>()
+        wire(paycheckFirefly(), deleted)
+        runBlocking { runner(true).applyPlan(runner(true).readPlan()) }
+        return deleted
+    }
+
+    @Test
+    fun aRuleThatNamesTheDuplicateKeepsItFromTheDelete() {
+        rules = listOf(rule("Paycheck", trigger = RuleTriggerKeyword.fromAccountIs to "evolv consulting"))  // duplicate 1 is EVOLV CONSULTING
+        val deleted = applyBlocked()
+        assertThat(deleted).containsExactly("3")
+        assertThat(log().filter { it.contains("\"op\":\"delete-skipped\"") }.single()).contains("rule \\\"Paycheck\\\"").contains("\"account\":\"1\"")
+    }
+
+    @Test
+    fun aRuleActionNamingTheDuplicateAlsoBlocks() {
+        rules = listOf(rule("Route", action = RuleActionKeyword.setDestinationAccount to "Evolv Consulting"))
+        assertThat(applyBlocked()).containsExactly("3")
+    }
+
+    @Test
+    fun aStartsWithTriggerMatchesByPrefixAndAnUnrelatedRuleDoesNot() {
+        rules = listOf(
+            rule("Prefix", trigger = RuleTriggerKeyword.fromAccountStarts to "AC EVOLV"),
+            rule("Other", trigger = RuleTriggerKeyword.fromAccountIs to "Some Other Payee"),
+            rule("Not account", trigger = RuleTriggerKeyword.descriptionIs to "EVOLV CONSULTING"),
+        )
+        assertThat(applyBlocked()).containsExactly("1")  // only duplicate 3 starts with the prefix
+    }
+
+    @Test
+    fun aRecurrenceUsingTheDuplicateByIdBlocks() {
+        recurrences = listOf(recurrence("r1", destination = "1"), recurrence("r2", source = "3"), recurrence("r3", destination = "99"))
+        assertThat(applyBlocked()).isEmpty()
+        recurrences = listOf(recurrence("r3", destination = "99"))
+        assertThat(applyBlocked()).containsExactlyInAnyOrder("1", "3")
+    }
+
+    @Test
+    fun aDryRunListsTheBlockedDuplicateAndWritesNothing() {
+        rules = listOf(rule("Paycheck", trigger = RuleTriggerKeyword.fromAccountIs to "EVOLV CONSULTING"))
+        wire(paycheckFirefly())
+        val out = captureOut { runner(false).run() }
+        assertThat(out).contains("KEEP 1").contains("rule \"Paycheck\"")
+        assertThat(java.io.File(dir, "rehome_names_log.jsonl")).doesNotExist()
+        runBlocking { verify(accountsApi, never()).deleteAccount(any()) }
+    }
+
+    @Test
+    fun theRunDoesNotFailWhenTheOnlyLeftoverIsAKeptDuplicate() {
+        rules = listOf(rule("Paycheck", trigger = RuleTriggerKeyword.fromAccountIs to "EVOLV CONSULTING"))
+        wire(paycheckFirefly())
+        val out = captureOut { runner(true).run() }
+        assertThat(out).contains("KEPT 1 accounts")
+    }
+
+    @Test
+    fun aKeptDuplicateDoesNotHideAnotherGroupThatIsLeft() {
+        rules = listOf(rule("Paycheck", trigger = RuleTriggerKeyword.fromAccountIs to "EVOLV CONSULTING"))
+        wire(paycheckFirefly())
+        runBlocking { whenever(accountsApi.deleteAccount(any())).doSuspendableAnswer { createFireflyResponse(Unit) } }  // duplicate 3 stays too
+        assertThatThrownBy { captureOut { runner(true).run() } }.hasMessageContaining("groups of duplicate accounts are left")
+    }
+
+    @Test
+    fun aRuleAddedAfterThePlanIsStillSeenAtDeleteTime() {
+        val deleted = mutableListOf<String>()
+        wire(paycheckFirefly(), deleted)
+        var calls = 0
+        runBlocking {
+            whenever(rulesApi.listRule(anyOrNull())).doSuspendableAnswer {
+                val named = if (++calls == 1) listOf() else listOf(rule("Late", trigger = RuleTriggerKeyword.fromAccountIs to paycheck[2]))
+                createFireflyResponse(RuleArray(named, Meta(), PageLink()))
+            }
+        }
+        runBlocking { runner(true).applyPlan(runner(true).readPlan()) }
+        assertThat(deleted).containsExactly("1")  // the rule appeared before duplicate 3's delete
+    }
+
+    @Test
+    fun anUnreadableRuleListStopsBeforeAnyDelete() {
+        val deleted = mutableListOf<String>()
+        wire(paycheckFirefly(), deleted)
+        runBlocking { whenever(rulesApi.listRule(anyOrNull())).doSuspendableAnswer { error("500 rules") } }
+        assertThatThrownBy { runBlocking { runner(true).applyPlan(runner(true).readPlan()) } }.hasMessageContaining("500 rules")
+        assertThat(deleted).isEmpty()
+    }
+
+    private fun captureOut(block: () -> Unit): String {
+        val old = System.out
+        val buf = java.io.ByteArrayOutputStream()
+        System.setOut(java.io.PrintStream(buf, true))
+        try { block() } finally { System.setOut(old) }
+        return buf.toString()
     }
 
     // endregion
