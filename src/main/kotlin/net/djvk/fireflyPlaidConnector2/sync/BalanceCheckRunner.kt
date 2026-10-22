@@ -30,10 +30,12 @@ private fun money(x: BigDecimal?) = x?.setScale(2, RoundingMode.HALF_UP)?.toPlai
  * type alone decides (a card is negative in Firefly whether it is an asset or a liability, see BatchSyncRunner.carriesOwedAsNegative).
  * gap = fireflyPosted - plaidSigned; `ok` while abs(gap) <= tolerance.
  */
-fun compareBalances(account: Int, plaidType: String, fireflyPosted: BigDecimal, plaidCurrent: BigDecimal, tolerance: BigDecimal): BalanceResult {
+fun compareBalances(account: Int, plaidType: String, fireflyPosted: BigDecimal, plaidCurrent: BigDecimal, tolerance: BigDecimal, fireflyWithPending: BigDecimal = fireflyPosted): BalanceResult {
     val plaid = if (plaidType == "credit" || plaidType == "loan") plaidCurrent.negate() else plaidCurrent
-    val gap = fireflyPosted - plaid
-    return BalanceResult(account, plaidType, if (gap.abs() > tolerance) "gap" else "ok", fireflyPosted, plaid, gap)
+    // Institutions differ on whether Plaid `current` includes pending: a gap counts only if it is unexplained both ways,
+    // and the smaller of the two is the one reported.
+    val (firefly, gap) = listOf(fireflyPosted, fireflyWithPending).map { it to it - plaid }.minBy { it.second.abs() }
+    return BalanceResult(account, plaidType, if (gap.abs() > tolerance) "gap" else "ok", firefly, plaid, gap)
 }
 
 /**
@@ -105,7 +107,7 @@ class BalanceCheckRunner(
                 val b = accounts[pid]
                 val current = b?.balances?.current
                 results.add(if (b == null || current == null) BalanceResult(fid, b?.type?.value ?: previous[fid]?.plaidType ?: "unknown", "missing")
-                else compareBalances(fid, b.type.value, fireflyPosted(fid, now), BigDecimal.valueOf(current), tolerance))
+                else fireflyBalances(fid, now).let { (withPending, posted) -> compareBalances(fid, b.type.value, posted, BigDecimal.valueOf(current), tolerance, withPending) })
             }
         }
         val entries = mergeFirstSeen(previous, results.sortedBy { it.account }, now)
@@ -117,10 +119,10 @@ class BalanceCheckRunner(
         }
     }
 
-    /** Firefly's balance includes the importer's pending-tagged rows; Plaid `current` is posted, so back them out (D2). */
-    private suspend fun fireflyPosted(id: Int, now: LocalDate): BigDecimal {
+    /** (with pending, posted): Firefly's balance includes the importer's pending-tagged rows; posted backs them out. Both are compared (see compareBalances). */
+    private suspend fun fireflyBalances(id: Int, now: LocalDate): Pair<BigDecimal, BigDecimal> {
         val current = BigDecimal(fireflyAccountsApi.getAccount(id.toString(), null).body().data.attributes.currentBalance ?: error("Firefly has no balance for account $id"))
-        if (pendingTag.isBlank()) return current
+        if (pendingTag.isBlank()) return current to current
         val from = now.minusDays(pendingLookbackDays.toLong())
         var pending = BigDecimal.ZERO
         var page = 1
@@ -135,6 +137,6 @@ class BalanceCheckRunner(
             val p = body.meta.pagination
             if (p == null || p.currentPage >= p.totalPages) break
         }
-        return current - pending
+        return current to current - pending
     }
 }
