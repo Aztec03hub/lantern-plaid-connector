@@ -138,7 +138,7 @@ class LoanInterestRunner(
         if (!apply || lagDirectory.isBlank()) return listOf()
         val file = File(lagDirectory, "loan-lag.json")
         val old: Map<String, String> = if (file.exists()) try {
-            ObjectMapper().readValue(file, Map::class.java).entries.associate { it.key.toString() to it.value.toString() }
+            (ObjectMapper().readValue(file, Map::class.java) ?: throw com.fasterxml.jackson.core.JsonParseException(null, "document is null")).entries.associate { it.key.toString() to it.value.toString() }
         } catch (e: com.fasterxml.jackson.core.JsonProcessingException) {
             // U03: keep the bad file for a person; if the move throws, the loan step fails loudly and nothing is overwritten
             val aside = moveAside(file.toPath())
