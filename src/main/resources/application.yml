@@ -127,6 +127,10 @@ fireflyPlaidConnector2:
     # How many transactions are created in Firefly at once within one sync. Firefly takes 0.2-1.5 s per create, so the
     #  writes are the slow part of a big import. Set 1 to write one at a time. Updates and deletes are always sequential.
     writeConcurrency: 8
+    # Failsafes for the read of Firefly transactions in the pull window. maxReadPages only guards an infinite loop;
+    #  maxRangeTransactions (from Firefly's total, whatever its page size) is the real ceiling.
+    maxReadPages: 1000
+    maxRangeTransactions: 200000
   plaid:
 #    url: https://production.plaid.com
 #    clientId: HI I'M A CLIENT ID
