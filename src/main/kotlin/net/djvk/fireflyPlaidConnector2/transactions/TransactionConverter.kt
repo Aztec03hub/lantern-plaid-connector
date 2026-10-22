@@ -653,7 +653,7 @@ class TransactionConverter(
                 fallbackOnlyWhenGone = true, // a 422 leaves the pending leg holding the money
             )
         }
-        if (existingSplit.type != getFireflyTransactionDtoType(posted, false)) {
+        if (existingSplit.type != getFireflyTransactionDtoType(posted)) {
             logger.debug(
                 "Not updating pending Firefly transaction {} in place: type {} differs from posted type",
                 target.id, existingSplit.type,
@@ -956,7 +956,6 @@ class TransactionConverter(
         }
         return convert(
             tx = tx,
-            isPair = false,
             sourceId = sourceId,
             sourceName = sourceName,
             destinationId = destinationId,
@@ -991,7 +990,6 @@ class TransactionConverter(
      */
     protected suspend fun convert(
         tx: PlaidTransaction,
-        isPair: Boolean,
         sourceId: String? = null,
         sourceName: String? = null,
         destinationId: String? = null,
@@ -1012,7 +1010,7 @@ class TransactionConverter(
             null
         }
         val split = TransactionSplit(
-            getFireflyTransactionDtoType(tx, isPair, sourceId, destinationId),
+            getFireflyTransactionDtoType(tx),
             // The Firefly date is the POSTED date, so balances match what the bank shows; the authorized (purchase)
             //  date is kept in book_date.
             postedTime,
@@ -1076,35 +1074,10 @@ class TransactionConverter(
 
     /**
      * [Firefly transaction types](https://docs.firefly-iii.org/firefly-iii/support/transaction_types/)
-     * See [getPlaidAmount] for sort of the inverse of this.
-     *
-     * @param isPair True if [t] is part of a pair of offsetting Plaid transactions, false otherwise.
-     * @param sourceId @param destinationId the Firefly account ids of the pair; they decide whether it is a transfer
+     * See [getPlaidAmount] for sort of the inverse of this. The import only makes singles; the settled pair pass gives a
+     * pair its type with [pairedTransactionType].
      */
-    suspend fun getFireflyTransactionDtoType(
-        t: PlaidTransaction,
-        isPair: Boolean,
-        sourceId: String? = null,
-        destinationId: String? = null,
-    ): TransactionTypeProperty {
-
-        /**
-         * Per Firefly docs:
-         * Transfers are internal transactions that don't influence your bottom line.
-         * A transfer is created only between existing asset accounts.
-         * Select an asset account for both the source and destination from the free-form fields.
-         * Transfers can be linked to piggy banks, to automatically add or remove money from the piggy bank you select.
-         */
-        if (isPair) {
-            // Firefly 6.7.7 refuses a transfer between an asset and a liability account (422 "Could not find a valid
-            //  destination account"). Money into a liability is a payment (withdrawal); money out of one is a cash
-            //  advance or disbursement (deposit). Two liabilities, or two assets, stay a transfer.
-            return pairedTransactionType(
-                accountKinds[sourceId] ?: AccountKind.ASSET,
-                accountKinds[destinationId] ?: AccountKind.ASSET,
-            )
-        }
-
+    suspend fun getFireflyTransactionDtoType(t: PlaidTransaction): TransactionTypeProperty {
         /**
          * Per Firefly docs:
          * Withdrawals represent money that you spent that you can't get back easily unless the receiving party sends it to you.

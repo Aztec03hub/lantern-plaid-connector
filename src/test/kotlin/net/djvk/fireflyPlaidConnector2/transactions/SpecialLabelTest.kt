@@ -18,13 +18,13 @@ internal class SpecialLabelTest {
         txStyle = TransactionStyleConfig(null), pairConfigFile = "",
     ) {
         suspend fun create(t: net.djvk.fireflyPlaidConnector2.api.plaid.models.Transaction) =
-            convert(t, false, sourceId = "1", plaidLinks = listOf(PlaidLink(t.transactionId, PlaidLinkLeg.single, t.accountId))).tx
+            convert(t, sourceId = "1", plaidLinks = listOf(PlaidLink(t.transactionId, PlaidLinkLeg.single, t.accountId))).tx
 
         suspend fun plainUpdate(t: net.djvk.fireflyPlaidConnector2.api.plaid.models.Transaction) =
             convertSingle(t, mapOf(t.accountId to 1)).tx
 
         suspend fun update(t: net.djvk.fireflyPlaidConnector2.api.plaid.models.Transaction) =
-            convert(t, false, sourceId = "1", fireflyTx = FireflyTransactionDto("9", FireflyFixtures.getTransaction(categoryName = "Hand set").transactions.first())).tx
+            convert(t, sourceId = "1", fireflyTx =FireflyTransactionDto("9", FireflyFixtures.getTransaction(categoryName = "Hand set").transactions.first())).tx
     }
 
     private fun tx(text: String) = PlaidFixtures.getTransaction(
