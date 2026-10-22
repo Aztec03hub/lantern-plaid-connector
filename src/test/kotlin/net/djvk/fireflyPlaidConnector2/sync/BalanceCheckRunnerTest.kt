@@ -71,6 +71,7 @@ internal class BalanceCheckRunnerTest {
                 val id = it.getArgument<String>(0)
                 // real Firefly answers 422 to a start with no end
                 val start = it.getArgument<java.time.LocalDate?>(3); val end = it.getArgument<java.time.LocalDate?>(4)
+                if (start == null || end == null || !start.isBefore(end)) throw IllegalStateException("422 or unbounded window")
                 if (start != null && (end == null || !start.isBefore(end))) throw IllegalStateException("422 The start must be a date before end")
                 val rows = if (id != "3") listOf() else listOf(
                     split("3", "9", "20.00", listOf("pending"), today.minusDays(1)),
