@@ -5,6 +5,7 @@ import io.ktor.client.network.sockets.ConnectTimeoutException
 import io.ktor.client.network.sockets.SocketTimeoutException
 import io.ktor.client.plugins.HttpRequestTimeoutException
 import io.ktor.client.plugins.HttpTimeout
+import io.ktor.client.plugins.plugin
 import io.ktor.client.request.get
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.*
@@ -281,7 +282,7 @@ internal class WireAndTimeoutTest {
         val never = MockEngine { awaitCancellation() }
         val plaid = PlaidApiWrapper(
             baseUrl = "https://plaid.test", maxRetries = 2, plaidClientId = "cid", plaidSecret = "sec",
-            httpClientEngine = never, httpClientConfig = timeoutConfig(100), retryBackoffMillis = 1,
+            httpClientEngine = never, httpClientConfig = ApiConfiguration(request = 100).getClientConfig(), retryBackoffMillis = 1,
         )
         val pe = assertThrows<Throwable> {
             runBlocking { withTimeout(10_000) { plaid.executeRequest({ it.accountsBalanceGet(AccountsBalanceGetRequest(accessToken = "t")) }, "t") } }
@@ -289,7 +290,7 @@ internal class WireAndTimeoutTest {
         assertTrue(pe is RuntimeException && pe !is java.util.concurrent.CancellationException, "wrapped, got $pe")
         assertTrue(generateSequence<Throwable>(pe) { it.cause }.any { it is HttpRequestTimeoutException }, "cause chain keeps the timeout, got ${generateSequence<Throwable>(pe) { it.cause }.toList()}")
         val firefly = FireflyMock()
-        val tx = TransactionsApi("https://firefly.test", never, timeoutConfig(100))
+        val tx = TransactionsApi("https://firefly.test", never, ApiConfiguration(request = 100).getClientConfig())
         tx.setAccessToken("t")
         val helper = SyncHelper(AccountConfigs(emptyList()), "token", firefly.aboutApi, tx, firefly.accountsApi, firefly.plaidLinksApi)
         val dtos = listOf(net.djvk.fireflyPlaidConnector2.transactions.FireflyTransactionDto(null, FireflyFixtures.getTransaction().transactions.first()))
@@ -310,6 +311,13 @@ internal class WireAndTimeoutTest {
         }
         assertEquals("timeout", run(100))
         assertEquals("ok", run(30_000))
+        val plugin = io.ktor.client.HttpClient(MockEngine { respond("ok") }) {
+            ApiConfiguration(connect = 111, socket = 222, request = 333).getClientConfig()(this)
+        }.plugin(HttpTimeout)
+        val cfg = plugin.javaClass.getDeclaredField("config").also { it.isAccessible = true }.get(plugin) as io.ktor.client.plugins.HttpTimeoutConfig
+        assertEquals(111L, cfg.connectTimeoutMillis)
+        assertEquals(222L, cfg.socketTimeoutMillis)
+        assertEquals(333L, cfg.requestTimeoutMillis)
     }
 
     // endregion
