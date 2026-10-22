@@ -5,8 +5,11 @@ import io.ktor.client.network.sockets.ConnectTimeoutException
 import io.ktor.client.network.sockets.SocketTimeoutException
 import io.ktor.client.plugins.HttpRequestTimeoutException
 import io.ktor.client.plugins.HttpTimeout
+import io.ktor.client.request.get
+import io.ktor.client.statement.bodyAsText
 import io.ktor.http.*
 import io.ktor.utils.io.*
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.AboutApi
@@ -125,7 +128,7 @@ internal class WireAndTimeoutTest {
         when (kind) {
             "connect" -> throw ConnectTimeoutException("connect timed out", null)
             "socket" -> throw SocketTimeoutException("socket timed out", null)
-            else -> { delay(2000); respond("{}", HttpStatusCode.OK, jsonHeaders) } // "request": HttpTimeout fires first
+            else -> { awaitCancellation() } // "request": never answers, so HttpTimeout always fires (no wall-clock race)
         }
 
     private fun plaidTimeoutRun(kind: String): Pair<Int, Throwable> {
@@ -184,15 +187,27 @@ internal class WireAndTimeoutTest {
     }
 
     @Test
-    fun fireflySocketAndRequestTimeoutsAbortTheBatchRawAsBefore() {
-        // ktor 2.3.13 behaviour (measured, same on 3.6.0): only ConnectTimeoutException is caught in the insert loop;
-        //  the others leave the batch unwrapped (both inserts run concurrently), so the caller does not commit its cursor.
+    fun fireflySocketAndRequestTimeoutsFailTheBatchLikeAConnectTimeout() {
         for ((kind, type) in listOf("socket" to SocketTimeoutException::class, "request" to HttpRequestTimeoutException::class)) {
             val (calls, e) = batch(kind)
-            assertTrue(type.isInstance(e), "$kind: got $e")
-            assertTrue(e is IOException)
             assertEquals(2, calls, "$kind: both inserts were attempted")
+            assertTrue(e is IOException && type.isInstance(e.cause), "$kind: got $e / ${e.cause}")
+            assertContains(e.message!!, "2 of 2 Firefly inserts timed out")
         }
+    }
+
+    @Test
+    fun connectSocketAndRequestTimeoutsComeFromTheProperties() {
+        fun run(request: Long): String {
+            val client = io.ktor.client.HttpClient(MockEngine { delay(400); respond("ok") }) {
+                ApiConfiguration(connect = 111, socket = 222, request = request).getClientConfig()(this)
+            }
+            return runBlocking {
+                try { client.get("https://x.test/").bodyAsText() } catch (e: HttpRequestTimeoutException) { "timeout" }
+            }
+        }
+        assertEquals("timeout", run(100))
+        assertEquals("ok", run(30_000))
     }
 
     // endregion
