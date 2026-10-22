@@ -59,6 +59,9 @@ internal class LoanInterestRunnerTest {
     /** False makes the store mock leave Firefly's balance alone, so the apply re-read check can fail. */
     private var storeMovesOwed = true
     private var failSecondStore = false
+    private var failFirstStore = false
+    /** Loan 3 (twoLoans runners): what Firefly says it owes. */
+    private var fireflyOwed3 = BigDecimal("23417.37")
     /** Runs after each store mock call; a test sets it to simulate another writer. */
     private var onStore: (() -> Unit)? = null
     private val owedBefore = mutableMapOf<LocalDate, String>()
@@ -67,12 +70,12 @@ internal class LoanInterestRunnerTest {
 
     private fun journal(
         id: String, amount: String, date: LocalDate, desc: String = "payment", interest: Boolean = false,
-        deposit: Boolean = false, tags: List<String>? = listOf(), externalId: String? = null,
+        deposit: Boolean = false, tags: List<String>? = listOf(), externalId: String? = null, loan: String = "2",
     ) = TransactionRead(
         "transactions", id,
         FireflyFixtures.getTransaction(
             type = if (deposit) TransactionTypeProperty.deposit else TransactionTypeProperty.withdrawal,
-            sourceId = if (interest) "2" else "1", destinationId = if (interest) "90" else "2", amount = amount, description = desc,
+            sourceId = if (interest) loan else "1", destinationId = if (interest) "90" else loan, amount = amount, description = desc,
             date = date.atTime(12, 0).atZone(zone).toOffsetDateTime(), transactionJournalId = "j$id", tags = tags, externalId = externalId,
         ), ObjectLink(),
     )
@@ -82,20 +85,25 @@ internal class LoanInterestRunnerTest {
     private fun interest(id: String, amount: String, payAmount: String, date: LocalDate, externalId: String? = null, loanName: String = name) =
         journal(id, amount, date, "Interest on $loanName payment of $$payAmount", interest = true, externalId = externalId)
 
-    private fun runner(plaidOwed: String, rows: List<TransactionRead>, apply: Boolean = true, hold: Boolean = false, lagDir: String = ""): LoanInterestRunner {
+    private val extraLoan = ",{\"account\":3,\"apr\":7.59,\"interestAccount\":\"Interest: other loan\"}"
+
+    private fun runner(plaidOwed: String, rows: List<TransactionRead>, apply: Boolean = true, hold: Boolean = false, lagDir: String = "", twoLoans: Boolean = false): LoanInterestRunner {
         val cfg = File(dir, "pair.json").also {
-            it.writeText("""{"loans":[{"account":2,"apr":7.59,"interestAccount":"Interest: DCU Lexus NX loan"}]}""")
+            it.writeText("""{"loans":[{"account":2,"apr":7.59,"interestAccount":"Interest: DCU Lexus NX loan"}${if (twoLoans) extraLoan else ""}]}""")
         }
         val ours = BigDecimal(plaidOwed)
         runBlocking {
-            whenever(syncHelper.getAllPlaidAccessTokenAccountIdSets()).thenReturn(Pair(mapOf("pl" to 2), sequenceOf("tok" to listOf("pl"))))
+            whenever(syncHelper.getAllPlaidAccessTokenAccountIdSets()).thenReturn(if (twoLoans) Pair(mapOf("pl" to 2, "pl3" to 3), sequenceOf("tok" to listOf("pl", "pl3"))) else Pair(mapOf("pl" to 2), sequenceOf("tok" to listOf("pl"))))
             val balance = mock<AccountBalance>()
             whenever(balance.current).thenReturn(ours.toDouble())
             val base = mock<AccountBase>()
             whenever(base.accountId).thenReturn("pl")
             whenever(base.balances).thenReturn(balance)
             val resp = mock<AccountsGetResponse>()
-            whenever(resp.accounts).thenReturn(listOf(base))
+            val base3 = mock<AccountBase>()
+            whenever(base3.accountId).thenReturn("pl3")
+            whenever(base3.balances).thenReturn(balance)
+            whenever(resp.accounts).thenReturn(if (twoLoans) listOf(base, base3) else listOf(base))
             val plaidResponse = createPlaidResponse(resp)
             whenever(plaid.api.accountsBalanceGet(any<AccountsBalanceGetRequest>())).thenReturn(plaidResponse)
             whenever(accountsApi.getAccount(any(), anyOrNull())).doSuspendableAnswer {
@@ -105,12 +113,25 @@ internal class LoanInterestRunnerTest {
             }
             whenever(accountsApi.listTransactionByAccount(any(), anyOrNull(), anyOrNull(), anyOrNull(), anyOrNull(), anyOrNull()))
                 .doSuspendableAnswer { createFireflyResponse(TransactionArray(rows, Meta(), PageLink())) }
+            if (twoLoans) {
+                val rows3 = listOf(
+                    journal("p3", "400.00", d(8, 17), loan = "3"), journal("i3", "154.72", d(8, 17), "Interest on $name payment of \$400.00", interest = true, loan = "3"),
+                    journal("q3", "400.00", d(9, 1), loan = "3"),
+                )
+                whenever(accountsApi.getAccount(org.mockito.kotlin.eq("3"), anyOrNull())).doSuspendableAnswer {
+                    val owed = it.getArgument<LocalDate?>(1)?.let { x -> owedBefore[x] } ?: fireflyOwed3.toPlainString()
+                    createFireflyResponse(AccountSingle(AccountRead("accounts", "3", Account(name, ShortAccountTypeProperty.liabilities, currentBalance = "-$owed"), ObjectLink())))
+                }
+                whenever(accountsApi.listTransactionByAccount(org.mockito.kotlin.eq("3"), anyOrNull(), anyOrNull(), anyOrNull(), anyOrNull(), anyOrNull()))
+                    .doSuspendableAnswer { createFireflyResponse(TransactionArray(rows3, Meta(), PageLink())) }
+            }
             var calls = 0
             whenever(txApi.storeTransaction(any())).doSuspendableAnswer {
-                if (failSecondStore && ++calls == 2) error("store failed")
+                calls++
+                if (failFirstStore && calls == 1 || failSecondStore && calls == 2) error("store failed")
                 val s = it.getArgument<TransactionStore>(0).transactions.single()
                 val amount = BigDecimal(s.amount)
-                if (storeMovesOwed) fireflyOwed += if (s.type == TransactionTypeProperty.deposit) amount.negate() else amount
+                if (storeMovesOwed && s.sourceId == "3") fireflyOwed3 += amount else if (storeMovesOwed) fireflyOwed += if (s.type == TransactionTypeProperty.deposit) amount.negate() else amount
                 onStore?.invoke()
                 createFireflyResponse(TransactionSingle(rows.first()))
             }
@@ -395,7 +416,7 @@ internal class LoanInterestRunnerTest {
         failSecondStore = true
         val rows = listOf(payment("a", "400.00", d(8, 17)), payment("b", "400.00", d(9, 1)))
         // two uncovered payments and the oldest has days 0 (no earlier payment), so only b earns interest: lines [0.00, X]
-        org.junit.jupiter.api.assertThrows<IllegalStateException> { runner("23428.34", rows).run() }
+        org.junit.jupiter.api.assertThrows<IllegalStateException> { runner("23428.34", rows).run() }.also { assertThat(it.message).contains("HELD, write failed") }
         val first = stored().first().transactions.single()
         assertThat(first.description).contains("payment of \$400.00")
         assertThat(first.date.toLocalDate()).isEqualTo(d(9, 1))
@@ -426,7 +447,7 @@ internal class LoanInterestRunnerTest {
             payment("a", "400.00", d(8, 17)), payment("b", "400.00", d(9, 20)),
         )
         // a: 7 days (about 34.93), b: 34 days (about 167.10); a gap 0.20 above the sum goes to b, the biggest, which must be written first
-        org.junit.jupiter.api.assertThrows<IllegalStateException> { runner("23402.23", rows).run() }
+        org.junit.jupiter.api.assertThrows<IllegalStateException> { runner("23402.23", rows).run() }.also { assertThat(it.message).contains("HELD, write failed") }
         val first = stored().first().transactions.single()
         assertThat(first.date.toLocalDate()).isEqualTo(d(9, 20))
         assertThat(first.amount).isEqualTo("167.30")
@@ -559,7 +580,7 @@ internal class LoanInterestRunnerTest {
         owedBefore[d(8, 31)] = "23817.37"
         val r = runner("23491.66", chargedThenNew)
         reReadSees(chargedThenNew) { error("Firefly did not answer") }
-        assertThat(runCatching { r.run() }.exceptionOrNull()).isInstanceOf(IllegalStateException::class.java)
+        assertThat(runCatching { r.run() }.exceptionOrNull()).isInstanceOf(IllegalStateException::class.java).hasMessageContaining("HELD, write failed")
         assertThat(stored()).isEmpty()
     }
 
@@ -571,6 +592,17 @@ internal class LoanInterestRunnerTest {
         val e = org.junit.jupiter.api.assertThrows<IllegalStateException> { r.run() }
         assertThat(e.message).contains("HELD, write failed").contains("2 (ERROR_IllegalStateException)")
         assertThat(stored()).hasSize(2)
+    }
+
+    @Test
+    fun oneLoansFailedStoreDoesNotStopTheNextLoanAndStillFailsTheRun() = runBlocking<Unit> {  // U04c L2, two loans
+        owedBefore[d(8, 31)] = "23817.37"
+        failFirstStore = true  // loan 2's only line throws; loan 3 comes after it
+        val r = runner("23491.66", chargedThenNew, twoLoans = true)
+        val e = org.junit.jupiter.api.assertThrows<IllegalStateException> { r.run() }
+        assertThat(e.message).contains("HELD, write failed").contains("2 (ERROR_IllegalStateException)").doesNotContain("3 (")
+        assertThat(stored().map { it.transactions.single().sourceId }).containsExactly("2", "3")  // 2 threw, 3 stored its line
+        assertThat(fireflyOwed3).isEqualByComparingTo("23491.66")
     }
 
     @Test
