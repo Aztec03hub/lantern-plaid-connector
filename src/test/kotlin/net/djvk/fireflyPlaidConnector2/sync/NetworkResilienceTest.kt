@@ -122,7 +122,7 @@ internal class NetworkResilienceTest {
     fun allowItemToFailAlsoCoversNetworkFailures() = runBlocking<Unit> {
         // A wrapper that throws like the real one does once its retries are exhausted
         val wrapper: PlaidApiWrapper = mock()
-        whenever(wrapper.executeRequest<Any>(any(), any(), any())).doSuspendableAnswer {
+        whenever(wrapper.executeRequest<Any>(any(), any(), any(), any())).doSuspendableAnswer {
             throw RuntimeException("Plaid API call failed after 3 attempts", IOException("down"))
         }
         val tolerant = PlaidSyncService(wrapper, 100, true)

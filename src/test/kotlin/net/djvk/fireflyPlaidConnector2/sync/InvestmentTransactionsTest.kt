@@ -155,7 +155,7 @@ internal class InvestmentTransactionsTest {
             on { totalInvestmentTransactions } doReturn 3
         }
         var call = 0
-        whenever(wrapper.executeRequest<Any>(any(), any(), any())).doSuspendableAnswer {
+        whenever(wrapper.executeRequest<Any>(any(), any(), any(), any())).doSuspendableAnswer {
             createPlaidResponse(if (++call == 1) page1 else page2)
         }
 

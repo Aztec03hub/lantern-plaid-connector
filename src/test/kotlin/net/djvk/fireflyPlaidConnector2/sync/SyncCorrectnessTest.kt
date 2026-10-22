@@ -295,7 +295,7 @@ internal class SyncCorrectnessTest {
         val tx1 = PlaidFixtures.getPaymentTransaction(accountId = "acct", transactionId = "tx1")
         val tx2 = PlaidFixtures.getPaymentTransaction(accountId = "acct", transactionId = "tx2")
         var call = 0
-        whenever(plaidWrapper.executeRequest<Any>(any(), any(), any())).doSuspendableAnswer {
+        whenever(plaidWrapper.executeRequest<Any>(any(), any(), any(), any())).doSuspendableAnswer {
             call++
             when (call) {
                 1 -> createPlaidResponse(syncResponse(listOf(tx1), "c1", hasMore = true))
@@ -343,7 +343,7 @@ internal class SyncCorrectnessTest {
     @Test
     fun paginationRestartsAreBoundedSoAPermanentlyChangingItemCannotLoopForever() = runBlocking<Unit> {
         var call = 0
-        whenever(plaidWrapper.executeRequest<Any>(any(), any(), any())).doSuspendableAnswer {
+        whenever(plaidWrapper.executeRequest<Any>(any(), any(), any(), any())).doSuspendableAnswer {
             call++
             throw mutationException()
         }
