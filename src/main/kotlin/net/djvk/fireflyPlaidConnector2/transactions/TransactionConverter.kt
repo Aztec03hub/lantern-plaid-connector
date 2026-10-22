@@ -1126,6 +1126,8 @@ class TransactionConverter(
             sourceName = sourceName,
             destinationId = destinationId,
             destinationName = destinationName,
+            // create only: an update must not overwrite a category set by hand
+            categoryName = if (fireflyTx == null) namer.special(tx.counterparties?.firstOrNull()?.name ?: tx.merchantName, tx.name) else null,
             tags = getFireflyCategoryTags(tx) + listOfNotNull(importTag),
             latitude = tx.location.lat,
             longitude = tx.location.lon,

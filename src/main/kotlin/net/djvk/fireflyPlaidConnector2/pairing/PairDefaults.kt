@@ -6,11 +6,13 @@ package net.djvk.fireflyPlaidConnector2.pairing
  * file (see pair-config.template.json), never here. The patterns are the ones tools/pair_mock.py measured against the oracles.
  */
 object PairDefaults {
+    val consolidation = Regex("BALANCE CONSOLIDATION")
+
     val outMarkers = listOf(
         Marker("ach", Regex("^AC ")),
         Marker("dcu-to", Regex("(?i)(^|onlin )to (loan|share) ")),
         Marker("online-withdrawal", Regex("(?i)^withdrawal onlin ")),
-        Marker("balance-transfer", Regex("BALANCE CONSOLIDATION")),
+        Marker("balance-transfer", consolidation),
         Marker("sofi-vault", Regex("^(Roundup \\*|To Emergency Fund Vault)")),
     )
     val inMarkers = listOf(
@@ -29,7 +31,7 @@ object PairDefaults {
         DestRule(Regex("CHASE CREDIT CRD"), DestTarget.Institution("Chase")),
         DestRule(Regex("(?i)withdrawal onlin old second"), DestTarget.Institution("Old Second")),
         DestRule(Regex("^(To Emergency Fund Vault|Roundup \\*)"), DestTarget.Role("vault")),
-        DestRule(Regex("BALANCE CONSOLIDATION"), DestTarget.Role("card")),
+        DestRule(consolidation, DestTarget.Role("card")),
         DestRule(Regex("(?i)best buy|home depot|lowes|nordstrom|\\batt\\b|\\bcomed\\b|\\bbilt\\b|\\baffirm\\b|klarna|coinbase|IBTRANSFER"), DestTarget.Unlinked),
     )
 }
