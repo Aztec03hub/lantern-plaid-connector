@@ -1053,6 +1053,24 @@ internal class PairPassTest {
     }
 
     @Test
+    fun aPairBothConfirmedAndRejectedIsNeverMergedNorReportedAsAnUnappliedConfirm() = runBlocking<Unit> {  // U47d row 3
+        val w = World().also { it.review() }
+        decide("confirm" to "t", "reject" to "t")
+        val report = pass(w, dryRun = false).run(d.minusDays(5), today, now = now)
+        assertThat(w.requests).isEmpty()
+        assertThat(report.result.proposals).isEmpty()
+        // the reject wins, so the confirm is dropped quietly instead of showing as "was not merged"
+        assertThat(report.text).doesNotContain("Confirmed pair")
+    }
+
+    @Test
+    fun anAwaitingRecordNamesTheLegDirectionInLowerCase() = runBlocking<Unit> {  // LAN-109
+        val w = World().also { it.add("lone1", 1, true, d, 12_345, "AC CHASE CREDIT CRD AUTOPAY") }
+        val report = pass(w, dryRun = false).run(d.minusDays(5), today, now = now)
+        assertThat(report.awaiting.single().direction).isEqualTo("out")
+    }
+
+    @Test
     fun aDryRunWithADecisionMergesNothingAndWritesNoState() = runBlocking<Unit> {
         val w = World().also { it.review() }
         decide("confirm" to "t")
