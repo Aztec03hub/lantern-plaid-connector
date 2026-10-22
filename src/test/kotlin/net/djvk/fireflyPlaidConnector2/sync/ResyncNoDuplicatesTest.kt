@@ -360,7 +360,7 @@ internal class ResyncNoDuplicatesTest {
         assertThat(journals).hasSize(1)
         val posted = plaid("t1", 25.0, pendingId = "p1")
         poll(created = listOf(posted), deleted = listOf("p1"))
-        poll(created = listOf(posted), deleted = listOf("p1"))
+        // asserted after this one poll: a later repeat would heal the old code's duplicate (its lookup then hits and removes p1)
         assertThat(journals).describedAs("journals after the resync").hasSize(1)
         assertThat(linkOwners().keys).describedAs("link owners").containsExactly("t1")
     }
@@ -378,7 +378,7 @@ internal class ResyncNoDuplicatesTest {
         val posted = plaid("t1", 25.0, pendingId = "p1")
         lookupMissesLeft = 1
         poll(created = listOf(posted), deleted = listOf("p1"))
-        poll(created = listOf(posted), deleted = listOf("p1"))
+        // asserted after this one poll: a later repeat would heal the old code's duplicate (its lookup then hits and removes p1)
         assertThat(journals).describedAs("journals after the resync").hasSize(1)
         assertThat(linkOwners().keys).describedAs("link owners").containsExactly("t1")
     }
