@@ -37,10 +37,16 @@ class FireflyTransactionService(
 
     /** Where Firefly writes that were permanently rejected are kept; null means a rejected write fails the iteration. */
     private val deadLetters: DeadLetterStore? = null,
+
+    /** Infinite-loop failsafe on the page count of one range read; the real ceiling is [maxRangeTransactions]. */
+    @Value("\${fireflyPlaidConnector2.firefly.maxReadPages:1000}")
+    private val maxReadPages: Int = 1000,
+
+    /** Failsafe on the total transactions one range read may return (from Firefly's pagination total). */
+    @Value("\${fireflyPlaidConnector2.firefly.maxRangeTransactions:200000}")
+    private val maxRangeTransactions: Int = 200_000,
 ) {
     private val logger = LoggerFactory.getLogger(this::class.java)
-    private val fireflyPageCountMax = 20
-    private val maxRangeTransactions = 200_000
     private val zoneId = ZoneId.of(timeZoneString)
 
     /**
@@ -48,7 +54,7 @@ class FireflyTransactionService(
      * given. [maxPages] is a failsafe: exceeding it is an error rather than a silently truncated list.
      */
     suspend fun fetchExistingFireflyTransactions(): List<TransactionRead> =
-        fetchFireflyTransactionsBetween(windowStart(), LocalDate.now(zoneId), fireflyPageCountMax)
+        fetchFireflyTransactionsBetween(windowStart(), LocalDate.now(zoneId), maxReadPages)
 
     suspend fun fetchFireflyTransactionsBetween(start: LocalDate, end: LocalDate, maxPages: Int): List<TransactionRead> =
         readRange(start, end, maxPages, strict = false)
