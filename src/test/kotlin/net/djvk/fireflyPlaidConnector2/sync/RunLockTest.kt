@@ -94,7 +94,7 @@ internal class RunLockTest {
 
     @Test
     fun guardedRunsTheBlockReleasesAndCleansStaleTemps(@TempDir dir: Path) {
-        val stale = listOf("item_status123.tmp", "plaid_sync_cursors9.tmp", "plaid_dead_letters1.tmp", "pair-state.json.tmp", "pair-state.json.55.tmp", "loan-lag.json.tmp", "item_status.json.77.tmp")
+        val stale = listOf("item_status123.tmp", "plaid_sync_cursors9.tmp", "plaid_dead_letters1.tmp", "pair-state.json.tmp", "pair-state.json.55.tmp", "loan-lag.json.tmp", "item_status.json.77.tmp", "balance_gap.json.8123_x.tmp")
         val keep = listOf("plaid_sync_cursors.txt", "item_status.json", "pair-state.json", "pair-state.json.v1.bak", "plaid_dead_letters.unreadable-1.json", "notes.tmp")
         (stale + keep).forEach { Files.writeString(dir.resolve(it), "b-$it") }
         var ran = 0

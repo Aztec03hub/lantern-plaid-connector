@@ -46,12 +46,12 @@ internal class BalanceCheckRunnerTest {
     private val down = """{"error_type":"INSTITUTION_ERROR","error_code":"INSTITUTION_NOT_RESPONDING","error_message":"m","display_message":null,"request_id":"r"}"""
     private val fatal = """{"error_type":"INVALID_INPUT","error_code":"INVALID_ACCESS_TOKEN","error_message":"m","display_message":null,"request_id":"r"}"""
 
-    private fun runner(bFails: String? = null, pendingTag: String = "pending", fireflyFails: Boolean = false): BalanceCheckRunner {
+    private fun runner(bFails: String? = null, pendingTag: String = "pending", fireflyFails: Boolean = false, cardPlaid: Double = 305.40): BalanceCheckRunner {
         val engine = MockEngine { req ->
             val b = String(req.body.toByteArray())
             val json = HttpHeaders.ContentType to "application/json"
             when {
-                "tokA" in b -> respond(body(acct("plA", "depository", 1200.00), acct("plC", "credit", 305.40)), HttpStatusCode.OK, headersOf(json.first, json.second))
+                "tokA" in b -> respond(body(acct("plA", "depository", 1200.00), acct("plC", "credit", cardPlaid)), HttpStatusCode.OK, headersOf(json.first, json.second))
                 bFails != null -> respond(bFails, HttpStatusCode.BadRequest, headersOf(json.first, json.second))
                 else -> respond(body(acct("plL", "loan", 900.00)), HttpStatusCode.OK, headersOf(json.first, json.second))
             }
@@ -98,6 +98,15 @@ internal class BalanceCheckRunnerTest {
         assertThat(accounts[1]["firefly"].asText()).isEqualTo("-305.40")
         assertThat(accounts[1]["gap"].asText()).isEqualTo("0.00")
         assertThat(out.toString()).doesNotContain("!! balance gap")
+    }
+
+    @Test
+    fun anInstitutionWhoseCurrentIncludesPendingIsAlsoOk() {
+        // Plaid owes 325.40 (pending 20.00 included), Firefly -325.40 includes the same pending row: no gap
+        runner(cardPlaid = 325.40).run()
+        val card = file()["accounts"][1]
+        assertThat(card["status"].asText()).isEqualTo("ok")
+        assertThat(card["gap"].asText()).isEqualTo("0.00")
     }
 
     @Test

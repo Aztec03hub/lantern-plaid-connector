@@ -24,6 +24,18 @@ internal class BalanceCheckTest {
     private fun night(prev: List<GapEntry>, r: BalanceResult, day: LocalDate) = mergeFirstSeen(prev.associateBy { it.account }, listOf(r), day)
 
     @Test
+    fun aGapUnexplainedWithOrWithoutPendingOnlyCountsWhenUnexplainedBothWays() {
+        // Plaid excludes pending: posted 100 matches Plaid 100 (Firefly incl. pending would be 80)
+        assertThat(compareBalances(1, "depository", d("100"), d("100"), tol, d("80")).status).isEqualTo("ok")
+        // Plaid includes pending: with-pending 80 matches Plaid 80 (posted would be 100)
+        assertThat(compareBalances(1, "depository", d("100"), d("80"), tol, d("80")).status).isEqualTo("ok")
+        // neither matches: a gap, reported as the smaller one
+        val r = compareBalances(1, "depository", d("100"), d("90"), tol, d("85"))
+        assertThat(r.status).isEqualTo("gap")
+        assertThat(r.gap).isEqualByComparingTo("-5.00")
+    }
+
+    @Test
     fun depositoryToleranceSignAndEdge() {
         assertThat(cmp("depository", "1200.00", "1200.03").status).isEqualTo("ok")
         assertThat(cmp("depository", "1200.05", "1200.00").status).isEqualTo("ok")
