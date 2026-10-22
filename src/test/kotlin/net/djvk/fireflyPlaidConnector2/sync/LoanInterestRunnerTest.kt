@@ -338,6 +338,24 @@ internal class LoanInterestRunnerTest {
     }
 
     @Test
+    fun twoSameDayPaymentsThroughWriteStoreTheDayRowOnceAndTheLoanIsNotHeld() = runBlocking<Unit> {  // U04b L3, write() path
+        owedBefore[d(8, 31)] = "23817.37"
+        // A same-day second payment has 0 days since the first, so its interest is 0 and write() correctly stores no row for it
+        // (the loan owes nothing extra for it). The first payment carries the 15 days: exactly one row, 74.29, owned by jb1.
+        val rows = chargedThenNew + payment("b2", "400.00", d(9, 1))
+        val plan = runner("23491.66", rows, hold = true).runOnce().single()
+        assertThat(plan.action).startsWith("write")
+        assertThat(plan.paymentIds).containsExactlyInAnyOrder("ja", "jb", "jb2")
+        val first = stored().single().transactions.single()
+        assertThat(first.amount).isEqualTo("74.29")
+        assertThat(first.externalId).isEqualTo("lantern-interest:jb")
+        // next night: the stored row names jb, which is live, so it never covers jb2; the gap is closed, nothing is HELD or stored
+        val next = runner("23491.66", rows + interest("ib", "74.29", "400.00", d(9, 1), externalId = "lantern-interest:jb"), hold = true).runOnce().single()
+        assertThat(next.action).startsWith("OK")
+        assertThat(stored()).hasSize(1)
+    }
+
+    @Test
     fun aReimportedPaymentWhoseOldRowNamesAGoneJournalStaysCovered() = runBlocking<Unit> {  // U04b L3
         val rows = chargedThenNew + interest("ib", "74.29", "400.00", d(9, 1), externalId = "lantern-interest:jGONE")
         assertThat(runner("23491.66", rows, apply = false).runOnce().single().lines).isEmpty()
