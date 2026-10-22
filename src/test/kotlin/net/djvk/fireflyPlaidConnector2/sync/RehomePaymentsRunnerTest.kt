@@ -15,6 +15,7 @@ import net.djvk.fireflyPlaidConnector2.api.firefly.models.PlaidLink
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.PlaidLinkLeg
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionArray
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionRead
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionSingle
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionUpdate
 import net.djvk.fireflyPlaidConnector2.config.properties.TransactionStyleConfig
 import net.djvk.fireflyPlaidConnector2.lib.FireflyFixtures
@@ -58,11 +59,11 @@ internal class RehomePaymentsRunnerTest {
         )
     }
 
-    private fun journal(id: String, amount: String, desc: String = text, destType: AccountTypeProperty = AccountTypeProperty.expenseAccount) = TransactionRead(
+    private fun journal(id: String, amount: String, desc: String = text, destType: AccountTypeProperty = AccountTypeProperty.expenseAccount, at: OffsetDateTime? = null) = TransactionRead(
         "transactions", id,
         FireflyFixtures.getTransaction(
             sourceId = "1", destinationId = "50", destinationType = destType, amount = amount, description = desc,
-            date = OffsetDateTime.now().minusDays(2).withDayOfMonth(7).let { if (it.isAfter(OffsetDateTime.now())) it.minusMonths(1) else it },
+            date = at ?: OffsetDateTime.now().minusDays(2).withDayOfMonth(7).let { if (it.isAfter(OffsetDateTime.now())) it.minusMonths(1) else it },
             transactionJournalId = "j$id", plaidLinks = listOf(PlaidLink("p$id", PlaidLinkLeg.single, "plaid1")),
         ), ObjectLink(),
     )
@@ -135,6 +136,7 @@ internal class RehomePaymentsRunnerTest {
     fun reverseModePutsDoneMovesBackWithTheirOldLeg() = runBlocking<Unit> {  // B4
         val r = runner(true, listOf(journal("a", "400.00")))
         r.applyPlan(r.readPlan())
+        stubJournal("a", "2")  // the move landed
         runner(false, emptyList(), reverse = true).reverseLog()
         verify(txApi, org.mockito.kotlin.times(1)).updateTransaction(any(), any())  // dry run reverses nothing
         runner(true, emptyList(), reverse = true).reverseLog()
@@ -148,12 +150,30 @@ internal class RehomePaymentsRunnerTest {
         verify(txApi, org.mockito.kotlin.times(2)).updateTransaction(any(), any())
     }
 
-    private fun done(old: String, new: String, at: String, journal: String = "a", split: String = "j$journal") =
-        """{"status":"done","journal":"$journal","split":"$split","oldDestination":"$old","newDestination":"$new","plaidTx":"pa","plaidAccount":"plaid1","oldLeg":"single","at":"$at"}"""
+    private fun done(old: String, new: String, at: String, journal: String = "a", split: String = "j$journal", oldLeg: String = "single", status: String = "done") =
+        """{"status":"$status","journal":"$journal","split":"$split","oldDestination":"$old","newDestination":"$new","plaidTx":"pa","plaidAccount":"plaid1","oldLeg":"$oldLeg","at":"$at"}"""
+
+    private fun intent(old: String, new: String, at: String) = done(old, new, at, status = "intent")
+
+    /** Firefly's current view of journal [id]: its split [split] sits on destination [dest] with the one Plaid link on [leg]. */
+    private fun stubJournal(id: String, dest: String, leg: PlaidLinkLeg = PlaidLinkLeg.source, split: String = "j$id") = runBlocking {
+        val tx = FireflyFixtures.getTransaction(destinationId = dest, transactionJournalId = split, plaidLinks = listOf(PlaidLink("p$id", leg, "plaid1")))
+        val resp = createFireflyResponse(TransactionSingle(TransactionRead("transactions", id, tx, ObjectLink())))
+        whenever(txApi.getTransaction(id)).thenReturn(resp)
+    }
+
+    private fun captureOut(block: () -> Unit): String {
+        val old = System.out
+        val buf = java.io.ByteArrayOutputStream()
+        System.setOut(java.io.PrintStream(buf, true))
+        try { block() } finally { System.setOut(old) }
+        return buf.toString()
+    }
 
     @Test
     fun aJournalMovedTwiceIsReversedNewestFirstSoItEndsOnItsFirstDestination() = runBlocking<Unit> {  // N11
-        File(dir, "rehome_log.jsonl").writeText(done("50", "60", "2026-10-01T01:00:00Z") + "\n" + done("60", "70", "2026-10-02T01:00:00Z") + "\n")
+        File(dir, "rehome_log.jsonl").writeText(done("50", "60", "2026-10-01T01:00:00Z") + "\n" + done("60", "70", "2026-10-02T01:00:00Z", oldLeg = "source") + "\n")
+        stubJournal("a", "70")
         runner(true, emptyList(), reverse = true).reverseLog()
         val upd = argumentCaptor<TransactionUpdate>()
         verify(txApi, org.mockito.kotlin.times(2)).updateTransaction(any(), upd.capture())
@@ -163,6 +183,7 @@ internal class RehomePaymentsRunnerTest {
     @Test
     fun aMoveMadeAfterAReverseIsReversedByTheNextReverse() = runBlocking<Unit> {  // N11: keyed on the done line, not on the journal
         File(dir, "rehome_log.jsonl").writeText(done("50", "60", "2026-10-01T01:00:00Z") + "\n")
+        stubJournal("a", "60")
         runner(true, emptyList(), reverse = true).reverseLog()
         File(dir, "rehome_log.jsonl").appendText(done("50", "60", "2026-10-05T01:00:00Z") + "\n") // moved again later
         runner(true, emptyList(), reverse = true).reverseLog()
@@ -178,6 +199,7 @@ internal class RehomePaymentsRunnerTest {
                 """{"status":"reversed","journal":"a","split":"ja","at":"2026-10-02T01:00:00Z"}""" + "\n" +
                 done("50", "60", "2026-10-05T01:00:00Z") + "\n", // a later move, after the old reverse
         )
+        stubJournal("a", "60")
         runner(true, emptyList(), reverse = true).reverseLog()
         val upd = argumentCaptor<TransactionUpdate>()
         verify(txApi, org.mockito.kotlin.times(1)).updateTransaction(any(), upd.capture())
@@ -192,6 +214,8 @@ internal class RehomePaymentsRunnerTest {
                 done("52", "62", "2026-10-01T03:00:00Z", "a", split = "jx") + "\n" +  // same journal, other split: not covered
                 """{"status":"reversed","journal":"a","split":"ja","at":"2026-10-02T01:00:00Z"}""" + "\n",
         )
+        stubJournal("a", "62", split = "jx")
+        stubJournal("b", "61", split = "ja")
         runner(true, emptyList(), reverse = true).reverseLog()
         val upd = argumentCaptor<TransactionUpdate>()
         verify(txApi, org.mockito.kotlin.times(2)).updateTransaction(any(), upd.capture())
@@ -204,6 +228,7 @@ internal class RehomePaymentsRunnerTest {
             done("50", "60", "2026-10-01T01:00:00Z") + "\n" + done("60", "70", "2026-10-02T01:00:00Z") + "\n" +
                 """{"status":"reversed","journal":"a","split":"ja","undoes":"2026-10-02T01:00:00Z","at":"2026-10-03T01:00:00Z"}""" + "\n", // crash before the earlier move was undone
         )
+        stubJournal("a", "60")
         runner(true, emptyList(), reverse = true).reverseLog()
         val upd = argumentCaptor<TransactionUpdate>()
         verify(txApi, org.mockito.kotlin.times(1)).updateTransaction(any(), upd.capture())
@@ -234,5 +259,97 @@ internal class RehomePaymentsRunnerTest {
         r.checkTargets(listOf(9))  // not a target: fine
         account(ShortAccountTypeProperty.liabilities)
         r.checkTargets(listOf(2, 3))  // a Plaid-synced loan has a balance only
+    }
+
+    @Test
+    fun anInterruptedApplyIsPutBackByReverse() = runBlocking<Unit> {  // E20: the update landed, the done line never got written
+        File(dir, "rehome_log.jsonl").writeText(intent("50", "2", "2026-10-01T01:00:00Z") + "\n")
+        stubJournal("a", "2")
+        val out = captureOut { runBlocking { runner(true, emptyList(), reverse = true).reverseLog() } }
+        val upd = argumentCaptor<TransactionUpdate>()
+        verify(txApi).updateTransaction(any(), upd.capture())
+        val back = upd.firstValue.transactions!!.single()
+        assertThat(back.destinationId).isEqualTo("50")
+        assertThat(back.plaidLinks!!.single().leg).isEqualTo(PlaidLinkLeg.single)
+        assertThat(out).contains("recovered").contains("REVERSED 1 moves.")
+        assertThat(File(dir, "rehome_log.jsonl").readLines().last()).contains("\"status\":\"reversed\"").contains("\"undoes\":\"2026-10-01T01:00:00Z\"")
+    }
+
+    @Test
+    fun anIntentThatNeverMovedIsNotReversed() = runBlocking<Unit> {  // E20: the update failed
+        File(dir, "rehome_log.jsonl").writeText(intent("50", "2", "2026-10-01T01:00:00Z") + "\n")
+        stubJournal("a", "50", leg = PlaidLinkLeg.single)
+        val out = captureOut { runBlocking { runner(true, emptyList(), reverse = true).reverseLog() } }
+        verify(txApi, never()).updateTransaction(any(), any())
+        assertThat(out).contains("not moved").contains("REVERSED 0 moves.")
+    }
+
+    @Test
+    fun anIntentFollowedByItsDoneLineIsReversedOnceNotTwice() = runBlocking<Unit> {
+        File(dir, "rehome_log.jsonl").writeText(intent("50", "2", "2026-10-01T01:00:00Z") + "\n" + done("50", "2", "2026-10-01T01:00:01Z") + "\n")
+        stubJournal("a", "2")
+        runner(true, emptyList(), reverse = true).reverseLog()
+        verify(txApi, org.mockito.kotlin.times(1)).updateTransaction(any(), any())
+    }
+
+    @Test
+    fun aJournalEditedAfterTheDoneLineIsNotReversed() = runBlocking<Unit> {  // B21
+        File(dir, "rehome_log.jsonl").writeText(done("50", "2", "2026-10-01T01:00:00Z") + "\n")
+        stubJournal("a", "77")
+        val out = captureOut { runBlocking { runner(true, emptyList(), reverse = true).reverseLog() } }
+        verify(txApi, never()).updateTransaction(any(), any())
+        assertThat(out).contains("edited since").contains("destination is now 77")
+        assertThat(File(dir, "rehome_log.jsonl").readLines()).hasSize(1)  // a skip writes no log line
+    }
+
+    @Test
+    fun aJournalWhoseLegWasChangedIsNotReversed() = runBlocking<Unit> {  // B21
+        File(dir, "rehome_log.jsonl").writeText(done("50", "2", "2026-10-01T01:00:00Z") + "\n")
+        stubJournal("a", "2", leg = PlaidLinkLeg.single)
+        val out = captureOut { runBlocking { runner(true, emptyList(), reverse = true).reverseLog() } }
+        verify(txApi, never()).updateTransaction(any(), any())
+        assertThat(out).contains("edited since")
+    }
+
+    @Test
+    fun aDryRunReverseChecksStateButWritesNothing() = runBlocking<Unit> {
+        File(dir, "rehome_log.jsonl").writeText(
+            done("50", "2", "2026-10-01T01:00:00Z", "a") + "\n" + done("51", "2", "2026-10-01T02:00:00Z", "b") + "\n",
+        )
+        stubJournal("a", "2")
+        stubJournal("b", "77")
+        val out = captureOut { runBlocking { runner(false, emptyList(), reverse = true).reverseLog() } }
+        verify(txApi, never()).updateTransaction(any(), any())
+        assertThat(out).contains("journal a: would go back to destination 50").contains("journal b: destination is now 77").contains("DRY RUN")
+        assertThat(File(dir, "rehome_log.jsonl").readLines()).hasSize(2)
+    }
+
+    @Test
+    fun aJournalMovedTwiceChainsThroughTheStateCheck() = runBlocking<Unit> {  // N11 with the state check
+        File(dir, "rehome_log.jsonl").writeText(done("50", "60", "2026-10-01T01:00:00Z") + "\n" + done("60", "70", "2026-10-02T01:00:00Z", oldLeg = "source") + "\n")
+        stubJournal("a", "70")  // Firefly shows only the final state; the second check must use the simulated one
+        val dry = captureOut { runBlocking { runner(false, emptyList(), reverse = true).reverseLog() } }
+        assertThat(dry).contains("would go back to destination 60").contains("would go back to destination 50")
+        verify(txApi, never()).updateTransaction(any(), any())
+        runner(true, emptyList(), reverse = true).reverseLog()
+        val upd = argumentCaptor<TransactionUpdate>()
+        verify(txApi, org.mockito.kotlin.times(2)).updateTransaction(any(), upd.capture())
+        assertThat(upd.allValues.map { it.transactions!!.single().destinationId }).containsExactly("60", "50")
+    }
+
+    @Test
+    fun theLogIsAppendedDurably() {
+        val f = File(dir, "deeper/new/log.jsonl")
+        appendDurably(f, "one\n")
+        appendDurably(f, "two\n")
+        assertThat(f.readLines()).containsExactly("one", "two")
+    }
+
+    @Test
+    fun aLateEveningMoveLandsOnTheLocalDay() = runBlocking<Unit> {  // A13: 03:30Z on the 8th is 22:30 on the 7th in Chicago
+        val r = runner(false, listOf(journal("a", "400.00", at = OffsetDateTime.parse("2026-09-08T03:30:00Z"))))
+        val m = r.readPlan().single()
+        assertThat(m.date.dayOfMonth).isEqualTo(7)
+        assertThat(m.to).isEqualTo(2)
     }
 }

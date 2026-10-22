@@ -2,8 +2,11 @@ package net.djvk.fireflyPlaidConnector2.sync
 
 import kotlinx.coroutines.runBlocking
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.AccountsApi
+import net.djvk.fireflyPlaidConnector2.api.firefly.apis.RecurrencesApi
+import net.djvk.fireflyPlaidConnector2.api.firefly.apis.RulesApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.TransactionsApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.AccountTypeFilter
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.RuleActionKeyword
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionRead
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionSplitUpdate
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionTypeFilter
@@ -49,6 +52,8 @@ class RehomeNamesRunner(
     private val fireflyAccountsApi: AccountsApi,
     private val fireflyTxApi: TransactionsApi,
     private val converter: TransactionConverter,
+    private val fireflyRulesApi: RulesApi,
+    private val fireflyRecurrencesApi: RecurrencesApi,
     @Value("\${fireflyPlaidConnector2.repair.apply:false}")
     private val apply: Boolean = false,
     @Value("\${fireflyPlaidConnector2.polled.cursorFileDirectoryPath:persistence}")
@@ -64,14 +69,18 @@ class RehomeNamesRunner(
         val plan = readPlan()
         print(plan)
         if (!apply) {
+            printNamed(plan)
             println("DRY RUN: nothing was changed. Add --fireflyPlaidConnector2.repair.apply=true to apply.")
             return@runBlocking
         }
-        applyPlan(plan)
+        val kept = applyPlan(plan)
         println("APPLIED. Re-reading to check:")
         val again = readPlan()
         print(again)
-        check(again.isEmpty()) { "rehome-names is not done: ${again.size} groups of duplicate accounts are left" }
+        // a duplicate kept because a rule or recurrence names it is listed forever; it is not a failure
+        val left = again.filter { g -> g.duplicates.isEmpty() || g.duplicates.any { it.id !in kept } }
+        check(left.isEmpty()) { "rehome-names is not done: ${left.size} groups of duplicate accounts are left" }
+        if (kept.isNotEmpty()) println("KEPT ${kept.size} accounts because rules or recurrences name them: ${kept.sorted()}")
     }
 
     /** Reads every expense and revenue account, counts the journals of the candidates only, and plans. */
@@ -112,10 +121,47 @@ class RehomeNamesRunner(
         return out
     }
 
+    /** Why [d] must not be deleted: the titles of rules whose triggers/actions name it and the ids of recurrences that use it. Empty = safe. */
+    internal suspend fun namedBy(d: NamedAccount): List<String> {
+        val out = mutableListOf<String>()
+        var page = 1
+        while (true) {
+            val body = fireflyRulesApi.listRule(page++).body()
+            for (r in body.data) {
+                val a = r.attributes
+                val byTrigger = a.triggers.any { t ->
+                    val k = t.type.value
+                    k.contains("account") && when {
+                        k.endsWith("_is") -> t.value.equals(d.name, ignoreCase = true)
+                        k.endsWith("_starts") -> d.name.startsWith(t.value, ignoreCase = true)
+                        k.endsWith("_ends") -> d.name.endsWith(t.value, ignoreCase = true)
+                        k.endsWith("_contains") -> d.name.contains(t.value, ignoreCase = true)
+                        else -> false
+                    }
+                }
+                val byAction = a.actions.any {
+                    (it.type == RuleActionKeyword.setSourceAccount || it.type == RuleActionKeyword.setDestinationAccount) && it.value.equals(d.name, ignoreCase = true)
+                }
+                if (byTrigger || byAction) out.add("rule \"${a.title}\"")
+            }
+            val p = body.meta.pagination
+            if (p == null || p.currentPage >= p.totalPages) break
+        }
+        page = 1
+        while (true) {
+            val body = fireflyRecurrencesApi.listRecurrence(page++).body()
+            for (r in body.data) {
+                if (r.attributes.transactions.orEmpty().any { it.sourceId == d.id.toString() || it.destinationId == d.id.toString() }) out.add("recurrence ${r.id}")
+            }
+            val p = body.meta.pagination
+            if (p == null || p.currentPage >= p.totalPages) break
+        }
+        return out
+    }
+
     /** One JSONL line per step, appended BEFORE the step, so a wrong group can be reversed by hand (M4). */
     private fun log(vararg fields: Pair<String, Any?>) {
-        logFile.also { it.absoluteFile.parentFile.mkdirs() }
-            .appendText(mapper.writeValueAsString(linkedMapOf<String, Any?>(*fields, "at" to java.time.OffsetDateTime.now().toString())) + "\n")
+        appendDurably(logFile, mapper.writeValueAsString(linkedMapOf<String, Any?>(*fields, "at" to java.time.OffsetDateTime.now().toString())) + "\n")
     }
 
     /**
@@ -123,8 +169,14 @@ class RehomeNamesRunner(
      * one type with the same name, so a duplicate already spelled like the display name (any case) is merged and deleted
      * before the rename; the rename then runs right after that delete, ahead of the other duplicates. A rename that still
      * fails leaves a lone account whose name differs from its canonical, which the next plan lists again.
+     *
+     * A duplicate that a rule or recurrence names ([namedBy]) is emptied but not deleted; its id is returned.
+     * Firefly's REST delete has no move-to (core DestroyController.php:61 passes null), so a journal that arrives
+     * between the re-check and the delete cannot be saved; the window is one API round trip. Run this tool when no
+     * import is running.
      */
-    internal suspend fun applyPlan(plan: List<NameGroup>) {
+    internal suspend fun applyPlan(plan: List<NameGroup>): Set<Int> {
+        val kept = mutableSetOf<Int>()
         for (g in plan) {
             val to = g.survivor.id.toString()
             val blockers = g.duplicates.filter { it.name.equals(g.canonical, ignoreCase = true) }.map { it.id }.toMutableSet()
@@ -154,13 +206,27 @@ class RehomeNamesRunner(
                 }
                 // Re-check right before the delete: a journal that arrived since the plan keeps the account alive
                 val left = fireflyAccountsApi.listTransactionByAccount(from, 1, 1, null, null, TransactionTypeFilter.all).body().data
-                if (left.isEmpty()) {
+                val refs = if (left.isEmpty()) namedBy(d) else emptyList()
+                if (left.isEmpty() && refs.isNotEmpty()) {
+                    log("op" to "delete-skipped", "account" to from, "name" to d.name, "type" to g.type.value, "namedBy" to refs)
+                    println("The ${g.type.value} account ${d.id} \"${d.name}\" is named by ${refs.joinToString(", ")}; not deleted.")
+                    kept.add(d.id)
+                } else if (left.isEmpty()) {
                     log("op" to "delete", "account" to from, "name" to d.name, "type" to g.type.value, "mergedInto" to to)
                     fireflyAccountsApi.deleteAccount(from)
                     blockers.remove(d.id)
                     renameNow()
                 } else println("The ${g.type.value} account ${d.id} \"${d.name}\" still has journals; not deleted.")
             }
+        }
+        return kept
+    }
+
+    /** Dry run: which duplicates a rule or recurrence names, so they would be merged but not deleted. */
+    private suspend fun printNamed(plan: List<NameGroup>) {
+        for (g in plan) for (d in g.duplicates) {
+            val refs = namedBy(d)
+            if (refs.isNotEmpty()) println("   KEEP ${d.id}: named by ${refs.joinToString(", ")}; it would be merged but not deleted")
         }
     }
 
