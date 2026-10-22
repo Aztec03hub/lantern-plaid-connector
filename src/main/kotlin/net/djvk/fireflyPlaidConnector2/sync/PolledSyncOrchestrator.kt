@@ -96,6 +96,8 @@ class PolledSyncOrchestrator(
     private val investmentMaxLookbackDays: Long = 90,
     /** Remembers a transfer leg that flipped before its partner did; null (tests) means nothing is remembered. */
     private val flippedLegStore: FlippedLegStore? = null,
+    /** Keeps each Item's last refresh time across runs; null (tests) means in memory only. */
+    private val refreshTimeStore: RefreshTimeStore? = null,
 ) : Runner, DisposableBean {
     private val logger = LoggerFactory.getLogger(this::class.java)
 
@@ -123,6 +125,10 @@ class PolledSyncOrchestrator(
     /** When each Item (by access token) was last asked to refresh; in memory only, so every restart refreshes once. */
     private val lastRefreshAt = mutableMapOf<PlaidAccessToken, Instant>()
 
+    /** The same times keyed by item id, as kept in [refreshTimeStore]; loaded once on first use. */
+    private val persistedRefreshAt = mutableMapOf<String, Instant>()
+    private var refreshTimesLoaded = false
+
     /**
      * Requests a Plaid refresh for every Item that hasn't been asked within [refreshIntervalMinutes]. The attempt
      * time is recorded even if Plaid rejects the request, so a failing or unsupported Item is retried only on the
@@ -133,12 +139,22 @@ class PolledSyncOrchestrator(
         now: Instant = Instant.now(),
     ) {
         if (refreshIntervalMinutes <= 0) return
+        val store = refreshTimeStore
+        if (!refreshTimesLoaded) {
+            refreshTimesLoaded = true
+            store?.read()?.let { persistedRefreshAt.putAll(it) }
+        }
+        var changed = false
         for ((accessToken, _) in accessTokens) {
-            val last = lastRefreshAt[accessToken]
+            val id = store?.itemId(accessToken)
+            val last = lastRefreshAt[accessToken] ?: id?.let { persistedRefreshAt[it] }
             if (last != null && java.time.Duration.between(last, now).toMinutes() < refreshIntervalMinutes) continue
             lastRefreshAt[accessToken] = now
+            if (id != null) persistedRefreshAt[id] = now
+            changed = true
             plaidSyncService.refreshTransactions(accessToken)
         }
+        if (changed) store?.write(persistedRefreshAt)
     }
 
     /**

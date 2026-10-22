@@ -36,7 +36,7 @@ class RunLock private constructor(
 
         /** Lock paths held by this JVM: a second tryLock in one JVM throws, and closing any channel on the file drops the JVM's lock. */
         private val HELD = ConcurrentHashMap<Path, String>()
-        private val STALE_TEMP = Regex("^((item_status|plaid_sync_cursors|plaid_dead_letters)\\d+\\.tmp|(pair-state|loan-lag)\\.json\\.(\\d+\\.)?tmp|(pair-state|loan-lag|item_status|balance_gap)\\.json\\.[A-Za-z0-9_-]+\\.tmp)$")
+        private val STALE_TEMP = Regex("^((item_status|plaid_sync_cursors|plaid_dead_letters)\\d+\\.tmp|(pair-state|loan-lag)\\.json\\.(\\d+\\.)?tmp|(pair-state|loan-lag|item_status|balance_gap|refresh_times)\\.json\\.[A-Za-z0-9_-]+\\.tmp)$")
 
         /** Throws [RunLockBusyException] (message names the holder) or IOException. Waits up to [waitSeconds], polling every 500 ms. */
         fun acquire(dir: Path, mode: String, waitSeconds: Long = 0): RunLock {
