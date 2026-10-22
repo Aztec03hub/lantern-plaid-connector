@@ -430,7 +430,7 @@ internal class LoanInterestRunnerTest {
     }
 
     @Test
-    fun aCorruptOrHandEditedLagFileNeverFailsTheLoanStepAndIsReplacedWhole() {  // W3
+    fun aCorruptLagFileIsMovedAsideLoggedAndTheLoanStepStillPasses() {  // W3
         val lagDir = File(dir, "lag").also { it.mkdirs() }
         val file = File(lagDir, "loan-lag.json")
         fireflyOwed = BigDecimal("23817.37")
@@ -439,11 +439,13 @@ internal class LoanInterestRunnerTest {
         val realOut = System.out
         System.setOut(java.io.PrintStream(out, true))
         try { runner("23427.28", chargedThenNew, hold = true, lagDir = lagDir.path).also { it.today = { d(10, 1) } }.run() } finally { System.setOut(realOut) }
-        assertThat(out.toString()).contains("WARN: ").contains(file.path) // nit-1
+        val aside = lagDir.list()!!.single { it.startsWith("loan-lag.unreadable-") }
+        assertThat(out.toString()).contains("ERROR: ").contains(file.path).contains(aside)
+        assertThat(File(lagDir, aside).readText()).isEqualTo("{not json")
         assertThat(file.readText()).isEqualTo("""{"2":"2026-10-01"}""")
         file.writeText("""{"2":"yesterday"}""")
         runner("23427.28", chargedThenNew, hold = true, lagDir = lagDir.path).also { it.today = { d(10, 2) } }.run()
         assertThat(file.readText()).isEqualTo("""{"2":"2026-10-02"}""")
-        assertThat(lagDir.list()!!.toList()).containsExactly("loan-lag.json") // no .tmp left behind
+        assertThat(lagDir.list()!!.toList()).containsExactlyInAnyOrder("loan-lag.json", aside) // no .tmp left behind
     }
 }

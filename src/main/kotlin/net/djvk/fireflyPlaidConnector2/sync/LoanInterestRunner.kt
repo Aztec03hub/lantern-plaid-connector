@@ -137,8 +137,14 @@ class LoanInterestRunner(
     private fun trackLag(plans: List<LoanPlan>): List<Int> {
         if (!apply || lagDirectory.isBlank()) return listOf()
         val file = File(lagDirectory, "loan-lag.json")
-        val old: Map<String, String> = if (file.exists()) runCatching { ObjectMapper().readValue(file, Map::class.java).entries.associate { it.key.toString() to it.value.toString() } }
-            .onFailure { println("WARN: ${file.path} cannot be read (${it.message?.lineSequence()?.firstOrNull()}); the lag counters start again") }.getOrDefault(mapOf()) else mapOf()
+        val old: Map<String, String> = if (file.exists()) try {
+            ObjectMapper().readValue(file, Map::class.java).entries.associate { it.key.toString() to it.value.toString() }
+        } catch (e: com.fasterxml.jackson.core.JsonProcessingException) {
+            // U03: keep the bad file for a person; if the move throws, the loan step fails loudly and nothing is overwritten
+            val aside = moveAside(file.toPath())
+            println("ERROR: ${file.path} cannot be read (${e::class.simpleName}); moved to ${aside.fileName}; the lag counters start again")
+            mapOf()
+        } else mapOf()
         val now = today()
         // a hand-edited date that does not parse counts as "first lagged tonight"
         // L3: a HELD night neither starts nor resets the clock; a loan that alternates lagging and HELD keeps its first date
@@ -152,10 +158,8 @@ class LoanInterestRunner(
             }
         }.toMap() + skipped.mapNotNull { (l, _) -> old[l.account.toString()]?.takeIf { d -> runCatching { LocalDate.parse(d) }.isSuccess }?.let { l.account.toString() to it } }.toMap()
         File(lagDirectory).mkdirs()
-        // W3: temp file then atomic move, so a kill mid-write leaves the old file whole
-        val tmp = File(lagDirectory, "loan-lag.json.tmp")
-        tmp.writeText(ObjectMapper().writeValueAsString(lagging))
-        java.nio.file.Files.move(tmp.toPath(), file.toPath(), java.nio.file.StandardCopyOption.ATOMIC_MOVE, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+        // W3 + U03: unique temp file then atomic move, so a kill mid-write leaves the old file whole
+        writeAtomically(file.toPath(), ObjectMapper().writeValueAsString(lagging))
         return lagging.filterValues { ChronoUnit.DAYS.between(LocalDate.parse(it), now) >= lagNights - 1 }.keys.map { it.toInt() }
     }
 
