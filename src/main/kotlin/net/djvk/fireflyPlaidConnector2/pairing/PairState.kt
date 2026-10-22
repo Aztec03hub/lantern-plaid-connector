@@ -80,6 +80,12 @@ object Awaiting {
     private const val ACH_BUSINESS_DAYS = 5L
     private const val CARD_DAYS = 7L
 
+    /** Control characters removed, trimmed, capped at 80 code points (never splits a surrogate pair). */
+    internal fun textOf(raw: String): String {
+        val t = raw.filterNot { it.isISOControl() }.trim()
+        return if (t.codePointCount(0, t.length) <= 80) t else t.substring(0, t.offsetByCodePoints(0, 80))
+    }
+
     internal fun amountText(cents: Long): String = java.math.BigDecimal.valueOf(kotlin.math.abs(cents), 2).toPlainString()
 
     private fun addBusinessDays(from: LocalDate, days: Long): LocalDate {
@@ -128,6 +134,6 @@ object Awaiting {
             else -> "awaiting-partner"
         }
         AwaitingRecord(leg.id, leg.account, leg.date, state, expected, if (leg.pending) null else expectedBy, waiting, firstSeen, pendingEnd, estimateBasis, evidence,
-            amountText(leg.cents), leg.dir.name.lowercase(), leg.text.filterNot { it.isISOControl() }.trim().take(80))
+            amountText(leg.cents), leg.dir.name.lowercase(), textOf(leg.text))
     }
 }

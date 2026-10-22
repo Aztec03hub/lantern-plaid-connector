@@ -848,6 +848,9 @@ internal class PairPassTest {
     fun awaitingRecordsCarryAmountDirectionAndTextAndAnOldRecordStillBuilds() {  // LAN-109
         assertThat(Awaiting.amountText(-1234)).isEqualTo("12.34")
         assertThat(Awaiting.amountText(5)).isEqualTo("0.05")
+        assertThat(Awaiting.textOf("  A\u0000B\n ")).isEqualTo("AB")
+        val emoji = "\uD83D\uDE00".repeat(81)
+        assertThat(Awaiting.textOf(emoji)).isEqualTo("\uD83D\uDE00".repeat(80))
         val old = AwaitingRecord("a", 1, d, "pending", null, null, emptyMap(), null, null, null, emptyList())
         assertThat(old.amount).isNull()
         val json = com.fasterxml.jackson.module.kotlin.jacksonObjectMapper().findAndRegisterModules()
