@@ -369,10 +369,10 @@ internal class ResyncNoDuplicatesTest {
     fun aPendingToPostedResyncWithTheLookupAloneLeavesOneJournal() { conflictsEnabled = false; pendingToPostedThenRepeat() }
 
     /**
-     * FINDING (U38): with the lookup missing the pending journal, the 409 can't help (the posted id differs from the pending one's):
+     * LAN-110 (found by U38): with the lookup missing the pending journal, the 409 can't help (the posted id differs from the pending one's):
      * the posted create lands as a second journal beside the still-held pending one. Enable once the connector re-checks.
      */
-    @org.junit.jupiter.api.Disabled("Finding: pending to posted has no 409 defence; a lookup that misses leaves pending p1 and posted t1 as 2 journals")
+    @org.junit.jupiter.api.Disabled("LAN-110: pending to posted has no 409 defence; a lookup that misses leaves pending p1 and posted t1 as 2 journals")
     @Test
     fun aPendingToPostedResyncWithThe409AloneLeavesOneJournal() { lookupEnabled = false; pendingToPostedThenRepeat() }
 
