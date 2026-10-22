@@ -47,6 +47,10 @@ class FireflyTransactionService(
     private val maxRangeTransactions: Int = 200_000,
 ) {
     private val logger = LoggerFactory.getLogger(this::class.java)
+    private val updateConflicts = java.util.concurrent.ConcurrentLinkedQueue<String>()
+
+    /** The Firefly group ids whose update Firefly answered 409 since this was last asked (a poll's writes and its dead letter retries); resets. */
+    fun takeUpdateConflicts(): List<String> = generateSequence { updateConflicts.poll() }.toList()
     private val zoneId = ZoneId.of(timeZoneString)
 
     /**
@@ -366,6 +370,7 @@ class FireflyTransactionService(
                         "Firefly refused update of ${letter.key}: a Plaid id it sends is already on another transaction " +
                                 "(HTTP 409: ${runCatching { cre.response.bodyAsText() }.getOrDefault("")}); left as it was, check it by hand"
                     )
+                    updateConflicts.add(letter.key)
                 } else {
                     logger.info("Firefly already holds a Plaid id of the ${letter.operation} of ${letter.key}; left as it was")
                 }
