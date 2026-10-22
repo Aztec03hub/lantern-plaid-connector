@@ -372,7 +372,7 @@ class PolledSyncOrchestrator(
         //  stops it, and the pending removal finds nothing). Firefly may merely lag: look those pending ids up once more
         //  before the write. One that is still missing is truly gone, and the posted create goes ahead (LAN-110).
         val postedPendingIds = plaidTransactions.created.mapNotNull { it.pendingTransactionId } // the service skips the ones it already holds
-        val existingFireflyTxs = firstLookupTxs +
+        val existingFireflyTxs = if (postedPendingIds.isEmpty()) firstLookupTxs else firstLookupTxs +
                 fireflyTransactionService.fetchMissingByPlaidId(postedPendingIds, firstLookupTxs)
 
         // Convert Plaid transactions to Firefly format
