@@ -70,6 +70,8 @@ class BatchSyncRunner(
     private val disableRunningBalance: Boolean = false,
     @Value("\${fireflyPlaidConnector2.firefly.personalAccessToken:}")
     private val fireflyAccessToken: String = "",
+    /** Called with 1 when the run finished but left an opening balance unset. */
+    private val exit: (Int) -> Unit = { kotlin.system.exitProcess(it) },
     ) : Runner {
     private val logger = LoggerFactory.getLogger(this::class.java)
 
@@ -138,7 +140,14 @@ class BatchSyncRunner(
 
             // Set initial balance transaction if configured
             if (setInitialBalance) {
-                setInitialBalances(allPlaidTxs, syncHelper)
+                val skipped = setInitialBalances(allPlaidTxs, syncHelper)
+                if (skipped.isNotEmpty()) {
+                    logger.error(
+                        "Batch run finished, but opening balances were NOT set for ${skipped.size} account(s): " +
+                                "${skipped.joinToString("; ")}. Fix the cause and run again."
+                    )
+                    exit(1)
+                }
             }
         }
     }
@@ -241,8 +250,10 @@ class BatchSyncRunner(
     suspend fun setInitialBalances(
         allPlaidTxs: Map<PlaidAccessToken, List<Transaction>>,
         syncHelper: SyncHelper,
-    ) {
+    ): List<String> {
         logger.info("Attempting to set initial balances")
+        // One entry per account (or Item) left without an opening; no names, no amounts
+        val skipped = mutableListOf<String>()
         val historyStart = allPlaidTxs.values.flatten().minOfOrNull { converter.getTxPostedTimestamp(it).toLocalDate() }
         val (accountMap, accountAccessTokenSequence) = syncHelper.getAllPlaidAccessTokenAccountIdSets()
         // Iterate over all Plaid items/access tokens we have configured
@@ -272,6 +283,7 @@ class BatchSyncRunner(
                     "Failed to fetch balances for access token ${redactAccessToken(accessToken)} and account ids ${accountIds.joinToString()}",
                     e
                 )
+                skipped.add("${redactAccessToken(accessToken)}: balance fetch failed")
                 continue
             }
 
@@ -289,6 +301,7 @@ class BatchSyncRunner(
                 ).body().totalTransactions
             } catch (e: Exception) {
                 logger.error("Failed to re-check the transaction count for ${redactAccessToken(accessToken)}; its opening balances are skipped", e)
+                skipped.add("${redactAccessToken(accessToken)}: transaction re-check failed")
                 continue
             }
             if (countNow != plaidTxs.size) {
@@ -296,6 +309,7 @@ class BatchSyncRunner(
                     "Plaid's transaction count for {} changed during the run ({} now, {} read); its opening balances are skipped, run again",
                     redactAccessToken(accessToken), countNow, plaidTxs.size,
                 )
+                skipped.add("${redactAccessToken(accessToken)}: transaction count changed")
                 continue
             }
 
@@ -308,10 +322,12 @@ class BatchSyncRunner(
                 val fireflyAccountId = accountMap[accountId]
                 if (fireflyAccountId == null) {
                     logger.warn("Failed to find Firefly account id for Plaid account $accountId")
+                    skipped.add("${redactAccessToken(accessToken)}: no Firefly account for Plaid account")
                     continue
                 }
                 if (currentBalance == null) {
                     logger.warn("No current balance data received for Plaid account $accountId")
+                    skipped.add("Firefly account $fireflyAccountId: no balance")
                     continue
                 }
                 val fireflyAccount: AccountRead
@@ -319,6 +335,7 @@ class BatchSyncRunner(
                     fireflyAccount = fireflyAccountsApi.getAccount(fireflyAccountId.toString(), null).body().data
                 } catch (e: Exception) {
                     logger.error("Error fetching Firefly account $fireflyAccountId", e)
+                    skipped.add("Firefly account $fireflyAccountId: Firefly account read failed")
                     continue
                 }
                 val owedIsNegative = carriesOwedAsNegative(fireflyAccount)
@@ -331,6 +348,7 @@ class BatchSyncRunner(
                         "Firefly forces the sign of a liability opening balance (debit: negative, credit: positive), but Firefly account " +
                                 "$fireflyAccountId needs ${opening.amount}; opening balance NOT set, set it by hand"
                     )
+                    skipped.add("Firefly account $fireflyAccountId: liability sign forced")
                     continue
                 }
                 // Dated the day before the first imported transaction, so the account does not read 0 before it
@@ -346,6 +364,7 @@ class BatchSyncRunner(
                 )
             }
         }
+        return skipped
     }
 
     companion object {

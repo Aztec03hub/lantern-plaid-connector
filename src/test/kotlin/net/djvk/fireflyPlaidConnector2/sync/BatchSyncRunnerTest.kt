@@ -23,6 +23,7 @@ internal class BatchSyncRunnerTest {
             plaidBatchSize: Int = 100,
             syncHelper: SyncHelper? = null,
             converter: TransactionConverter? = null,
+            exit: (Int) -> Unit = {},
         ): BatchSyncRunner {
             val defaultSyncHelper = SyncHelper(
                 plaidAccountsConfig = AccountConfigs(listOf(AccountConfig(1, "account1Token", "plaidAccount1"))),
@@ -52,6 +53,7 @@ internal class BatchSyncRunnerTest {
                 syncHelper ?: defaultSyncHelper,
                 firefly.accountsApi,
                 converter ?: defaultTransactionConverter,
+                exit = exit,
             )
         }
 

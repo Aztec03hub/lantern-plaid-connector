@@ -50,11 +50,18 @@ data class PollResult(
     val transfersNeedingReview: Int = 0,
     /** Own-account routings skipped because the target has Plaid transactions of its own; a person must fix the rule. */
     val routingsRefused: Int = 0,
+    /** Updates Firefly refused with 409 this poll (a Plaid id is on another transaction); left as they were, a person must check. */
+    val updateConflicts: Int = 0,
+    /** 1 if the pairing pass threw this poll, plus merges core refused or that failed. */
+    val pairFailures: Int = 0,
+    /** Legs the pairer won't touch (reconciled or foreign amount). Informational, not part of [partial]. */
+    val pairLegsNeedingHuman: Int = 0,
 ) {
     /** True when the poll ran but something needs attention: a bank is failing, a write is dead-lettered. */
     @get:com.fasterxml.jackson.annotation.JsonIgnore
     val partial: Boolean get() = failedItems.isNotEmpty() || deadLetters > 0 || investmentFailures > 0 ||
-            deadLetterFilesUnreadable > 0 || transfersNeedingReview > 0 || routingsRefused > 0
+            deadLetterFilesUnreadable > 0 || transfersNeedingReview > 0 || routingsRefused > 0 ||
+            updateConflicts > 0 || pairFailures > 0
 }
 
 /**

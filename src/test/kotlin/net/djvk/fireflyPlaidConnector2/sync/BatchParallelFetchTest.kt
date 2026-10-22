@@ -243,6 +243,39 @@ internal class BatchParallelFetchTest {
     }
 
     @Test
+    fun aSkippedOpeningBalanceMakesTheRunExitNonZero() = runBlocking<Unit> {
+        val assets = createFireflyResponse(AccountArray(listOf(AccountRead("accounts", "1", Account("a1", ShortAccountTypeProperty.asset), ObjectLink())), Meta()))
+        val noLiabilities = createFireflyResponse(AccountArray(listOf(), Meta()))
+        whenever(firefly.accountsApi.listAccount(anyOrNull(), anyOrNull(), eq(AccountTypeFilter.asset))).thenReturn(assets)
+        whenever(firefly.accountsApi.listAccount(anyOrNull(), anyOrNull(), eq(AccountTypeFilter.liabilities))).thenReturn(noLiabilities)
+        whenever(firefly.transactionsApi.storeTransaction(any())).doSuspendableAnswer {
+            val store = it.getArgument<net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionStore>(0)
+            createFireflyResponse(
+                net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionSingle(
+                    TransactionRead("transactions", "1", net.djvk.fireflyPlaidConnector2.api.firefly.models.Transaction(transactions = store.transactions), ObjectLink())
+                )
+            )
+        }
+        whenever(plaid.api.transactionsGet(any<TransactionsGetRequest>())).doSuspendableAnswer {
+            val one = net.djvk.fireflyPlaidConnector2.lib.PlaidFixtures.getPaymentTransaction(
+                accountId = "a".repeat(37), transactionId = "t1", pendingTransactionId = null, amount = 5.0,
+            )
+            val response = mock<TransactionsGetResponse>()
+            whenever(response.transactions).thenReturn(listOf(one))
+            whenever(response.totalTransactions).thenReturn(1)
+            createPlaidResponse(response)
+        }
+        // the balance read fails, so the Item's opening balances are skipped
+        whenever(plaid.api.accountsBalanceGet(any<net.djvk.fireflyPlaidConnector2.api.plaid.models.AccountsBalanceGetRequest>())).doSuspendableAnswer { throw IllegalStateException("down") }
+        val helper = SyncHelper(AccountConfigs(listOf(AccountConfig(1, "token1", "a".repeat(37)))), "t", firefly.aboutApi, firefly.transactionsApi, firefly.accountsApi, firefly.plaidLinksApi)
+        val exits = mutableListOf<Int>()
+
+        BatchSyncRunnerTest.createRunner(plaid, firefly, setInitialBalance = true, syncHelper = helper, exit = { exits.add(it) }).run()
+
+        assertThat(exits).containsExactly(1)
+    }
+
+    @Test
     fun aBatchPlaidReadThatEndsOnAnEmptyPageBeforeTheTotalFails() = runBlocking<Unit> {
         val assets = createFireflyResponse(AccountArray(listOf(AccountRead("accounts", "1", Account("a1", ShortAccountTypeProperty.asset), ObjectLink())), Meta()))
         val noLiabilities = createFireflyResponse(AccountArray(listOf(), Meta()))
