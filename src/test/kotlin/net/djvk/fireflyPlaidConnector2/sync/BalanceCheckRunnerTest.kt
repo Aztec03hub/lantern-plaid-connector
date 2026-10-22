@@ -69,6 +69,8 @@ internal class BalanceCheckRunnerTest {
             }
             whenever(accountsApi.listTransactionByAccount(any(), anyOrNull(), anyOrNull(), anyOrNull(), anyOrNull(), anyOrNull())).doSuspendableAnswer {
                 val id = it.getArgument<String>(0)
+                // real Firefly answers 422 to a start with no end
+                if (it.getArgument<java.time.LocalDate?>(3) != null && it.getArgument<java.time.LocalDate?>(4) == null) throw IllegalStateException("422 The start must be a date before end")
                 val rows = if (id != "3") listOf() else listOf(
                     split("3", "9", "20.00", listOf("pending"), today.minusDays(1)),
                     split("3", "9", "7.00", listOf("pending"), today.minusDays(40)),

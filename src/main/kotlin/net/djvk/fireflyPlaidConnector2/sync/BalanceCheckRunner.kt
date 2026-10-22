@@ -127,7 +127,7 @@ class BalanceCheckRunner(
         var pending = BigDecimal.ZERO
         var page = 1
         while (true) {
-            val body = fireflyAccountsApi.listTransactionByAccount(id.toString(), page++, 50, from, null, TransactionTypeFilter.all).body()
+            val body = fireflyAccountsApi.listTransactionByAccount(id.toString(), page++, 50, from, now, TransactionTypeFilter.all).body()
             body.data.flatMap { it.attributes.transactions }
                 .filter { pendingTag in (it.tags ?: listOf()) && !it.date.atZoneSameInstant(zone).toLocalDate().isBefore(from) }
                 .forEach {
