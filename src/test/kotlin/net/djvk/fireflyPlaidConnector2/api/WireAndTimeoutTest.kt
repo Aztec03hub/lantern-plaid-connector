@@ -12,6 +12,7 @@ import io.ktor.utils.io.*
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.AboutApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.apis.TransactionsApi
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionStore
@@ -192,9 +193,9 @@ internal class WireAndTimeoutTest {
     // region M1: timeouts
 
     /** Same shape as ApiConfiguration.getClientConfig (expectSuccess + HttpTimeout), with a timer too long to ever race. */
-    private fun timeoutConfig(): (io.ktor.client.HttpClientConfig<*>) -> Unit = {
+    private fun timeoutConfig(timerMs: Long = 60_000): (io.ktor.client.HttpClientConfig<*>) -> Unit = {
         it.expectSuccess = true
-        it.install(HttpTimeout) { requestTimeoutMillis = 60_000 }
+        it.install(HttpTimeout) { requestTimeoutMillis = timerMs }
     }
 
     private suspend fun MockRequestHandleScope.fail(kind: String, request: io.ktor.client.request.HttpRequestData): io.ktor.client.request.HttpResponseData =
@@ -270,6 +271,33 @@ internal class WireAndTimeoutTest {
         }
     }
 
+    /**
+     * The one path the injected exception skips: the REAL HttpTimeout timer cancels the call and ktor turns that into
+     * HttpRequestTimeoutException. The handler never answers, so the timer always fires (no call count: it would race).
+     * A wrong timer config fails at the 10 s bound, never by a 60 s wait.
+     */
+    @Test
+    fun aRealRequestTimerTimeoutIsWrappedByPlaidAndFailsTheFireflyBatchLikeTheInjectedOne() {
+        val never = MockEngine { awaitCancellation() }
+        val plaid = PlaidApiWrapper(
+            baseUrl = "https://plaid.test", maxRetries = 2, plaidClientId = "cid", plaidSecret = "sec",
+            httpClientEngine = never, httpClientConfig = timeoutConfig(100), retryBackoffMillis = 1,
+        )
+        val pe = assertThrows<Throwable> {
+            runBlocking { withTimeout(10_000) { plaid.executeRequest({ it.accountsBalanceGet(AccountsBalanceGetRequest(accessToken = "t")) }, "t") } }
+        }
+        assertTrue(pe is RuntimeException && pe !is java.util.concurrent.CancellationException, "wrapped, got $pe")
+        assertTrue(generateSequence<Throwable>(pe) { it.cause }.any { it is HttpRequestTimeoutException }, "cause chain keeps the timeout, got ${generateSequence<Throwable>(pe) { it.cause }.toList()}")
+        val firefly = FireflyMock()
+        val tx = TransactionsApi("https://firefly.test", never, timeoutConfig(100))
+        tx.setAccessToken("t")
+        val helper = SyncHelper(AccountConfigs(emptyList()), "token", firefly.aboutApi, tx, firefly.accountsApi, firefly.plaidLinksApi)
+        val dtos = listOf(net.djvk.fireflyPlaidConnector2.transactions.FireflyTransactionDto(null, FireflyFixtures.getTransaction().transactions.first()))
+        val be = assertThrows<Throwable> { runBlocking { withTimeout(10_000) { helper.optimisticInsertBatchIntoFirefly(dtos) } } }
+        assertTrue(be is IOException && generateSequence<Throwable>(be) { it.cause }.any { it is HttpRequestTimeoutException }, "got ${generateSequence<Throwable>(be) { it.cause }.toList()}")
+        assertContains(be.message!!, "1 of 1 Firefly inserts timed out")
+    }
+
     @Test
     fun connectSocketAndRequestTimeoutsComeFromTheProperties() {
         fun run(request: Long): String {
@@ -277,7 +305,7 @@ internal class WireAndTimeoutTest {
                 ApiConfiguration(connect = 111, socket = 222, request = request).getClientConfig()(this)
             }
             return runBlocking {
-                try { client.get("https://x.test/").bodyAsText() } catch (e: HttpRequestTimeoutException) { "timeout" }
+                try { withTimeout(10_000) { client.get("https://x.test/").bodyAsText() } } catch (e: HttpRequestTimeoutException) { "timeout" }
             }
         }
         assertEquals("timeout", run(100))
