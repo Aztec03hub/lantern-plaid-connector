@@ -68,11 +68,19 @@ data class AwaitingRecord(
     val pendingExpectedEnd: LocalDate?,
     val estimateBasis: String?,
     val scoreSoFar: List<RulePoints>,
+    /** The leg's absolute amount as a decimal string ("12.34"), never a float; Lantern shows it (LAN-109). */
+    val amount: String? = null,
+    /** "out" or "in". */
+    val direction: String? = null,
+    /** The leg's description, control characters removed, at most 80 characters. */
+    val text: String? = null,
 )
 
 object Awaiting {
     private const val ACH_BUSINESS_DAYS = 5L
     private const val CARD_DAYS = 7L
+
+    internal fun amountText(cents: Long): String = java.math.BigDecimal.valueOf(kotlin.math.abs(cents), 2).toPlainString()
 
     private fun addBusinessDays(from: LocalDate, days: Long): LocalDate {
         var d = from
@@ -119,6 +127,7 @@ object Awaiting {
             today.isAfter(expectedBy) && waiting.isEmpty() -> "overdue"
             else -> "awaiting-partner"
         }
-        AwaitingRecord(leg.id, leg.account, leg.date, state, expected, if (leg.pending) null else expectedBy, waiting, firstSeen, pendingEnd, estimateBasis, evidence)
+        AwaitingRecord(leg.id, leg.account, leg.date, state, expected, if (leg.pending) null else expectedBy, waiting, firstSeen, pendingEnd, estimateBasis, evidence,
+            amountText(leg.cents), leg.dir.name.lowercase(), leg.text.filterNot { it.isISOControl() }.trim().take(80))
     }
 }
