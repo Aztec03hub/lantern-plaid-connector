@@ -147,6 +147,23 @@ class FireflyTransactionServiceTest {
     }
 
     @Test
+    fun anUpdate409InTheDeadLetterRetryAndInTheMainWriteIsEachCountedOnce() = runBlocking<Unit> {
+        val (store, service) = serviceWithStore()
+        whenever(syncHelper.updateBatchInFirefly(any())).doSuspendableAnswer { throw statusError(HttpStatusCode.UnprocessableEntity) }
+        service.processFireflyTransactionUpdates(listOf(), listOf(FireflyTransactionDto("ff7", linked("tx1").tx)), listOf())
+        assertThat(store.read()).hasSize(1)
+        assertThat(service.takeUpdateConflicts()).isEmpty()
+
+        whenever(syncHelper.updateBatchInFirefly(any())).doSuspendableAnswer { throw statusError(HttpStatusCode.Conflict) }
+        service.retryDeadLetters()
+        service.processFireflyTransactionUpdates(listOf(), listOf(FireflyTransactionDto("ff8", linked("tx2").tx)), listOf())
+
+        assertThat(store.read()).isEmpty()
+        assertThat(service.takeUpdateConflicts()).hasSize(2)
+        assertThat(service.takeUpdateConflicts()).isEmpty()
+    }
+
+    @Test
     fun a409OnAFreshUpdateIsNotKept() = runBlocking<Unit> {
         val (store, service) = serviceWithStore()
         whenever(syncHelper.updateBatchInFirefly(any())).doSuspendableAnswer { throw statusError(HttpStatusCode.Conflict) }
