@@ -91,6 +91,9 @@ internal class ResyncNoDuplicatesTest {
     private var conflictsEnabled = true
     private var lookupEnabled = true
 
+    /** The next this many link lookups answer "nothing held" (Firefly lagging), then it answers normally. */
+    private var lookupMissesLeft = 0
+
     private fun linkOwners(): Map<String, String> =
         journals.flatMap { (group, tx) -> tx.transactions.flatMap { it.plaidLinks.orEmpty() }.map { it.plaidTransactionId to group } }.toMap()
 
@@ -140,7 +143,7 @@ internal class ResyncNoDuplicatesTest {
             whenever(firefly.plaidLinksApi.lookupPlaidLinks(any())).doSuspendableAnswer {
                 // the fake mocks the API, so the real client's size rule is enforced here
                 require(it.getArgument<List<String>>(0).size in 1..PlaidLinksApi.MAX_IDS) { "A link lookup takes 1 to ${PlaidLinksApi.MAX_IDS} ids" }
-                val owners = if (lookupEnabled) linkOwners() else mapOf()
+                val owners = if (lookupEnabled && lookupMissesLeft-- <= 0) linkOwners() else mapOf()
                 val rows = it.getArgument<List<String>>(0).filter { id -> id in owners }.map { id ->
                     val group = owners.getValue(id)
                     val link = journals.getValue(group).transactions.flatMap { s -> s.plaidLinks.orEmpty() }.first { l -> l.plaidTransactionId == id }
@@ -368,13 +371,25 @@ internal class ResyncNoDuplicatesTest {
     @Test
     fun aPendingToPostedResyncWithTheLookupAloneLeavesOneJournal() { conflictsEnabled = false; pendingToPostedThenRepeat() }
 
-    /**
-     * LAN-110 (found by U38): with the lookup missing the pending journal, the 409 can't help (the posted id differs from the pending one's):
-     * the posted create lands as a second journal beside the still-held pending one. Enable once the connector re-checks.
-     */
-    @org.junit.jupiter.api.Disabled("LAN-110: pending to posted has no 409 defence; a lookup that misses leaves pending p1 and posted t1 as 2 journals")
+    /** LAN-110: the first lookup misses the pending journal (Firefly lagging); the re-check before the write finds it, so the posted one replaces it. */
     @Test
-    fun aPendingToPostedResyncWithThe409AloneLeavesOneJournal() { lookupEnabled = false; pendingToPostedThenRepeat() }
+    fun aPendingToPostedResyncWhoseFirstLookupMissesLeavesOneJournal() = runBlocking<Unit> {
+        poll(created = listOf(plaid("p1", 25.0, pending = true)))
+        val posted = plaid("t1", 25.0, pendingId = "p1")
+        lookupMissesLeft = 1
+        poll(created = listOf(posted), deleted = listOf("p1"))
+        poll(created = listOf(posted), deleted = listOf("p1"))
+        assertThat(journals).describedAs("journals after the resync").hasSize(1)
+        assertThat(linkOwners().keys).describedAs("link owners").containsExactly("t1")
+    }
+
+    /** LAN-110: a pending journal that truly no longer exists must not block the posted create. */
+    @Test
+    fun aPostedTransactionWhosePendingJournalIsGoneIsStillCreated() = runBlocking<Unit> {
+        poll(created = listOf(plaid("t1", 25.0, pendingId = "p-gone")), deleted = listOf("p-gone"))
+        assertThat(journals).hasSize(1)
+        assertThat(linkOwners().keys).containsExactly("t1")
+    }
 
     @Test
     fun aBatchOverTheLookupLimitIsChunkedAndNotDuplicatedOnResync() = runBlocking<Unit> {
