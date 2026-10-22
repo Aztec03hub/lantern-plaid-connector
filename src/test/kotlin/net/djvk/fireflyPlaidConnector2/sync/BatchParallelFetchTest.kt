@@ -127,7 +127,36 @@ internal class BatchParallelFetchTest {
     }
 
     @Test
-    fun aCrashedEarlierRunIsRepairedBeforeThisRunStarts() = runBlocking<Unit> {
+    fun aFailingClosingPutDoesNotReplaceTheRunsOwnFailure() = runBlocking<Unit> {
+        val assets = createFireflyResponse(AccountArray((1..1).map { AccountRead("accounts", "$it", Account("a$it", ShortAccountTypeProperty.asset), ObjectLink()) }, Meta()))
+        whenever(firefly.accountsApi.listAccount(anyOrNull(), anyOrNull(), eq(AccountTypeFilter.asset))).thenReturn(assets)
+        val noLiab = createFireflyResponse(AccountArray(listOf(), Meta()))
+        whenever(firefly.accountsApi.listAccount(anyOrNull(), anyOrNull(), eq(AccountTypeFilter.liabilities))).thenReturn(noLiab)
+        val page = mock<TransactionsGetResponse> { on { transactions } doReturn listOf() }
+        val pageResponse = createPlaidResponse(page)
+        whenever(plaid.api.transactionsGet(any<TransactionsGetRequest>())).thenReturn(pageResponse)
+        val configurationApi = mock<net.djvk.fireflyPlaidConnector2.api.firefly.apis.ConfigurationApi>()
+        whenever(configurationApi.runningBalanceNeedsRefresh()).thenReturn(false)
+        whenever(configurationApi.setUseRunningBalance(true)).doSuspendableAnswer { throw IllegalStateException("closing put 500") }
+        val pairPass = mock<net.djvk.fireflyPlaidConnector2.pairing.PairPass>()
+        whenever(pairPass.run(any(), any(), any(), any())).doSuspendableAnswer { throw IllegalStateException("pairing blew up") }
+        val helper = SyncHelper(AccountConfigs(listOf(AccountConfig(1, "token1", "plaid1"))), "t", firefly.aboutApi, firefly.transactionsApi, firefly.accountsApi, firefly.plaidLinksApi)
+        val runner = BatchSyncRunner(
+            5, false, null, 100, plaid.wrapper, helper, firefly.accountsApi,
+            net.djvk.fireflyPlaidConnector2.transactions.TransactionConverter(
+                false, "America/New_York", 5, false, "p-", false, "d-", net.djvk.fireflyPlaidConnector2.config.properties.TransactionStyleConfig(),
+            ),
+            pairPass, net.djvk.fireflyPlaidConnector2.pairing.PairSettings(dryRun = false, afterRun = true), configurationApi, true, "tok",
+        )
+
+        val failure = runCatching { runner.run() }.exceptionOrNull()
+
+        assertThat(failure).hasMessageContaining("pairing blew up")
+        assertThat(failure!!.suppressed.map { it.message }).contains("closing put 500")
+    }
+
+    @Test
+    fun aCrashedEarlierRunIsRepairedBeforeThisRunStarts()= runBlocking<Unit> {
         val configurationApi = mock<net.djvk.fireflyPlaidConnector2.api.firefly.apis.ConfigurationApi>()
         whenever(configurationApi.runningBalanceNeedsRefresh()).thenReturn(true)
 
