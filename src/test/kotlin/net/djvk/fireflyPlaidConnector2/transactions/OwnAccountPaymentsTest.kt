@@ -33,7 +33,9 @@ internal class OwnAccountPaymentsTest {
     }
 
     @Test
-    fun imagineAmountIsNotRouted() = assertThat(r(11000, 2026, 10, 7)).isNull()
+    fun imagineAmountIsNotRouted() {
+        assertThat(r(11000, 2026, 10, 7)).isNull()
+    }
 
     @Test
     fun twoCandidatesWithTheSameAmountAndDayAreNotRouted() {
