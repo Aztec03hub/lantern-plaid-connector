@@ -27,6 +27,7 @@ import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import org.mockito.kotlin.any
+import org.mockito.kotlin.times
 import org.mockito.kotlin.argumentCaptor
 import org.mockito.kotlin.doReturn
 import org.mockito.kotlin.doSuspendableAnswer
@@ -311,7 +312,30 @@ internal class R3SyncTest {
         orchestrator.processTransactions(accountMap, sequence, mutableMapOf())
 
         verify(helper, never()).optimisticInsertBatchIntoFirefly(any())
-        assertThat(store.read().single().abandoned).isTrue()
+        assertThat(store.read()).isEmpty() // an older import holds it: the letter is dropped, as a fresh create would be
+    }
+
+    /** N1 follow-up: the search starts working on poll 3 and finds no older import: the create goes out exactly once. */
+    @Test
+    fun anUncheckedCreateIsSentExactlyOnceWhenTheLegacySearchStartsWorkingAndFindsNothing() = runBlocking<Unit> {
+        emptyFirefly()
+        val store = DeadLetterStore(dir.toString())
+        whenever(helper.heldByLegacyReference(any())).doSuspendableAnswer { throw statusError(HttpStatusCode.UnprocessableEntity) }
+        whenever(plaidSyncService.processPlaidTransactions(any(), any())).thenReturn(plaidResult(updated = listOf(plaid(accountA, "tx1", 50.0))))
+        val orchestrator = orchestrator(service(store), store)
+        val sequence = sequenceOf(Pair("tok-12345678", listOf(accountA)))
+
+        orchestrator.processTransactions(accountMap, sequence, mutableMapOf())
+        whenever(plaidSyncService.processPlaidTransactions(any(), any())).thenReturn(plaidResult())
+        orchestrator.processTransactions(accountMap, sequence, mutableMapOf())
+        verify(helper, never()).optimisticInsertBatchIntoFirefly(any())
+
+        whenever(helper.heldByLegacyReference(any())).thenReturn(false)
+        orchestrator.processTransactions(accountMap, sequence, mutableMapOf())
+        orchestrator.processTransactions(accountMap, sequence, mutableMapOf())
+
+        verify(helper, times(1)).optimisticInsertBatchIntoFirefly(any())
+        assertThat(store.read()).isEmpty()
     }
 
     /** M1: a waiting update/promotion letter takes Plaid's later values in its split and its fallback. */

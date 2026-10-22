@@ -272,7 +272,26 @@ class FireflyTransactionService(
      */
     suspend fun retryDeadLetters(accountMap: Map<String, Int> = mapOf()) {
         val store = deadLetters ?: return
-        for (letter in store.read()) {
+        for (stored in store.read()) {
+            var letter = stored
+            if (letter.abandoned && letter.legacyUnchecked) {
+                // Kept because the legacy search was rejected: ask again. Answered "none" re-arms it (it is then sent once,
+                //  like any create); answered "held" drops it; still rejected leaves it abandoned for a person.
+                val ids = letter.split?.plaidLinks.orEmpty().map { it.plaidTransactionId }
+                if (ids.isEmpty()) continue
+                val held = try {
+                    ids.firstOrNull { syncHelper.heldByLegacyReference(it) }
+                } catch (cre: ClientRequestException) {
+                    continue
+                }
+                if (held != null) {
+                    logger.warn("Dead-lettered create ${letter.key}: Firefly already holds Plaid id $held from before the link table; dropped")
+                    store.remove(letter.operation, letter.key)
+                    continue
+                }
+                letter = letter.copy(abandoned = false, legacyUnchecked = false, attempts = 0)
+                store.add(letter)
+            }
             if (letter.abandoned) continue
             if (letter.operation == "create" && letter.split?.plaidLinks.isNullOrEmpty()) {
                 // Written by a build from before the link table: sent now it would be unprotected against duplicates
