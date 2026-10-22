@@ -20,6 +20,7 @@ import org.springframework.stereotype.Component
 import java.time.*
 import java.util.*
 import kotlin.math.abs
+import net.djvk.fireflyPlaidConnector2.sync.FlipMark
 import net.djvk.fireflyPlaidConnector2.api.plaid.models.Transaction as PlaidTransaction
 
 typealias PlaidAccountId = String
@@ -375,6 +376,8 @@ class TransactionConverter(
          * alone. A person has to check them; the poll reports the count (callback status "partial").
          */
         val transfersNeedingReview: Set<FireflyTransactionId> = setOf(),
+        /** Flip marks to save (null clears), see [shouldSwapTransfer]. */
+        val flipMarks: Map<FireflyTransactionId, FlipMark?> = mapOf(),
     )
 
     /**
@@ -390,6 +393,7 @@ class TransactionConverter(
         plaidUpdatedTxs: List<PlaidTransaction>,
         plaidDeletedTxs: List<PlaidTransactionId>,
         existingFireflyTxs: List<TransactionRead>,
+        flippedLegs: Map<FireflyTransactionId, FlipMark> = mapOf(),
     ): ConvertPollSyncResult {
         logger.trace("Starting ${::convertPollSync.name}")
         val deletedPlaidIds = plaidDeletedTxs.toSet()
@@ -409,6 +413,7 @@ class TransactionConverter(
          */
         val promotedFireflyIds = mutableSetOf<FireflyTransactionId>()
         val needsReview = linkedSetOf<FireflyTransactionId>()
+        val markChanges = linkedMapOf<FireflyTransactionId, FlipMark?>()
 
         /**
          * Don't pass in [plaidUpdatedTxs] here because we're not going to try to update transfers for now
@@ -439,7 +444,7 @@ class TransactionConverter(
                     // A posted transaction that replaces a pending one we already imported updates that Firefly
                     //  transaction in place (keeping its id, categories, budgets, notes and user tags) rather than
                     //  deleting and re-creating it.
-                    val promotion = convertPendingPromotion(create.plaidTransaction, indexer, accountMap, needsReview)
+                    val promotion = convertPendingPromotion(create.plaidTransaction, indexer, accountMap, needsReview, flippedLegs, markChanges)
                     if (promotion != null) {
                         promotedFireflyIds.add(promotion.transactionId)
                         updates.add(promotion)
@@ -539,7 +544,7 @@ class TransactionConverter(
             updates.add(
                 when {
                     existingSplit != null && existingSplit.isPaired() -> {
-                        val swap = shouldSwapTransfer(plaidUpdate, existingSplit, accountMap, plaidUpdatedTxs, target.id, needsReview)
+                        val swap = shouldSwapTransfer(plaidUpdate, existingSplit, accountMap, plaidUpdatedTxs, target.id, needsReview, flippedLegs, markChanges)
                         val leg = transferLegUpdate(convertedUpdate.tx, plaidUpdate, existingSplit, swap)
                         FireflyTransactionDto(
                             target.id,
@@ -623,6 +628,7 @@ class TransactionConverter(
             updates = updates,
             deletes = deletes,
             transfersNeedingReview = needsReview,
+            flipMarks = markChanges,
         )
     }
 
@@ -641,6 +647,8 @@ class TransactionConverter(
         indexer: PlaidLinkIndexer,
         accountMap: Map<PlaidAccountId, FireflyAccountId>,
         needsReview: MutableSet<FireflyTransactionId>,
+        marks: Map<FireflyTransactionId, FlipMark>,
+        markChanges: MutableMap<FireflyTransactionId, FlipMark?>,
     ): FireflyTransactionDto? {
         val pendingId = posted.pendingTransactionId ?: return null
         val target = indexer.find(pendingId) ?: return null
@@ -658,7 +666,7 @@ class TransactionConverter(
         if (existingSplit.isPaired()) {
             // The pending transaction became one leg of a transfer; that transfer is the posted one's record too.
             //  Creating a single for it would record the same money twice.
-            val swap = shouldSwapTransfer(posted, existingSplit, accountMap, listOf(), target.id, needsReview)
+            val swap = shouldSwapTransfer(posted, existingSplit, accountMap, listOf(), target.id, needsReview, marks, markChanges)
             val leg = transferLegUpdate(convertSingle(posted, accountMap).tx, posted, existingSplit, swap)
             return FireflyTransactionDto(
                 target.id,
@@ -699,10 +707,13 @@ class TransactionConverter(
     /**
      * Whether a Plaid update of one leg ([plaidTx]) should swap the source and destination of its Firefly transfer.
      *
-     * A transfer made from two Plaid legs flips only when BOTH legs say so. When one leg flips and the other does not
-     * (in this sync, [batchUpdates]), the two banks disagree about the direction, so the pair is no longer a transfer
-     * we can describe: nothing is swapped (a swap per leg would flip-flop on every later update), the transfer is
-     * logged at ERROR and added to [needsReview]. A transfer with only one known Plaid leg has only that leg's word.
+     * A transfer made from two Plaid legs flips only when BOTH legs say so. When one leg flips and the other has not
+     * (in this sync, [batchUpdates], or in an earlier one, [marks]), the two banks disagree about the direction, so
+     * nothing is swapped (a swap per leg would flip-flop on every later update), the transfer is logged at ERROR and
+     * added to [needsReview], and the flipped leg is remembered in [markChanges]. The partner flipping in a later sync
+     * then swaps the transfer and clears the mark. A mark counts only while the transfer's source is the one it was made
+     * under (a swap since makes it stale), and a leg that flips back clears its own mark. A transfer with only one
+     * known Plaid leg has only that leg's word.
      */
     private suspend fun shouldSwapTransfer(
         plaidTx: PlaidTransaction,
@@ -711,17 +722,28 @@ class TransactionConverter(
         batchUpdates: Collection<PlaidTransaction>,
         fireflyId: FireflyTransactionId,
         needsReview: MutableSet<FireflyTransactionId>,
+        marks: Map<FireflyTransactionId, FlipMark>,
+        markChanges: MutableMap<FireflyTransactionId, FlipMark?>,
     ): Boolean {
-        if (!isLegReversed(plaidTx, existingSplit, accountMap)) return false
+        val mark = marks[fireflyId]?.takeIf { it.sourceId == existingSplit.sourceId }
+        if (mark == null && fireflyId in marks) markChanges[fireflyId] = null
+        if (!isLegReversed(plaidTx, existingSplit, accountMap)) {
+            if (mark != null && plaidTx.transactionId in mark.legs) markChanges[fireflyId] = null
+            return false
+        }
         val partnerId = existingSplit.plaidLinks.orEmpty().map { it.plaidTransactionId }
             .firstOrNull { it != plaidTx.transactionId } ?: return true
         val partner = batchUpdates.firstOrNull { it.transactionId == partnerId }
-        if (partner != null && isLegReversed(partner, existingSplit, accountMap)) return true
+        if ((partner != null && isLegReversed(partner, existingSplit, accountMap)) || (mark != null && partnerId in mark.legs)) {
+            if (fireflyId in marks) markChanges[fireflyId] = null
+            return true
+        }
         logger.error(
             "Plaid reversed one leg of Firefly transfer {} but not the other; leaving the transfer as it is, check it by hand",
             fireflyId,
         )
         needsReview.add(fireflyId)
+        markChanges[fireflyId] = FlipMark(existingSplit.sourceId, mark?.legs.orEmpty() + plaidTx.transactionId)
         return false
     }
 

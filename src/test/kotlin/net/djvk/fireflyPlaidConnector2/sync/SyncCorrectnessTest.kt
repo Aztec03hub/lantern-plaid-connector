@@ -217,12 +217,12 @@ internal class SyncCorrectnessTest {
         whenever(fireflyTransactionService.fetchExistingFireflyTransactions()).thenReturn(listOf())
         whenever(fireflyTransactionService.fetchMissingByPlaidId(any(), any())).thenReturn(listOf(old))
         whenever(fireflyTransactionService.windowStart()).thenReturn(java.time.LocalDate.now().minusDays(5))
-        whenever(converter.convertPollSync(any(), any(), any(), any(), any()))
+        whenever(converter.convertPollSync(any(), any(), any(), any(), any(), any()))
             .thenReturn(net.djvk.fireflyPlaidConnector2.transactions.TransactionConverter.ConvertPollSyncResult(listOf(), listOf(), listOf("ffOld")))
 
         orchestrator().processTransactions(mapOf(), sequenceOf(), mutableMapOf())
 
-        verify(converter).convertPollSync(any(), any(), any(), eq(listOf("oldId")), eq(listOf(old)))
+        verify(converter).convertPollSync(any(), any(), any(), eq(listOf("oldId")), eq(listOf(old)), any())
         verify(fireflyTransactionService).processFireflyTransactionUpdates(any(), any(), eq(listOf("ffOld")))
     }
 

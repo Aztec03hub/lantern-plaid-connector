@@ -43,7 +43,7 @@ internal class OneShotModeTest {
             (it.arguments[1] as MutableMap<String, String>)["token1"] = "cursor-new"
             PlaidTransactionResult(emptyList(), emptyList(), emptyList())
         }
-        whenever(converter.convertPollSync(any(), any(), any(), any(), any()))
+        whenever(converter.convertPollSync(any(), any(), any(), any(), any(), any()))
             .thenReturn(TransactionConverter.ConvertPollSyncResult(emptyList(), emptyList(), emptyList()))
     }
 
