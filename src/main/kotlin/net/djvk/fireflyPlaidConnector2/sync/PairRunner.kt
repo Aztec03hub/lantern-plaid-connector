@@ -63,8 +63,8 @@ class PairRunner(
                     val inn = unmergeInn.trim()
                     // W1: a typo or swapped ids would record a rejection that never matches; only ids that really are the two legs of one merged journal are accepted
                     val today = LocalDate.now()
-                    check(pass.isMergedInFirefly(out, inn, today.minusDays(settings.lookbackDays), today)) {
-                        "No merged journal in Firefly (last ${settings.lookbackDays} days) has outflow $out and inflow $inn as its two legs. Nothing was unmerged. Check the ids and their order: <outflow plaid id> then <inflow plaid id>."
+                    check(pass.isMergedInFirefly(out, inn, today.minusDays(settings.unmergeLookbackDays), today)) {
+                        "No merged journal in Firefly (last ${settings.unmergeLookbackDays} days) has outflow $out and inflow $inn as its two legs. Nothing was unmerged. Check the ids and their order: <outflow plaid id> then <inflow plaid id>."
                     }
                     RejectedPair(out, inn, id, LocalDate.now().toString())
                 } else error(

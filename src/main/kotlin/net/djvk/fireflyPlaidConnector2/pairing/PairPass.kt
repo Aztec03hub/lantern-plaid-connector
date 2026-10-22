@@ -22,6 +22,7 @@ import org.springframework.stereotype.Component
 import java.math.RoundingMode
 import java.nio.file.Files
 import java.nio.file.Path
+import java.time.Duration
 import java.time.Instant
 import java.time.LocalDate
 import java.time.OffsetDateTime
@@ -32,7 +33,8 @@ import java.time.ZoneId
 class PairSettings(
     /** A pass only prints the plan, writing nothing, until this is false. */
     @Value("\${fireflyPlaidConnector2.pair.dryRun:true}") val dryRun: Boolean = true,
-    @Value("\${fireflyPlaidConnector2.pair.lookbackDays:3650}") val lookbackDays: Long = 3650,
+    /** How far back a pass reads and decides. Older single legs are decided already (a partner must arrive within fallbackDays); a repair of old history passes a larger value. */
+    @Value("\${fireflyPlaidConnector2.pair.lookbackDays:90}") val lookbackDays: Long = 90,
     @Value("\${fireflyPlaidConnector2.pair.markerDays:5}") val markerDays: Int = 5,
     @Value("\${fireflyPlaidConnector2.pair.fallbackDays:10}") val fallbackDays: Int = 10,
     @Value("\${fireflyPlaidConnector2.pair.autoMin:4}") val autoMin: Int = 4,
@@ -49,6 +51,10 @@ class PairSettings(
     @Value("\${fireflyPlaidConnector2.timeZone:UTC}") val timeZone: String = "UTC",
     /** Days the sync lags the bank's posting (4.4): the watermark is the last sync date minus this. */
     @Value("\${fireflyPlaidConnector2.pair.postingLagDays:1}") val postingLagDays: Int = 1,
+    /** How far back the unmerge check looks for a merged journal. Unlike a pass it must find old merges. */
+    @Value("\${fireflyPlaidConnector2.pair.unmergeLookbackDays:3650}") val unmergeLookbackDays: Long = 3650,
+    /** Pair dry-run reports (pair-dry-run-*.txt) older than this many days are removed after a pass; the newest is always kept. */
+    @Value("\${fireflyPlaidConnector2.pair.dryRunKeepDays:14}") val dryRunKeepDays: Long = 14,
 )
 
 object PairConfigLoader {
@@ -117,6 +123,15 @@ class PairPass(
         PairAccount(it.fireflyAccountId, it.displayName ?: "account ${it.fireflyAccountId}", it.institutionName, it.mask, it.roles.toSet())
     }
 
+    /** One concurrent write in Firefly shifts the pages of the strict read. A second read right away is normally clean; a second failure is reported as before. */
+    private suspend fun readStrictly(from: LocalDate, to: LocalDate): List<TransactionRead> =
+        try {
+            service.fetchFireflyTransactionsStrictly(from, to, MAX_PAGES)
+        } catch (e: IllegalStateException) {
+            logger.warn("Firefly changed during the pass read ({}); reading once more", e.message?.lineSequence()?.firstOrNull())
+            service.fetchFireflyTransactionsStrictly(from, to, MAX_PAGES)
+        }
+
     /** Runs one pass over [from]..[to] (the dates it may decide); [dryRun] overrides the setting when not null. */
     suspend fun run(from: LocalDate, to: LocalDate, dryRun: Boolean = settings.dryRun, now: Instant = Instant.now()): PairPassReport {
         pairApi.setAccessToken(settings.fireflyAccessToken)
@@ -127,8 +142,9 @@ class PairPass(
         // one line, always: the values this run really uses (A4), so a log shows which settings produced the plan
         println(
             "Pair settings in effect: dryRun=$dryRun autoMin=${config.autoMin} reviewMin=${config.reviewMin} markerDays=${config.markerDays} " +
-                "fallbackDays=${config.fallbackDays} lookbackDays=${settings.lookbackDays} useWatermark=${settings.useWatermark}",
+                "fallbackDays=${config.fallbackDays} lookbackDays=${settings.lookbackDays} useWatermark=${settings.useWatermark} postingLagDays=${settings.postingLagDays}",
         )
+        if (!dryRun && !settings.useWatermark) println("Pair watermark OFF: every leg counts as settled, so no leg waits for its bank's sync")
         val accounts = pairAccounts()
         val kinds = syncHelper.fetchAccountKinds().mapKeys { it.key.toInt() }.mapValues { it.value }
         val window = config.fallbackDays.toLong()
@@ -137,7 +153,9 @@ class PairPass(
         //  deciding on a truncated or shifting view
         val readFrom = from.minusDays(2 * window)
         val readTo = minOf(LocalDate.now(zone), to.plusDays(2 * window))
-        val journals = service.fetchFireflyTransactionsStrictly(readFrom, readTo, MAX_PAGES)
+        val readStart = System.nanoTime()
+        val journals = readStrictly(readFrom, readTo)
+        println("Pair read: ${journals.size} journals in ${(System.nanoTime() - readStart) / 1_000_000} ms (range $readFrom..$readTo)")
 
         val needsHuman = mutableListOf<Pair<Leg, String>>()
         val legs = journals.mapNotNull { toLeg(it, accounts.map { a -> a.id }.toSet(), needsHuman) }
@@ -297,10 +315,21 @@ class PairPass(
         //  merged nothing, so it must not claim its pairs as paired there (B3): it writes a file of its own.
         val awaitingFile = if (dryRun) "pair-awaiting-dryrun.json" else "pair-awaiting.json"
         Files.writeString(dir.resolve(awaitingFile), mapper.writerWithDefaultPrettyPrinter().writeValueAsString(awaiting))
+        pruneDryRunReports(dir, now)
+    }
+
+    private fun pruneDryRunReports(dir: Path, now: Instant) {
+        val cutoff = now.minus(Duration.ofDays(settings.dryRunKeepDays))
+        val files = Files.list(dir).use { s -> s.filter { it.fileName.toString().matches(DRY_RUN_FILE) }.toList() }
+        val newest = files.maxByOrNull { it.fileName.toString() } // names carry the ISO time, so the greatest name is the newest
+        files.filter { it != newest && Files.getLastModifiedTime(it).toInstant().isBefore(cutoff) }.forEach {
+            runCatching { Files.deleteIfExists(it) }.onFailure { _ -> logger.warn("Could not remove old pair report {}", it.fileName) }
+        }
     }
 
     companion object {
         const val MAX_PAGES = 5000
+        private val DRY_RUN_FILE = Regex("pair-dry-run-.*\\.txt")
         /** The `pairMergeId` of a merge found again in Firefly rather than made by this pass: its inflow leg is not the real one (W4). */
         const val RECOVERED_ID = "unknown"
 
