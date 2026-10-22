@@ -585,7 +585,7 @@ internal class LoanInterestRunnerTest {
     }
 
     @Test
-    fun aFailedReReadStoresNothingAndFailsTheRun()= runBlocking<Unit> {  // r1: fail safe
+    fun aFailedReReadStoresNothingAndFailsTheRun() = runBlocking<Unit> {  // r1: fail safe
         owedBefore[d(8, 31)] = "23817.37"
         val r = runner("23491.66", chargedThenNew)
         reReadSees(chargedThenNew) { error("Firefly did not answer") }

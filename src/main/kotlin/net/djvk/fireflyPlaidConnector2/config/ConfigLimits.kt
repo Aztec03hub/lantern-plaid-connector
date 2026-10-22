@@ -73,7 +73,7 @@ internal fun permissionWarnings(paths: List<Path>): List<String> = paths.mapNotN
         return@mapNotNull null
     }
     val open = perms.any { it.name.startsWith("GROUP") || it.name.startsWith("OTHERS") }
-    if (open) "${p.fileName} is readable by group or others (mode ${PosixFilePermissions.toString(perms)}); it holds credentials, chmod 600" else null
+    if (open) "${p.fileName} is readable by group or others (mode ${PosixFilePermissions.toString(perms)}); it holds credentials, chmod ${if (Files.isDirectory(p)) "700" else "600"}" else null
 }
 
 /** Files named in `spring.config.location` / `additional-location` (comma separated, `optional:` and `file:` prefixes stripped); directories are skipped. */

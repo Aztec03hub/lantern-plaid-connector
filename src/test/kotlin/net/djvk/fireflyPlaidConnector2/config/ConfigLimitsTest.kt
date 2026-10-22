@@ -129,4 +129,12 @@ class ConfigLimitsTest {
         assertThat(w).hasSize(2)
         assertThat(w.last()).startsWith("plaid_sync_cursors.txt is readable by group or others")
     }
+
+    @Test
+    fun `a missing cursor file at first start is silent and a directory is told chmod 700`() {  // CL22 r1
+        java.nio.file.Files.setPosixFilePermissions(tmp, java.nio.file.attribute.PosixFilePermissions.fromString("rwxr-xr-x"))
+        val w = permissionWarnings(startupPermissionPaths(listOf(), tmp))
+        assertThat(w).hasSize(1)
+        assertThat(w.single()).contains("chmod 700").doesNotContain("secret")
+    }
 }
