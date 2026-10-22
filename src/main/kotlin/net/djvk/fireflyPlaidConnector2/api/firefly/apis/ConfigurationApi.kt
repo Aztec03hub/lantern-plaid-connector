@@ -23,6 +23,8 @@ package net.djvk.fireflyPlaidConnector2.api.firefly.apis
 import com.fasterxml.jackson.databind.ObjectMapper
 import io.ktor.client.*
 import io.ktor.client.engine.*
+import io.ktor.client.plugins.ResponseException
+import io.ktor.client.statement.bodyAsText
 import io.ktor.http.*
 import net.djvk.fireflyPlaidConnector2.api.firefly.infrastructure.*
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.*
@@ -154,6 +156,33 @@ open class ConfigurationApi(
             mapOf("value" to enabled),
             listOf("firefly_iii_auth"),
         )
+    }
+
+    /**
+     * GET /api/v1/configuration/configuration.running_balance_dirty: true when core holds balances written while the
+     * running balance was off and not refreshed yet (an earlier run that did not finish). A core that does not know
+     * the key (404) answers false; any other failure throws.
+     */
+    open suspend fun runningBalanceNeedsRefresh(): kotlin.Boolean {
+        val response = try {
+            request(
+                RequestConfig<kotlin.Any?>(
+                    RequestMethod.GET,
+                    "/api/v1/configuration/configuration.running_balance_dirty",
+                    query = mutableMapOf(),
+                    headers = mutableMapOf(),
+                ),
+                null,
+                listOf("firefly_iii_auth"),
+            )
+        } catch (e: ResponseException) {
+            // the production client has expectSuccess on, so a 404 arrives as an exception
+            if (e.response.status == HttpStatusCode.NotFound) return false
+            throw e
+        }
+        if (response.status == HttpStatusCode.NotFound) return false
+        check(response.status.isSuccess()) { "Firefly answered ${response.status} to the running balance flag" }
+        return ObjectMapper().readTree(response.bodyAsText()).path("data").path("value").asBoolean(false)
     }
 
 }
