@@ -71,7 +71,7 @@ internal class LiabilitiesRunnerTest {
         val wrapper = PlaidApiWrapper("https://plaid.test", 3, "id", "secret", engine, ApiConfiguration().getClientConfig(), 0)
         whenever(syncHelper.getAllPlaidAccessTokenAccountIdSets()).thenReturn(
             Pair(configs.accounts.associate { it.plaidAccountId to it.fireflyAccountId },
-                sequenceOf("tokA" to listOf("plA", "plC"), "tokB" to listOf("plD"), "tokE" to listOf("plE"), "tokC" to listOf("plF"))))
+                sequenceOf("tokA" to listOf("plA", "plX", "plC"), "tokB" to listOf("plD"), "tokE" to listOf("plE"), "tokC" to listOf("plF"))))
         return LiabilitiesRunner(syncHelper, wrapper, configs, stateDir)
     }
 
@@ -106,7 +106,7 @@ internal class LiabilitiesRunnerTest {
     }
 
     @Test
-    fun optionsAccountIdsHoldsOnlyTheConfiguredIds() {
+    fun optionsAccountIdsHoldsOnlyTheConfiguredIds() { // plX is on the Item but not configured
         runner().run()
         val body = ObjectMapper().readTree(calls.first { it.second == "/liabilities/get" && "tokA" in it.third }.third)
         assertThat(body["options"]["account_ids"].map { it.asText() }).containsExactly("plA", "plC")
