@@ -83,6 +83,7 @@ internal class BatchParallelFetchTest {
         val pageResponse = createPlaidResponse(page)
         whenever(plaid.api.transactionsGet(any<TransactionsGetRequest>())).thenReturn(pageResponse)
         val configurationApi = mock<net.djvk.fireflyPlaidConnector2.api.firefly.apis.ConfigurationApi>()
+        whenever(configurationApi.runningBalanceNeedsRefresh()).thenReturn(false)
         val pairPass = mock<net.djvk.fireflyPlaidConnector2.pairing.PairPass>()
         whenever(pairPass.run(any(), any(), any(), any())).doSuspendableAnswer { throw IllegalStateException("pairing blew up") }
         val items = (1..4).map { AccountConfig(it, "token$it", "plaid$it") }
@@ -103,8 +104,83 @@ internal class BatchParallelFetchTest {
         order.verify(configurationApi).setUseRunningBalance(true)
     }
 
+    /** A runner over one empty Plaid page with a mocked ConfigurationApi, for the running balance tests. */
+    private fun runnerWith(
+        configurationApi: net.djvk.fireflyPlaidConnector2.api.firefly.apis.ConfigurationApi,
+        disableRunningBalance: Boolean,
+    ): BatchSyncRunner = runBlocking {
+        val assets = createFireflyResponse(AccountArray((1..1).map { AccountRead("accounts", "$it", Account("a$it", ShortAccountTypeProperty.asset), ObjectLink()) }, Meta()))
+        val noLiabilities = createFireflyResponse(AccountArray(listOf(), Meta()))
+        whenever(firefly.accountsApi.listAccount(anyOrNull(), anyOrNull(), eq(AccountTypeFilter.asset))).thenReturn(assets)
+        whenever(firefly.accountsApi.listAccount(anyOrNull(), anyOrNull(), eq(AccountTypeFilter.liabilities))).thenReturn(noLiabilities)
+        val page = mock<TransactionsGetResponse> { on { transactions } doReturn listOf() }
+        val pageResponse = createPlaidResponse(page)
+        whenever(plaid.api.transactionsGet(any<TransactionsGetRequest>())).thenReturn(pageResponse)
+        val helper = SyncHelper(AccountConfigs(listOf(AccountConfig(1, "token1", "plaid1"))), "t", firefly.aboutApi, firefly.transactionsApi, firefly.accountsApi, firefly.plaidLinksApi)
+        BatchSyncRunner(
+            5, false, null, 100, plaid.wrapper, helper, firefly.accountsApi,
+            net.djvk.fireflyPlaidConnector2.transactions.TransactionConverter(
+                false, "America/New_York", 5, false, "p-", false, "d-", net.djvk.fireflyPlaidConnector2.config.properties.TransactionStyleConfig(),
+            ),
+            null, null, configurationApi, disableRunningBalance, "tok",
+        )
+    }
+
     @Test
-    fun anItemIsReadToPlaidsTotalEvenWhenAPageIsShort() = runBlocking<Unit> {
+    fun aCrashedEarlierRunIsRepairedBeforeThisRunStarts() = runBlocking<Unit> {
+        val configurationApi = mock<net.djvk.fireflyPlaidConnector2.api.firefly.apis.ConfigurationApi>()
+        whenever(configurationApi.runningBalanceNeedsRefresh()).thenReturn(true)
+
+        runnerWith(configurationApi, true).run()
+
+        val order = org.mockito.kotlin.inOrder(configurationApi)
+        order.verify(configurationApi).setUseRunningBalance(true)
+        order.verify(configurationApi).setUseRunningBalance(false)
+        order.verify(configurationApi).setUseRunningBalance(true)
+    }
+
+    @Test
+    fun aCleanCoreIsNotRefreshedAtTheStart() = runBlocking<Unit> {
+        val configurationApi = mock<net.djvk.fireflyPlaidConnector2.api.firefly.apis.ConfigurationApi>()
+        whenever(configurationApi.runningBalanceNeedsRefresh()).thenReturn(false)
+
+        runnerWith(configurationApi, true).run()
+
+        val order = org.mockito.kotlin.inOrder(configurationApi)
+        order.verify(configurationApi).setUseRunningBalance(false)
+        order.verify(configurationApi).setUseRunningBalance(true)
+        org.mockito.kotlin.verify(configurationApi, org.mockito.kotlin.times(1)).setUseRunningBalance(true)
+    }
+
+    @Test
+    fun theFlagIsNotAskedWhenTheSwitchIsOff() = runBlocking<Unit> {
+        val configurationApi = mock<net.djvk.fireflyPlaidConnector2.api.firefly.apis.ConfigurationApi>()
+
+        runnerWith(configurationApi, false).run()
+
+        org.mockito.kotlin.verify(configurationApi, org.mockito.kotlin.never()).runningBalanceNeedsRefresh()
+        org.mockito.kotlin.verify(configurationApi, org.mockito.kotlin.never()).setUseRunningBalance(org.mockito.kotlin.any())
+    }
+
+    @Test
+    fun aTimeoutOnTheRefreshingPutIsLoggedAndTheRunCarriesOn() = runBlocking<Unit> {
+        val configurationApi = mock<net.djvk.fireflyPlaidConnector2.api.firefly.apis.ConfigurationApi>()
+        whenever(configurationApi.runningBalanceNeedsRefresh()).thenReturn(true)
+        whenever(configurationApi.setUseRunningBalance(true)).doSuspendableAnswer {
+            throw io.ktor.client.plugins.HttpRequestTimeoutException("http://firefly.test", 60000L)
+        }
+
+        runnerWith(configurationApi, true).run()
+
+        // repair PUT timed out, the off PUT still happened, the closing PUT timed out too and nothing was thrown
+        val order = org.mockito.kotlin.inOrder(configurationApi)
+        order.verify(configurationApi).setUseRunningBalance(true)
+        order.verify(configurationApi).setUseRunningBalance(false)
+        order.verify(configurationApi).setUseRunningBalance(true)
+    }
+
+    @Test
+    fun anItemIsReadToPlaidsTotalEvenWhenAPageIsShort()= runBlocking<Unit> {
         val assets = createFireflyResponse(AccountArray(listOf(AccountRead("accounts", "1", Account("a1", ShortAccountTypeProperty.asset), ObjectLink())), Meta()))
         val noLiabilities = createFireflyResponse(AccountArray(listOf(), Meta()))
         whenever(firefly.accountsApi.listAccount(anyOrNull(), anyOrNull(), eq(AccountTypeFilter.asset))).thenReturn(assets)
