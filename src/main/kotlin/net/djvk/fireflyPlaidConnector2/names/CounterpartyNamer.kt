@@ -1,6 +1,7 @@
 package net.djvk.fireflyPlaidConnector2.names
 
 import com.fasterxml.jackson.databind.ObjectMapper
+import net.djvk.fireflyPlaidConnector2.pairing.PairDefaults
 import java.io.File
 
 /**
@@ -11,15 +12,31 @@ import java.io.File
  * Order of preference: Plaid's own counterparty or merchant name (already clean), else the cleaned bank text, and the
  * [aliases] table (canonical key -> display name) has the last word.
  */
-class CounterpartyNamer(private val aliases: Map<String, String> = mapOf()) {
+class CounterpartyNamer(private val aliases: Map<String, String> = mapOf(), chains: Collection<String> = DEFAULT_CHAINS) {
     private val aliasByKey = aliases.mapKeys { key(it.key) }
+
+    // Effective chain stems: the defaults plus the alias file's "chains", longest first so "walmart supercenter" beats "walmart".
+    private val stemAlternation = (DEFAULT_CHAINS + chains).map { it.trim().lowercase() }.filter { it.isNotEmpty() }.distinct()
+        .sortedByDescending { it.length }
+        .joinToString("|") { stem ->
+            stem.split(Regex("\\s+")).joinToString("\\s+") { w -> w.map { c -> if (c == '\'') "['\u2019]?" else Regex.escape(c.toString()) }.joinToString("") }
+        }
+    // e.g. KROGERFUEL, COSTCO GAS, TARGET.COM: the chain with a fuel, gas or web suffix is the chain; the rest is location text
+    private val chainVariant = Regex("^(?i)($stemAlternation)(?:\\s*(?:fuel\\s*center|fuel|gas\\s*station|gasoline|gas|\\.com|wholesale))+(?![a-z]).*$")
+    // N8: a 1-2 digit store number after a known chain is a store number ("TARGET 12 CHICAGO IL")
+    private val chainStore = Regex("^(?i)($stemAlternation)\\s+\\d{1,2}\\b.*$")
 
     /** [plaidName] is `counterparties[0].name` or `merchant_name` when Plaid gave one; [text] is the raw transaction name. */
     fun canonical(plaidName: String?, text: String): String {
+        special(plaidName, text)?.let { return it }
         val base = plaidName?.takeIf { it.isNotBlank() }?.let { clean(it) }?.takeIf { it.isNotBlank() } ?: clean(text)
         val shown = base.ifBlank { text.trim() }
         return aliasByKey[key(shown)] ?: titleCase(shown)
     }
+
+    /** The fixed label for a statement carry-over or balance consolidation line (raw text or Plaid name), else null. */
+    fun special(plaidName: String?, text: String): String? =
+        SPECIAL.firstOrNull { (re, _) -> re.containsMatchIn(text) || (plaidName != null && re.containsMatchIn(plaidName)) }?.second
 
     /** The comparison key: lower case letters and digits, single spaces. Two names with the same key are the same payee. */
     fun key(name: String) = name.lowercase().replace(Regex("[^a-z0-9]+"), " ").trim()
@@ -47,8 +64,8 @@ class CounterpartyNamer(private val aliases: Map<String, String> = mapOf()) {
         // without a # is part of the name ("Pier 39 Parking", "Route 66 Diner", "Studio 54") and stays.
         s = s.replace(Regex("\\s+(#|(?i:no)\\.?\\s*)\\d{1,5}\\b.*$"), "")
         s = s.replace(Regex("\\s+\\d{3,5}\\b.*$"), "")
-        // N8: a 1-2 digit store number after a known chain is a store number ("TARGET 12 CHICAGO IL", "WALMART SUPERCENTER 47")
-        s = s.replace(CHAIN_STORE, "\$1")
+        s = s.replace(chainVariant, "\$1")
+        s = s.replace(chainStore, "\$1")
         // a trailing "CITY ST" location, only when a name of at least two words is left
         Regex("\\s+[A-Za-z.]+\\s+[A-Z]{2}$").find(s)?.let { if (s.substring(0, it.range.first).trim().contains(' ')) s = s.substring(0, it.range.first) }
         s = s.replace(Regex("(?i)(\\s+(payroll|ppd|web|ccd|pmt|payment|autopay|direct dep|dir dep|des|inc\\.?|llc\\.?))+$"), "")
@@ -71,20 +88,33 @@ class CounterpartyNamer(private val aliases: Map<String, String> = mapOf()) {
         else s.lowercase().split(' ').joinToString(" ") { w -> if ('&' in w && w.length <= 4) w.uppercase() else w.replaceFirstChar { it.uppercase() } }
 
     companion object {
-        // ponytail: a fixed list; a 1-2 digit number cannot be told from part of a name ("Studio 54", "Pier 1") without knowing the chain.
-        // Add a chain here when its stores show up as separate payees.
-        private val CHAIN_STORE = Regex(
-            "^(?i)(walmart supercenter|walmart|target|starbucks|kroger|home depot|shell oil|shell|cvs[ /]pharmacy|cvs|trader joe['\u2019]?s|lowe['\u2019]?s|costco|walgreens|mcdonald['\u2019]?s|dunkin( donuts)?)\\s+\\d{1,2}\\b.*$",
+        /** Chains built in; add more with a "chains" array in the alias file. */
+        val DEFAULT_CHAINS = listOf(
+            "walmart supercenter", "walmart", "target", "starbucks", "kroger", "home depot", "shell oil", "shell", "cvs pharmacy",
+            "cvs/pharmacy", "cvs", "trader joe's", "trader joes", "lowe's", "lowes", "costco", "walgreens", "mcdonald's", "mcdonalds",
+            "dunkin donuts", "dunkin",
+        )
+
+        private val SPECIAL = listOf(
+            Regex(PairDefaults.carryOver.pattern, RegexOption.IGNORE_CASE) to "Statement carry-over",
+            Regex(PairDefaults.consolidation.pattern, RegexOption.IGNORE_CASE) to "Balance consolidation",
         )
 
         /** Prefixes whose text after the colon is a person, not a bank spelling of the prefix ("Zelle: JOHN SMITH"). */
         private val PERSON_TO_PERSON = setOf("zelle", "venmo", "cash app", "paypal", "apple cash")
 
-        /** `{"EVOLV CONSULTING": "Evolv Consulting", ...}`; keys are compared by [key]. A missing file is no aliases. */
+        /** `{"chains": ["acme hardware"], "EVOLV CONSULTING": "Evolv Consulting", ...}`; keys are compared by [key]. A missing file is no aliases. */
         fun fromFile(path: String): CounterpartyNamer {
             if (path.isBlank() || !File(path).exists()) return CounterpartyNamer()
             val node = ObjectMapper().readTree(File(path))
-            return CounterpartyNamer(node.fields().asSequence().associate { it.key to it.value.asText() })
+            val chains = node.get("chains")?.also { c ->
+                require(c.isArray && c.all { it.isTextual }) { "alias file key \"chains\" must be an array of strings" }
+            }?.map { it.asText() } ?: listOf()
+            val aliases = node.fields().asSequence().filter { it.key != "chains" }.associate {
+                require(it.value.isTextual) { "alias file key \"${it.key}\" must be a string" }
+                it.key to it.value.asText()
+            }
+            return CounterpartyNamer(aliases, chains)
         }
     }
 }

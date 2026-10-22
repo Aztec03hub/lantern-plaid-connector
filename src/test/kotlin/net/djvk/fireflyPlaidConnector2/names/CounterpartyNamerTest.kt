@@ -136,4 +136,60 @@ internal class CounterpartyNamerTest {
     fun keysIgnoreCasePunctuationAndSpacing() {
         assertThat(namer.key("Evolv  Consulting, Inc.")).isEqualTo(namer.key("EVOLV CONSULTING INC"))
     }
+
+    @Test
+    fun chainSpellingsWithAFuelGasOrWebSuffixResolveToTheChain() {
+        for ((text, want) in listOf(
+            "KROGERFUEL #123 CHICAGO IL" to "Kroger", "KROGER FUEL 012345" to "Kroger", "COSTCO GAS #1234 NAPERVILLE IL" to "Costco",
+            "COSTCO WHOLESALE #12" to "Costco", "TARGET.COM  800-591-3869" to "Target", "Target.com" to "Target",
+        )) assertThat(namer.canonical(null, text)).describedAs(text).isEqualTo(want)
+        assertThat(namer.canonical("Costco Gas", "COSTCO GAS #9")).isEqualTo("Costco")
+    }
+
+    @Test
+    fun aGlueOnlyCountsWithAWordEdge() {
+        assertThat(namer.key(namer.canonical(null, "TARGETED ADS INC"))).isNotEqualTo("target")
+        assertThat(namer.key(namer.canonical(null, "COSTCO GASOLINEX"))).isNotEqualTo("costco")
+    }
+
+    @Test
+    fun walmartSupercenterKeepsItsOwnName() {
+        assertThat(namer.canonical(null, "WALMART SUPERCENTER 47")).isEqualTo("Walmart Supercenter")
+        assertThat(namer.canonical(null, "WALMART #12")).isEqualTo("Walmart")
+    }
+
+    private fun aliasFile(json: String) = java.io.File.createTempFile("alias", ".json").also { it.deleteOnExit(); it.writeText(json) }.path
+
+    @Test
+    fun aChainAddedThroughTheAliasFileMergesItsStoreNumbers() {
+        val n = CounterpartyNamer.fromFile(aliasFile("""{"chains":["acme hardware"],"EVOLV CONSULTING":"Evolv Consulting"}"""))
+        val names = listOf("ACME HARDWARE 12 CHICAGO IL", "ACME HARDWARE 7", "ACME HARDWARE").map { n.canonical(null, it) }
+        assertThat(names.toSet()).hasSize(1)
+        assertThat(n.canonical(null, "EVOLV CONSULTING")).isEqualTo("Evolv Consulting")
+        assertThat(setOf(namer.canonical(null, "ACME HARDWARE 12 CHICAGO IL"), namer.canonical(null, "ACME HARDWARE 7"))).hasSize(2)
+    }
+
+    @Test
+    fun aFileWithoutChainsKeepsTheDefaultChains() {
+        val n = CounterpartyNamer.fromFile(aliasFile("""{"EVOLV CONSULTING":"Evolv Consulting"}"""))
+        assertThat(n.canonical(null, "TARGET 12 CHICAGO IL")).isEqualTo("Target")
+    }
+
+    @Test
+    fun aMalformedAliasFileStopsWithTheKey() {
+        for ((json, key) in listOf("""{"chains":"secretvalue"}""" to "chains", """{"X":["secretvalue"]}""" to "X")) {
+            val e = org.junit.jupiter.api.assertThrows<IllegalArgumentException> { CounterpartyNamer.fromFile(aliasFile(json)) }
+            assertThat(e.message).contains(key).doesNotContain("secretvalue")
+        }
+    }
+
+    @Test
+    fun statementTextsGetTheirOwnLabelEvenWithAnAccountSuffix() {
+        assertThat(namer.canonical(null, "LAST STATEMENT BAL FROM ACCT ENDING 1234")).isEqualTo("Statement carry-over")
+        assertThat(namer.canonical(null, "BALANCE CONSOLIDATION")).isEqualTo("Balance consolidation")
+        assertThat(namer.canonical(null, "Balance Consolidation 05/01")).isEqualTo("Balance consolidation")
+        val aliased = CounterpartyNamer(mapOf("BALANCE CONSOLIDATION" to "Something else"))
+        assertThat(aliased.canonical(null, "BALANCE CONSOLIDATION")).isEqualTo("Balance consolidation")
+        assertThat(namer.special("BALANCE CONSOLIDATION", "x")).isEqualTo("Balance consolidation")
+    }
 }

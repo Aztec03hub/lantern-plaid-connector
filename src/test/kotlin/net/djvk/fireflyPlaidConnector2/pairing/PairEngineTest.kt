@@ -281,4 +281,11 @@ internal class PairEngineTest {
     fun aGapPastTheFallbackWindowIsNotACandidate() {
         assertThat(engine().evaluate(out(o2, "AC X"), inn(imagine, "Credit Card Payment Received", date = day.plusDays(11)))).isNull()
     }
+
+    @Test
+    fun consolidationConstantStillDrivesTheMarkerAndTheDestination() {
+        assertThat(PairDefaults.consolidation.containsMatchIn("BALANCE CONSOLIDATION")).isTrue()
+        assertThat(PairDefaults.outMarkers.any { it.regex.pattern == PairDefaults.consolidation.pattern }).isTrue()
+        assertThat(PairDefaults.destinations.any { it.regex.pattern == PairDefaults.consolidation.pattern }).isTrue()
+    }
 }
