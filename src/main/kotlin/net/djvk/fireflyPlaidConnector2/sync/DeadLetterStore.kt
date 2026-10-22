@@ -45,6 +45,11 @@ data class DeadLetter(
     val fallback: TransactionSplit? = null,
     /** See FireflyTransactionDto.plaidAccountId. */
     val plaidAccountId: String? = null,
+    /**
+     * True for a create kept because the legacy-reference search was rejected: it was never checked against an older
+     * import, so it stays abandoned (a revision may refresh it, never re-arm it) until a person resolves it.
+     */
+    val legacyUnchecked: Boolean = false,
 )
 
 /**

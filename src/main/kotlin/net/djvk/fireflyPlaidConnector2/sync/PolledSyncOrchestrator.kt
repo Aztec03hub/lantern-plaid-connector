@@ -449,8 +449,10 @@ class PolledSyncOrchestrator(
     ) {
         val store = deadLetterStore ?: return
         if (plaid.created.isEmpty() && plaid.updated.isEmpty() && plaid.deleted.isEmpty()) return
-        val creates = store.read().filter { it.operation == "create" && it.split != null }
-        if (creates.isEmpty()) return
+        val all = store.read()
+        val creates = all.filter { it.operation == "create" && it.split != null }
+        val updates = all.filter { it.operation == "update" && it.split != null }
+        if (creates.isEmpty() && updates.isEmpty()) return
         fun letterFor(plaidId: String) = creates.firstOrNull { letter ->
             letter.split?.plaidLinks.orEmpty().any { it.plaidTransactionId == plaidId }
         }
@@ -462,9 +464,32 @@ class PolledSyncOrchestrator(
             store.remove("create", letter.key)
         }
         for (modified in plaid.updated) {
-            val letter = letterFor(modified.transactionId) ?: continue
-            logger.info("Applying Plaid's update of ${modified.transactionId} to its dead-lettered create ${letter.key}")
-            store.add(letter.copy(split = converter.reviseUnsentCreate(letter.split!!, modified, accountMap), attempts = 0, abandoned = false))
+            val letter = letterFor(modified.transactionId)
+            if (letter != null) {
+                logger.info("Applying Plaid's update of ${modified.transactionId} to its dead-lettered create ${letter.key}")
+                store.add(
+                    letter.copy(
+                        split = converter.reviseUnsentCreate(letter.split!!, modified, accountMap),
+                        attempts = 0, abandoned = letter.legacyUnchecked,
+                    )
+                )
+            }
+            // A waiting update or promotion letter holding this id (which also keeps E3 from creating it) takes the change too
+            for (u in updates) {
+                val cur = store.read().firstOrNull { it.operation == "update" && it.key == u.key } ?: continue
+                val id = modified.transactionId
+                if (cur.split?.plaidLinks.orEmpty().none { it.plaidTransactionId == id } &&
+                    cur.fallback?.plaidLinks.orEmpty().none { it.plaidTransactionId == id }
+                ) continue
+                logger.info("Applying Plaid's update of $id to its dead-lettered update ${cur.key}")
+                store.add(
+                    cur.copy(
+                        split = cur.split?.let { converter.reviseUnsentUpdate(it, modified, accountMap) },
+                        fallback = cur.fallback?.let { converter.reviseUnsentCreate(it, modified, accountMap) },
+                        attempts = 0, abandoned = false,
+                    )
+                )
+            }
         }
         for (removedId in plaid.deleted) {
             val letter = store.read().firstOrNull { l ->
@@ -477,7 +502,7 @@ class PolledSyncOrchestrator(
             } else {
                 logger.info("Plaid removed one leg of the dead-lettered transfer ${letter.key}; keeping the other leg's money")
                 store.remove("create", letter.key)
-                store.add(letter.copy(key = FireflyTransactionService.letterKey(survivor), split = survivor, attempts = 0, abandoned = false))
+                store.add(letter.copy(key = FireflyTransactionService.letterKey(survivor), split = survivor, attempts = 0, abandoned = letter.legacyUnchecked))
             }
         }
     }

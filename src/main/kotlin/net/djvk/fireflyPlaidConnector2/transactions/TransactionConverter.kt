@@ -860,6 +860,24 @@ class TransactionConverter(
     }
 
     /**
+     * Applies a Plaid change to a dead-lettered UPDATE ([unsent], the split of an update letter): only what Plaid owns
+     * (date, amount, process date, Plaid tags) is refreshed; accounts, type, ids and user fields stay as the letter has them.
+     */
+    suspend fun reviseUnsentUpdate(
+        unsent: TransactionSplit,
+        plaidTx: PlaidTransaction,
+        accountMap: Map<PlaidAccountId, FireflyAccountId>,
+    ): TransactionSplit {
+        val converted = convertSingle(plaidTx, accountMap, currentImportTag(), link = true).tx
+        return unsent.copy(
+            date = converted.date,
+            amount = converted.amount,
+            processDate = converted.processDate,
+            tags = mergeTags(unsent.tags, converted.tags),
+        )
+    }
+
+    /**
      * Prepares a converted transaction to be sent as an update to the existing Firefly transaction [target]:
      * - Plaid-derived tags (category and pending tags) are refreshed, but tags the user added in Firefly are kept.
      *   Sending just the Plaid tags would remove the user's.
