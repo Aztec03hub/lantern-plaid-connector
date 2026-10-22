@@ -28,7 +28,9 @@ internal class OwnAccountPaymentsTest {
     }
 
     @Test
-    fun personalLoanRoutesToThree() = assertThat(r(12000, 2026, 10, 7)).isEqualTo(3)
+    fun personalLoanRoutesToThree() {
+        assertThat(r(12000, 2026, 10, 7)).isEqualTo(3)
+    }
 
     @Test
     fun imagineAmountIsNotRouted() = assertThat(r(11000, 2026, 10, 7)).isNull()

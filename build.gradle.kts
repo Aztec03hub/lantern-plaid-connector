@@ -90,3 +90,51 @@ tasks.withType<KotlinCompile> {
 tasks.withType<Test> {
     useJUnitPlatform()
 }
+
+// verifyTestReport (U39): every @Test method must show up in the XML report (a skipped one counts), and the
+// skips are printed by reason even on a green build. Keep the regexes in step with TestReportCheckTest.kt.
+val verifyTestReport = tasks.register("verifyTestReport") {
+    val testTask = tasks.named<Test>("test")
+    val partial = provider { (testTask.get().filter as org.gradle.api.internal.tasks.testing.filter.DefaultTestFilter).let { it.includePatterns.isNotEmpty() || it.commandLineIncludePatterns.isNotEmpty() } }
+    val srcDir = layout.projectDirectory.dir("src/test/kotlin")
+    val xmlDir = layout.buildDirectory.dir("test-results/test")
+    inputs.dir(srcDir)
+    inputs.dir(xmlDir).optional()
+    outputs.upToDateWhen { false }
+    mustRunAfter(testTask)
+    doLast {
+        if (partial.get()) {
+            logger.lifecycle("verifyTestReport: partial run (--tests filter), count check skipped")
+            return@doLast
+        }
+        val annotated = Regex("""(?m)^\s*@(Test|ParameterizedTest|RepeatedTest|TestFactory)\b(?:\([^)]*\))?(?:\s*@\w+(?:\([^)]*\))?)*\s*(?:(?:internal|private|public|override)\s+)*fun\s+(`[^`]+`|\w+)""")
+        val testcase = Regex("""<testcase\s+name="([^"]*)"\s+classname="([^"]*)"[^>]*?(/>|>)""")
+        val skippedTag = Regex("""<skipped(?:\s+message="([^"]*)")?""")
+        val want = sortedSetOf<String>()
+        srcDir.asFile.walkTopDown().filter { it.extension == "kt" }.forEach { f ->
+            // parameterized names are display names, so those only need their class in the report ("Class.*")
+            annotated.findAll(f.readText()).forEach { want += f.nameWithoutExtension + "." + (if (it.groupValues[1] == "Test") it.groupValues[2].trim('`') else "*") }
+        }
+        val have = mutableSetOf<String>()
+        val haveClasses = mutableSetOf<String>()
+        val skips = sortedMapOf<String, Int>()
+        xmlDir.get().asFile.listFiles { f -> f.extension == "xml" }.orEmpty().forEach { x ->
+            val text = x.readText()
+            testcase.findAll(text).forEach {
+                val cls = it.groupValues[2].substringAfterLast('.').substringBefore('$')
+                haveClasses += cls + ".*"
+                have += cls + "." + it.groupValues[1].replace(Regex("""\[\d+]$"""), "").substringBefore('(')
+            }
+            skippedTag.findAll(text).forEach { skips.merge(it.groupValues[1].ifEmpty { "(no message)" }, 1, Int::plus) }
+        }
+        val missing = want - have - haveClasses
+        logger.lifecycle("verifyTestReport: ${want.size} annotated, ${want.size - missing.size} executed or skipped, ${missing.size} missing")
+        logger.lifecycle("verifyTestReport: skipped ${skips.values.sum()}")
+        skips.forEach { (m, n) -> logger.lifecycle("  %3d  %s".format(n, m)) }
+        if (skips.keys.any { it.contains("ACCEPTANCE GATE SKIPPED") }) {
+            logger.lifecycle("*** pairing acceptance gate did not run: see docs/handoff/U39-report.md for the one command ***")
+        }
+        if (missing.isNotEmpty()) throw GradleException("annotated tests missing from the report: $missing")
+    }
+}
+tasks.test { finalizedBy(verifyTestReport) }
