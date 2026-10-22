@@ -208,7 +208,8 @@ internal class InvestmentTransactionsTest {
 
     @Test
     fun anOutageLongerThanTheWindowReadsBackToTheLastSuccess() = runBlocking<Unit> {
-        assertThat(startOfReadWith(LocalDate.of(2026, 3, 10))).isEqualTo(LocalDate.of(2026, 3, 10))
+        // the last success (03-10) minus the 14-day window, so late postings dated before it are still read
+        assertThat(startOfReadWith(LocalDate.of(2026, 3, 10))).isEqualTo(LocalDate.of(2026, 2, 24))
     }
 
     @Test
@@ -223,7 +224,28 @@ internal class InvestmentTransactionsTest {
 
     @Test
     fun theReadBackIsCappedAtTheMaximum() = runBlocking<Unit> {
-        assertThat(startOfReadWith(LocalDate.of(2025, 12, 1))).isEqualTo(LocalDate.of(2025, 12, 30))
+        val log = ch.qos.logback.classic.Logger::class.java.cast(org.slf4j.LoggerFactory.getLogger(PolledSyncOrchestrator::class.java))
+        val appender = ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent>().also { it.start(); log.addAppender(it) }
+        try {
+            assertThat(startOfReadWith(LocalDate.of(2025, 12, 1))).isEqualTo(LocalDate.of(2025, 12, 30))
+        } finally {
+            log.detachAppender(appender)
+        }
+        assertThat(appender.list.filter { it.level == ch.qos.logback.classic.Level.WARN }.map { it.formattedMessage })
+            .anyMatch { it.contains("exceeds investmentMaxLookbackDays=90") }
+    }
+
+    @Test
+    fun aGapInsideTheCapLogsNoCapWarning() = runBlocking<Unit> {
+        val log = ch.qos.logback.classic.Logger::class.java.cast(org.slf4j.LoggerFactory.getLogger(PolledSyncOrchestrator::class.java))
+        val appender = ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent>().also { it.start(); log.addAppender(it) }
+        try {
+            startOfReadWith(LocalDate.of(2026, 3, 10))
+        } finally {
+            log.detachAppender(appender)
+        }
+        assertThat(appender.list.filter { it.level == ch.qos.logback.classic.Level.WARN }.map { it.formattedMessage })
+            .noneMatch { it.contains("exceeds") }
     }
 
     @Test
@@ -244,7 +266,7 @@ internal class InvestmentTransactionsTest {
 
         o.syncInvestments(mapOf("brokerage" to 3), today.plusDays(20))
         verify(plaidSyncService).fetchInvestmentTransactions(
-            eq("tokBroker"), any(), eq(today), eq(today.plusDays(20))
+            eq("tokBroker"), any(), eq(today.minusDays(14)), eq(today.plusDays(20))
         )
     }
 
