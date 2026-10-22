@@ -104,7 +104,7 @@ class PlaidApiWrapper(
                 if (remainingRetries <= 1) throw cre
                 val retryAfter = cre.response.headers[HttpHeaders.RetryAfter]?.trim()?.toLongOrNull()?.let { it.coerceIn(0, 3600) * 1000 }
                 delay(minOf(retryAfter ?: rateLimitWaitMillis, rateLimitWaitMillis))
-                return executeRequest(request, logString, remainingRetries - 1, true)
+                return executeRequest(request, logString, remainingRetries - 1, boundRateLimit || !is400RateLimit)
             }
             val transientCode = errorCode?.takeIf { it in TRANSIENT_INSTITUTION_CODES }
             if (transientCode != null) {
@@ -132,7 +132,7 @@ class PlaidApiWrapper(
     /**
      * Plaid's `error_code` when [cre] is a transient institution or rate-limit error (error_type RATE_LIMIT or a code in
      * [TRANSIENT_INSTITUTION_CODES]), else null. Never returns the message, which can hold user data.
-     * Kept for the planned U34 balance check; executeRequest itself now reads the body once.
+     * Used by BalanceCheckRunner (U34); executeRequest itself reads the body once.
      */
     suspend fun transientPlaidError(cre: ClientRequestException): String? {
         val (type, code) = plaidErrorTypeAndCode(cre)
