@@ -82,4 +82,20 @@ internal class PlaidApiWrapperRateLimitTest {
         assertThat(e.message).contains("maxRetries is 0")
         assertThat(calls).isEqualTo(0)
     }
+
+    private val limited400 = HttpStatusCode.BadRequest to """{"error_type":"RATE_LIMIT","error_code":"ACCOUNTS_LIMIT"}"""
+
+    @Test
+    fun a400RateLimitWaitsLikeA429AndIsBounded() {
+        val t0 = System.nanoTime()
+        assertThrows<ClientRequestException> { call(wrapper(cap = 40) { limited400 }, bound = false) }  // backoff is 0, so only the cap can make it wait
+        assertThat(calls).isEqualTo(3)
+        assertThat((System.nanoTime() - t0) / 1_000_000).isBetween(70, 5_000)
+    }
+
+    @Test
+    fun a400WithoutAnErrorTypeIsThrownAtOnce() {
+        assertThrows<ClientRequestException> { call(wrapper(cap = 40) { HttpStatusCode.BadRequest to """{"error_code":"RATE_LIMIT"}""" }) }
+        assertThat(calls).isEqualTo(1)
+    }
 }
