@@ -72,11 +72,18 @@ internal class LinkTableLiveFireflyTest {
     )
 
     /** A TransactionsApi whose Nth store (1-based) fails like a dropped connection, after the first N-1 went through. */
-    private inner class CrashingTxApi(private val crashOn: Int) : TransactionsApi(url, null, config) {
+    private inner class CrashingTxApi(private val crashOn: Int, private val afterEarlierOnesLand: Boolean = true) : TransactionsApi(url, null, config) {
         val stores = AtomicInteger()
+        private val earlierLanded = kotlinx.coroutines.CompletableDeferred<Unit>()
         override suspend fun storeTransaction(transactionStore: TransactionStore): HttpResponse<TransactionSingle> {
-            if (stores.incrementAndGet() == crashOn) throw java.io.IOException("connection reset (simulated)")
-            return super.storeTransaction(transactionStore)
+            val n = stores.incrementAndGet()
+            if (n == crashOn) {
+                // The creates run concurrently (writeConcurrency), so "the 2nd store" can fire before the 1st is committed
+                //  and cancel it. Wait for the earlier one to land so this is the crash BETWEEN two creates.
+                if (afterEarlierOnesLand) earlierLanded.await()
+                throw java.io.IOException("connection reset (simulated)")
+            }
+            return super.storeTransaction(transactionStore).also { if (n == crashOn - 1) earlierLanded.complete(Unit) }
         }
     }
 
@@ -198,6 +205,35 @@ internal class LinkTableLiveFireflyTest {
         assertThat(found).hasSize(2)
         assertThat(held("c1$run", "c2$run")).containsExactlyInAnyOrder("c1$run", "c2$run")
         assertThat(retry.fireflyCreated).isEqualTo(1)
+        assertThat(store.read()).isEmpty()
+        cleanup(found)
+    }
+
+    /**
+     * The same crash with no ordering: the failing store fires at once, while the other create may still be in flight
+     * and gets cancelled. Whatever landed before the crash (none, or one) is held at most once, and the retry ends with
+     * each create recorded exactly once.
+     */
+    @Test
+    fun aPollThatCrashesWhileAnotherCreateIsInFlightStillEndsWithEachRecordedOnce() = runBlocking<Unit> {
+        creds()
+        val store = DeadLetterStore(dir.toString())
+        val crashing = CrashingTxApi(crashOn = 2, afterEarlierOnesLand = false).also { it.setAccessToken(token) }
+        val crashHelper = SyncHelper(AccountConfigs(emptyList()), token, AboutApi(url, null, config), crashing, accountsApi, linksApi)
+        val creates = listOf(plaid(plaidA, "r1$run", 13.0), plaid(plaidA, "r2$run", 14.0))
+
+        assertThatThrownBy { runBlocking { poll(orchestrator(store, crashing, crashHelper), created = creates) } }
+            .isInstanceOf(java.io.IOException::class.java)
+        val before = held("r1$run", "r2$run")
+        println("LINKLIVE racing crash: after the crash ${summary(mine("r1$run", "r2$run"))}")
+        assertThat(mine("r1$run", "r2$run")).hasSize(before.size)
+
+        val retry = poll(orchestrator(store), created = creates)
+        val found = mine("r1$run", "r2$run")
+        println("LINKLIVE racing crash: after the retry ${summary(found)} created=${retry.fireflyCreated}")
+        assertThat(found).hasSize(2)
+        assertThat(held("r1$run", "r2$run")).containsExactlyInAnyOrder("r1$run", "r2$run")
+        assertThat(retry.fireflyCreated).isEqualTo(2 - before.size)
         assertThat(store.read()).isEmpty()
         cleanup(found)
     }
