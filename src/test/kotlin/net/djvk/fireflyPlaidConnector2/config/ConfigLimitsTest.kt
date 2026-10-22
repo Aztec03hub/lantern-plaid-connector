@@ -120,4 +120,13 @@ class ConfigLimitsTest {
         val f = tmp.resolve("a.yml").also { java.nio.file.Files.writeString(it, "x") }
         assertThat(configFilePaths("optional:file:$f, $tmp", null)).containsExactly(f)
     }
+
+    @Test
+    fun `the cursor file and its directory are checked at startup`() {  // LAN-72
+        fileWithMode("plaid_sync_cursors.txt", "rw-r--r--")
+        java.nio.file.Files.setPosixFilePermissions(tmp, java.nio.file.attribute.PosixFilePermissions.fromString("rwxr-xr-x"))
+        val w = permissionWarnings(startupPermissionPaths(listOf(), tmp))
+        assertThat(w).hasSize(2)
+        assertThat(w.last()).startsWith("plaid_sync_cursors.txt is readable by group or others")
+    }
 }

@@ -1013,7 +1013,7 @@ internal class PairPassTest {
         pass(w, dryRun = false).run(d.minusDays(5), today, now = now)
         val again = pass(w, dryRun = false).run(d.minusDays(5), today, now = now)
         assertThat(w.requests).hasSize(1)
-        assertThat(again.text).contains("Confirmed pair rout1>rin1 was not merged")
+        assertThat(again.text).doesNotContain("Confirmed pair") // U47d Low 2: already merged, so quiet
     }
 
     @Test

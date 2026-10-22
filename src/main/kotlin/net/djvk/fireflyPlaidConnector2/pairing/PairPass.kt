@@ -186,7 +186,8 @@ class PairPass(
         val result = firstResult.copy(proposals = firstResult.proposals.map {
             if (!it.auto && (it.edge.out.id to it.edge.inn.id) in confirmed) it.copy(auto = true, heldBy = "human-confirmed") else it
         })
-        val unappliedConfirms = (confirmed - result.proposals.filter { it.heldBy == "human-confirmed" }.map { it.edge.out.id to it.edge.inn.id }.toSet()).sortedBy { it.first + ">" + it.second }
+        // U47d Low 2: a confirm for a pair that is already merged (its confirm was applied, or it auto-merged) is done, not worth a line every pass
+        val unappliedConfirms = (confirmed - state.merges.map { it.out.id to it.inn.id }.toSet() - result.proposals.filter { it.heldBy == "human-confirmed" }.map { it.edge.out.id to it.edge.inn.id }.toSet()).sortedBy { it.first + ">" + it.second }
 
         val lateFlags = engine.lateCompetitors(
             lateCheckable(stillMerged).mapNotNull { engine.evaluate(it.out, it.inn) },

@@ -81,6 +81,9 @@ internal fun configFilePaths(vararg locations: String?): List<Path> = locations.
     .map { it.trim().removePrefix("optional:").removePrefix("file:") }.filter { it.isNotEmpty() }
     .map { Path.of(it) }.filter { Files.isRegularFile(it) }
 
+/** LAN-72: the config files, the state directory and its plaintext cursor file are all checked for group/others access. */
+internal fun startupPermissionPaths(files: List<Path>, dir: Path?): List<Path> = files + listOfNotNull(dir, dir?.resolve("plaid_sync_cursors.txt"))
+
 /** Fails the Spring context at startup, with every problem at once, instead of an hour into the nightly. */
 @Component
 class ConfigLimits(env: Environment) {
@@ -90,7 +93,7 @@ class ConfigLimits(env: Environment) {
         val files = configFilePaths(env.getProperty("spring.config.location"), env.getProperty("spring.config.additional-location"))
         val dir = env.getProperty(P + "polled.cursorFileDirectoryPath")?.let { Path.of(it) }
         val log = LoggerFactory.getLogger(ConfigLimits::class.java)
-        permissionWarnings(files + listOfNotNull(dir)).forEach { log.warn(it) }
+        permissionWarnings(startupPermissionPaths(files, dir)).forEach { log.warn(it) }
         val url = env.getProperty(P + "firefly.url")
         if (url != null && !url.startsWith("https://") && !Regex("^http://(localhost|127\\.0\\.0\\.1|\\[::1])([:/]|$)").containsMatchIn(url)) {
             LoggerFactory.getLogger(ConfigLimits::class.java)

@@ -115,6 +115,9 @@ class LoanInterestRunner(
     /** L2 (U04c): loans whose write threw. They are held for tonight (a rerun is idempotent) and fail the run. */
     private var failedWrites: List<Pair<LoanConfig, String>> = listOf()
 
+    /** U04c L5: loans whose residual was held back because Firefly changed since the plan; they fail the run so the cause is named, not just a GAP. */
+    private var residualHeld: MutableList<Int> = mutableListOf()
+
     /** A loan left HELD exits non-zero, so the nightly prints its "!!" line instead of looking fine (A1). */
     override fun run() = runBlocking<Unit> {
         val plans = runOnce(apply)
@@ -128,6 +131,7 @@ class LoanInterestRunner(
             transient.takeIf { it.isNotEmpty() }?.let { "${it.size} loan(s) SKIPPED, Plaid did not answer or needs a login: ${it.map { (l, c) -> "${l.account} ($c)" }}" },
             unchecked.takeIf { it.isNotEmpty() }?.let { "${it.size} loan(s) WRITTEN but not re-checked, Plaid did not answer or a gap is left: ${it.map { (l, c) -> "${l.account} ($c)" }}" },
             failedWrites.takeIf { it.isNotEmpty() }?.let { "${it.size} loan(s) HELD, write failed: ${it.map { (l, c) -> "${l.account} ($c)" }}" },
+            residualHeld.takeIf { it.isNotEmpty() }?.let { "${it.size} loan(s) residual HELD, Firefly changed since the plan: $it" },
             held.takeIf { it.isNotEmpty() }?.let { "${it.size} loan(s) HELD, nothing written: ${it.map { h -> h.loan.account }}" },
             stuck.takeIf { it.isNotEmpty() }?.let { "loan(s) $it have been \"Firefly lags\" for $lagNights or more nights; a payment Plaid has seen is probably missing in Firefly" },
         )
@@ -184,6 +188,7 @@ class LoanInterestRunner(
         skipped = skip
         unchecked = listOf()
         failedWrites = listOf()
+        residualHeld = mutableListOf()
         plans.forEach { print(it) }
         if (!apply) {
             println("DRY RUN: nothing was changed. Add --fireflyPlaidConnector2.repair.apply=true to apply.")
@@ -394,6 +399,7 @@ class LoanInterestRunner(
         val moved = p.residual.signum() != 0 && fireflyOwed(p.loan.account, null).compareTo(p.fireflyOwed + storedSum) != 0
         if (p.residual.signum() != 0 && (skipped > 0 || moved)) {
             println("   loan ${p.loan.account}: Firefly changed since the plan; unexplained ${money(p.residual)} held back, the next run recomputes it")
+            residualHeld.add(p.loan.account)
         } else if (p.residual.signum() != 0) {
             val date = LocalDate.now(zone).atStartOfDay(zone).toOffsetDateTime()
             val desc = "$UNEXPLAINED_DESC${p.name}"

@@ -576,7 +576,16 @@ internal class LoanInterestRunnerTest {
     }
 
     @Test
-    fun aFailedReReadStoresNothingAndFailsTheRun() = runBlocking<Unit> {  // r1: fail safe
+    fun aResidualHeldBackBecauseFireflyMovedIsNamedInTheFailureMessage() = runBlocking<Unit> {  // U04c L5
+        val rows = chargedThenNew + interest("ib", "74.29", "400.00", d(9, 1))
+        val r = runner("23717.37", rows)
+        reReadSees(rows) { fireflyOwed = BigDecimal("23717.37"); rows }
+        val e = org.junit.jupiter.api.assertThrows<IllegalStateException> { r.run() }
+        assertThat(e.message).contains("residual HELD, Firefly changed since the plan")
+    }
+
+    @Test
+    fun aFailedReReadStoresNothingAndFailsTheRun()= runBlocking<Unit> {  // r1: fail safe
         owedBefore[d(8, 31)] = "23817.37"
         val r = runner("23491.66", chargedThenNew)
         reReadSees(chargedThenNew) { error("Firefly did not answer") }
