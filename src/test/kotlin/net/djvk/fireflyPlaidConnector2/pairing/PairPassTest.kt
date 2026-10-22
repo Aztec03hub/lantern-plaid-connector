@@ -68,6 +68,9 @@ internal class PairPassTest {
         val merges = mutableListOf<Pair<String, String>>()
         var refuse: Pair<Int, String>? = null
         var unreadable = false
+        /** The next N strict reads fail like a concurrent write did (then reads are clean). */
+        var unreadableTimes = 0
+        var runtimeFailure: RuntimeException? = null
         /** The Plaid id of an outflow whose merge makes core answer HTTP 500 (an exception, not a refusal). */
         var throwFor: String? = null
         private val originals = mutableMapOf<String, Pair<TransactionRead, TransactionRead>>()
@@ -100,10 +103,11 @@ internal class PairPassTest {
             val s = mock<FireflyTransactionService>()
             runBlocking {
                 whenever(s.fetchFireflyTransactionsStrictly(any(), any(), any())).doSuspendableAnswer {
-                    if (unreadable) throw IllegalStateException("Firefly changed while it was being read")
                     val from = it.getArgument<LocalDate>(0)
                     val to = it.getArgument<LocalDate>(1)
                     rangesRead.add(from to to)
+                    runtimeFailure?.let { e -> throw e }
+                    if (unreadable || unreadableTimes-- > 0) throw IllegalStateException("Firefly changed while it was being read")
                     journals.values.filter { j ->
                         val d = j.attributes.transactions.first().date.toLocalDate()
                         !d.isBefore(from) && !d.isAfter(to)
@@ -139,10 +143,10 @@ internal class PairPassTest {
         }
     }
 
-    private fun pass(world: World, dryRun: Boolean, useWatermark: Boolean = false, store: ItemStatusStore = ItemStatusStore(dir.toString()), stateDir: String = dir.toString()): PairPass {
+    private fun pass(world: World, dryRun: Boolean, useWatermark: Boolean = false, store: ItemStatusStore = ItemStatusStore(dir.toString()), stateDir: String = dir.toString(), keepDays: Long = 14): PairPass {
         val helper = mock<SyncHelper>()
         runBlocking { whenever(helper.fetchAccountKinds()).thenReturn(mapOf("1" to AccountKind.ASSET, "2" to AccountKind.LIABILITY, "3" to AccountKind.LIABILITY, "4" to AccountKind.ASSET)) }
-        val settings = PairSettings(dryRun = dryRun, useWatermark = useWatermark, directory = stateDir, timeZone = "UTC", pendingTag = "pending")
+        val settings = PairSettings(dryRun = dryRun, useWatermark = useWatermark, directory = stateDir, timeZone = "UTC", pendingTag = "pending", dryRunKeepDays = keepDays)
         return PairPass(helper, world.service(), world.core, AccountConfigs(configs), store, settings)
     }
 
@@ -217,6 +221,109 @@ internal class PairPassTest {
     }
 
     // region fetch range (4.6)
+
+    // region U10: pass window, one retry, report pruning, settings line
+
+    @Test
+    fun thePassReadsOnlyTheConfiguredWindowByDefault() = runBlocking<Unit> {
+        val w = World().also { it.payment(1, day = today.minusDays(5)); it.payment(2, day = today.minusDays(400)) }
+        val report = pass(w, dryRun = true).run(today.minusDays(PairSettings().lookbackDays), today, now = now)
+        assertThat(PairSettings().lookbackDays).isEqualTo(90)
+        assertThat(w.rangesRead.single().first).isEqualTo(today.minusDays(90 + 20))
+        assertThat(report.legsRead).isEqualTo(2) // only the recent payment
+    }
+
+    @Test
+    fun aStrictReadThatFailsOnceIsRetriedAndThePassSucceeds() = runBlocking<Unit> {
+        val w = World().also { it.payment(1); it.unreadableTimes = 1 }
+        pass(w, dryRun = false).run(d.minusDays(5), today, now = now)
+        assertThat(w.merges).containsExactly("out1" to "in1")
+        assertThat(w.rangesRead).hasSize(2)
+    }
+
+    @Test
+    fun aStrictReadThatFailsTwiceFailsThePassWithTheFireflyMessage() = runBlocking<Unit> {
+        val w = World().also { it.payment(1); it.unreadableTimes = 2 }
+        val failure = runCatching { pass(w, dryRun = false).run(d.minusDays(5), today, now = now) }.exceptionOrNull()
+        assertThat(failure).hasMessageContaining("Firefly changed while it was being read")
+        assertThat(w.merges).isEmpty()
+    }
+
+    @Test
+    fun aRuntimeFailureOfTheReadIsNotRetried() = runBlocking<Unit> {
+        val w = World().also { it.payment(1); it.runtimeFailure = RuntimeException("Exceeded Firefly failsafe max page count 5") }
+        val failure = runCatching { pass(w, dryRun = false).run(d.minusDays(5), today, now = now) }.exceptionOrNull()
+        assertThat(failure).hasMessageContaining("failsafe")
+        assertThat(w.rangesRead).hasSize(1)
+    }
+
+    private fun oldReports(): List<Path> {
+        val names = listOf("pair-dry-run-2026-01-01T00-00-00Z.txt" to 40L, "pair-dry-run-2026-02-01T00-00-00Z.txt" to 20L, "pair-dry-run-2026-02-28T00-00-00Z.txt" to 1L)
+        return names.map { (n, age) ->
+            dir.resolve(n).also { f ->
+                Files.writeString(f, "old")
+                Files.setLastModifiedTime(f, java.nio.file.attribute.FileTime.from(now.minus(java.time.Duration.ofDays(age))))
+            }
+        }
+    }
+
+    @Test
+    fun oldDryRunReportsArePrunedAndTheNewestIsKept() = runBlocking<Unit> {
+        val (f40, f20, f1) = oldReports()
+        Files.writeString(dir.resolve("pair-state.json"), "{}")
+        Files.writeString(dir.resolve("pair-awaiting.json"), "[]")
+        pass(World().also { it.payment(1) }, dryRun = true).run(d.minusDays(5), today, now = now)
+        assertThat(Files.exists(f40)).isFalse()
+        assertThat(Files.exists(f20)).isFalse()
+        assertThat(Files.exists(f1)).isTrue()
+        assertThat(Files.exists(dir.resolve("pair-dry-run-${now.toString().replace(':', '-')}.txt"))).isTrue()
+        assertThat(Files.exists(dir.resolve("pair-state.json"))).isTrue()
+        assertThat(Files.exists(dir.resolve("pair-awaiting.json"))).isTrue()
+    }
+
+    @Test
+    fun theNewestReportIsKeptEvenWhenItIsOlderThanTheLimit() = runBlocking<Unit> {
+        val (f40, f20, _) = oldReports()
+        Files.delete(f20); Files.delete(dir.resolve("pair-dry-run-2026-02-28T00-00-00Z.txt"))
+        pass(World().also { it.payment(1) }, dryRun = false).run(d.minusDays(5), today, now = now)
+        assertThat(Files.exists(f40)).isTrue()
+    }
+
+    @Test
+    fun aRealPassPrunesToo() = runBlocking<Unit> {
+        val (f40, f20, f1) = oldReports()
+        pass(World().also { it.payment(1) }, dryRun = false).run(d.minusDays(5), today, now = now)
+        assertThat(Files.exists(f40)).isFalse()
+        assertThat(Files.exists(f20)).isFalse()
+        assertThat(Files.exists(f1)).isTrue()
+    }
+
+    private fun captureOut(block: suspend () -> Unit): String {
+        val captured = java.io.ByteArrayOutputStream()
+        val old = System.out
+        System.setOut(java.io.PrintStream(captured, true))
+        try { runBlocking { block() } } finally { System.setOut(old) }
+        return captured.toString()
+    }
+
+    @Test
+    fun theSettingsLineShowsTheWatermarkAndALiveRunWithoutItSaysSo() {
+        fun out(dry: Boolean, wm: Boolean) = captureOut { pass(World().also { it.payment(1) }, dryRun = dry, useWatermark = wm).run(d.minusDays(5), today, now = now) }
+        val off = out(dry = false, wm = false)
+        assertThat(off).contains("useWatermark=false postingLagDays=1", "Pair watermark OFF", "Pair read: ")
+        val on = out(dry = false, wm = true)
+        assertThat(on).contains("useWatermark=true").doesNotContain("Pair watermark OFF")
+        assertThat(out(dry = true, wm = false)).doesNotContain("Pair watermark OFF")
+    }
+
+    @Test
+    fun theUnmergeCheckUsesTheLongRange() = runBlocking<Unit> {
+        val w = World().also { it.payment(1, day = LocalDate.now().minusDays(400)) }
+        runCatching { runnerFor(w, PairApi(), "m9", "out1", "in1").run() }
+        assertThat(w.rangesRead.first().first).isEqualTo(LocalDate.now().minusDays(3650))
+    }
+
+    // endregion
 
     @Test
     fun theReadRangeIsTwoWindowsBackAndTwoWindowsForward() = runBlocking<Unit> {
@@ -650,7 +757,7 @@ internal class PairPassTest {
     @Test
     fun theRunnerExitsNonZeroWhenAPairFailedAfterTheOthersWereMerged() = runBlocking<Unit> {
         val w = World().also { it.payment(1); it.payment(2, 20_000, d.plusDays(3)); it.throwFor = "out1" }
-        val settings = PairSettings(dryRun = false, directory = dir.toString(), timeZone = "UTC", pendingTag = "pending")
+        val settings = PairSettings(dryRun = false, directory = dir.toString(), timeZone = "UTC", pendingTag = "pending", lookbackDays = 3650)
         val failure = runCatching { PairRunner(mock<SyncHelper>(), mock<TransactionConverter>(), pass(w, dryRun = false), settings, w.core).run() }.exceptionOrNull()
         assertThat(failure).isInstanceOf(IllegalStateException::class.java).hasMessageContaining("1 pair(s) failed").hasMessageContaining("out1")
         assertThat(w.merges.map { it.first }).containsExactly("out2")
