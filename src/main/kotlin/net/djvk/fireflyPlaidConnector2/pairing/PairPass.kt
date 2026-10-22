@@ -236,7 +236,7 @@ class PairPass(
                 lags.toMap(), firstSeen, state.pendingDurations, stillMerged + merged.map { StoredMerge(it.pairMergeId, it.edge.out, it.edge.inn) },
                 rejectedPairs, failed.toList(),
             )
-            writeFiles(text, awaiting, next, now, dryRun)
+            writeFiles(text, awaiting, next, now, dryRun, result.proposals.filter { !it.auto })
         }
         return PairPassReport(result, dryRun, merged, rejected, needsHuman, lateFlags, awaiting, legs.size, kinds, text, failed)
     }
@@ -306,7 +306,7 @@ class PairPass(
         return leg
     }
 
-    private fun writeFiles(text: String, awaiting: List<AwaitingRecord>, state: PairState, now: Instant, dryRun: Boolean) {
+    private fun writeFiles(text: String, awaiting: List<AwaitingRecord>, state: PairState, now: Instant, dryRun: Boolean, review: List<Proposal>) {
         val dir = Path.of(settings.directory)
         Files.createDirectories(dir)
         if (dryRun) Files.writeString(dir.resolve("pair-dry-run-${now.toString().replace(':', '-')}.txt"), text)
@@ -315,6 +315,10 @@ class PairPass(
         //  merged nothing, so it must not claim its pairs as paired there (B3): it writes a file of its own.
         val awaitingFile = if (dryRun) "pair-awaiting-dryrun.json" else "pair-awaiting.json"
         Files.writeString(dir.resolve(awaitingFile), mapper.writerWithDefaultPrettyPrinter().writeValueAsString(awaiting))
+        // the review queue is rewritten whole on every pass, also empty, so a merged or rejected pair leaves it; a dry run has its own file
+        val reviewFile = if (dryRun) "pair-review-dryrun.json" else "pair-review.json"
+        runCatching { net.djvk.fireflyPlaidConnector2.sync.writeAtomically(dir.resolve(reviewFile), PairReviewFile.render(review, now)) }
+            .onFailure { logger.warn("Could not write the pair review file ({})", it::class.java.simpleName) }
         // housekeeping must never fail a pass whose files are already written
         runCatching { pruneDryRunReports(dir, now) }.onFailure { logger.warn("Could not prune old pair reports ({})", it::class.java.simpleName) }
     }

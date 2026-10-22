@@ -158,6 +158,62 @@ internal class PairPassTest {
         add("in$n", 2, false, day.plusDays(1), cents, "Payment Thank You")
     }
 
+    // U47a: the review queue file. A lone outflow marker with a plain inflow scores in the review band, not auto.
+    private fun World.review() {
+        add("rout1", 1, true, d, 5_000, "AC ACH XFER")
+        add("rin1", 4, false, d.plusDays(1), 5_000, "Deposit")
+    }
+
+    private fun reviewItems(file: String = "pair-review.json") = com.fasterxml.jackson.module.kotlin.jacksonObjectMapper().readTree(dir.resolve(file).toFile()).path("items")
+
+    @Test
+    fun aReviewBandPairIsWrittenToThePairReviewFileWithBothLegs() = runBlocking<Unit> {
+        val w = World().also { it.review() }
+        val report = pass(w, dryRun = false).run(d.minusDays(5), today, now = now)
+        val p = report.result.proposals.single()
+        assertThat(p.auto).isFalse()
+        val item = reviewItems().single()
+        assertThat(item.path("id").asText()).isEqualTo("rout1>rin1")
+        assertThat(item.path("outLeg").path("account").asInt()).isEqualTo(1)
+        assertThat(item.path("inLeg").path("account").asInt()).isEqualTo(4)
+        assertThat(item.path("points").map { it.path("rule").asText() }).isEqualTo(p.edge.points.map { it.rule })
+        assertThat(w.merges).isEmpty()
+    }
+
+    @Test
+    fun anAutoPairIsNotInTheQueueAndAnEmptyQueueIsStillWritten() = runBlocking<Unit> {
+        val w = World().also { it.payment(1) }
+        pass(w, dryRun = false).run(d.minusDays(5), today, now = now)
+        assertThat(reviewItems()).isEmpty()
+    }
+
+    @Test
+    fun theQueueIsRewrittenEmptyWhenItsPairIsGone() = runBlocking<Unit> {
+        val w = World().also { it.review() }
+        pass(w, dryRun = false).run(d.minusDays(5), today, now = now)
+        assertThat(reviewItems()).hasSize(1)
+        w.journals.clear()
+        pass(w, dryRun = false).run(d.minusDays(5), today, now = now)
+        assertThat(reviewItems()).isEmpty()
+    }
+
+    @Test
+    fun aDryRunWritesTheDryRunQueueFileOnly() = runBlocking<Unit> {
+        val w = World().also { it.review() }
+        pass(w, dryRun = true).run(d.minusDays(5), today, now = now)
+        assertThat(reviewItems("pair-review-dryrun.json")).hasSize(1)
+        assertThat(Files.exists(dir.resolve("pair-review.json"))).isFalse()
+    }
+
+    @Test
+    fun aFailingReviewWriteDoesNotFailThePass() = runBlocking<Unit> {
+        Files.createDirectory(dir.resolve("pair-review.json"))
+        val report = pass(World().also { it.review() }, dryRun = false).run(d.minusDays(5), today, now = now)
+        assertThat(report.result.proposals).hasSize(1)
+        assertThat(Files.exists(dir.resolve("pair-state.json"))).isTrue()
+        assertThat(Files.exists(dir.resolve("pair-awaiting.json"))).isTrue()
+    }
+
     @Test
     fun aDryRunPrintsThePlanAndWritesNothingToFirefly() = runBlocking<Unit> {
         val w = World().also { it.payment(1) }
