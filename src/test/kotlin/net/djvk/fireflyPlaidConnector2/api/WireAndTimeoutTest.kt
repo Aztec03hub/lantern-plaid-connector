@@ -35,6 +35,8 @@ import kotlin.test.assertTrue
  */
 internal class WireAndTimeoutTest {
     private val ok = """{"data":{"version":"6.1.2","api_version":"1.0","php_version":"8","os":"Linux","driver":"mysql"}}"""
+    /** Forced-proof hook: LANTERN_TEST_STALL_MS=200 delays every timeout-test handler, as a loaded box would. */
+    private suspend fun stall() { System.getenv("LANTERN_TEST_STALL_MS")?.toLongOrNull()?.let { delay(it) } }
     private val jsonHeaders = headersOf(HttpHeaders.ContentType, "application/json")
 
     // region M2: request headers on the wire
@@ -189,27 +191,27 @@ internal class WireAndTimeoutTest {
 
     // region M1: timeouts
 
-    /** Same shape as ApiConfiguration.getClientConfig (expectSuccess + HttpTimeout) with a short timeout. */
-    private fun timeoutConfig(kind: String): (io.ktor.client.HttpClientConfig<*>) -> Unit = {
+    /** Same shape as ApiConfiguration.getClientConfig (expectSuccess + HttpTimeout), with a timer too long to ever race. */
+    private fun timeoutConfig(): (io.ktor.client.HttpClientConfig<*>) -> Unit = {
         it.expectSuccess = true
-        // only the "request" kind needs the short timer; connect/socket throw at once and must not race it
-        it.install(HttpTimeout) { requestTimeoutMillis = if (kind == "request") 50 else 60_000 }
+        it.install(HttpTimeout) { requestTimeoutMillis = 60_000 }
     }
 
     private suspend fun MockRequestHandleScope.fail(kind: String, request: io.ktor.client.request.HttpRequestData): io.ktor.client.request.HttpResponseData =
         when (kind) {
             "connect" -> throw ConnectTimeoutException("connect timed out", null)
             "socket" -> throw SocketTimeoutException("socket timed out", null)
-            else -> { awaitCancellation() } // "request": never answers, so HttpTimeout always fires (no wall-clock race)
+            // "request": the exception the HttpTimeout plugin throws, raised directly so no timer races the handler
+            else -> throw HttpRequestTimeoutException(request.url.toString(), 50)
         }
 
     private fun plaidTimeoutRun(kind: String): Pair<Int, Throwable> {
         var calls = 0
-        val engine = MockEngine { request -> calls++
+        val engine = MockEngine { request -> stall(); calls++
             fail(kind, request) }
         val plaid = PlaidApiWrapper(
             baseUrl = "https://plaid.test", maxRetries = 2, plaidClientId = "cid-abc123", plaidSecret = "sec-xyz789",
-            httpClientEngine = engine, httpClientConfig = timeoutConfig(kind), retryBackoffMillis = 1,
+            httpClientEngine = engine, httpClientConfig = timeoutConfig(), retryBackoffMillis = 1,
         )
         val e = assertThrows<Throwable> {
             runBlocking { plaid.executeRequest({ it.accountsBalanceGet(AccountsBalanceGetRequest(accessToken = "t")) }, "t") }
@@ -233,14 +235,14 @@ internal class WireAndTimeoutTest {
 
     private fun helperWith(engine: MockEngine, kind: String): SyncHelper {
         val firefly = FireflyMock()
-        val tx = TransactionsApi("https://firefly.test", engine, timeoutConfig(kind))
+        val tx = TransactionsApi("https://firefly.test", engine, timeoutConfig())
         tx.setAccessToken("t")
         return SyncHelper(AccountConfigs(emptyList()), "token", firefly.aboutApi, tx, firefly.accountsApi, firefly.plaidLinksApi)
     }
 
     private fun batch(kind: String): Pair<Int, Throwable> {
         var calls = 0
-        val engine = MockEngine { request -> calls++
+        val engine = MockEngine { request -> stall(); calls++
             fail(kind, request) }
         val dtos = listOf(
             net.djvk.fireflyPlaidConnector2.transactions.FireflyTransactionDto(null, FireflyFixtures.getTransaction().transactions.first()),
@@ -271,7 +273,7 @@ internal class WireAndTimeoutTest {
     @Test
     fun connectSocketAndRequestTimeoutsComeFromTheProperties() {
         fun run(request: Long): String {
-            val client = io.ktor.client.HttpClient(MockEngine { delay(400); respond("ok") }) {
+            val client = io.ktor.client.HttpClient(MockEngine { if (request <= 100) awaitCancellation() else respond("ok") }) {
                 ApiConfiguration(connect = 111, socket = 222, request = request).getClientConfig()(this)
             }
             return runBlocking {
