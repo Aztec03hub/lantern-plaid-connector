@@ -106,6 +106,7 @@ class BatchSyncRunner(
                 configurationApi.setUseRunningBalance(false)
                 logger.info("Firefly's running balance is off for this run")
             }
+            var runFailure: Throwable? = null
             try {
                 // Map Plaid transactions to Firefly transactions
                 val fireflyTxs = converter.convertBatchSync(allPlaidTxs.values.flatten(), accountMap)
@@ -118,10 +119,20 @@ class BatchSyncRunner(
                 if (pairPass != null && pairSettings?.afterRun == true) {
                     pairPass.run(startDate, endDate, pairSettings.dryRun)
                 }
+            } catch (t: Throwable) {
+                runFailure = t
+                throw t
             } finally {
                 if (switchRunningBalance) {
-                    setRunningBalanceOn(configurationApi!!)
-                    logger.info("Firefly's running balance is on again (core refreshed the balances inside that call)")
+                    try {
+                        setRunningBalanceOn(configurationApi!!)
+                        logger.info("Firefly's running balance is on again (core refreshed the balances inside that call)")
+                    } catch (e: Exception) {
+                        // A throw here would replace the run's own failure; keep that one and attach this
+                        if (runFailure == null) throw e
+                        logger.error("!! The closing running balance PUT failed too; the next run checks the flag and repairs it", e)
+                        runFailure.addSuppressed(e)
+                    }
                 }
             }
 
