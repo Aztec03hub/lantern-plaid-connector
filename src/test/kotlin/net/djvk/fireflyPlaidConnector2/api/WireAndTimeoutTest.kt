@@ -153,6 +153,20 @@ internal class WireAndTimeoutTest {
     }
 
     @Test
+    fun aSameHostFireflyRedirectKeepsTheBearerToken() = runBlocking<Unit> {
+        val seen = mutableListOf<io.ktor.client.request.HttpRequestData>()
+        val api = AboutApi("https://firefly.test", MockEngine { request ->
+            seen.add(request)
+            if (request.url.encodedPath != "/landing") respond("", HttpStatusCode.Found, headersOf(HttpHeaders.Location, "https://firefly.test/landing"))
+            else respond(ByteReadChannel(ok), HttpStatusCode.OK, jsonHeaders)
+        })
+        api.setAccessToken("secret-token")
+        api.getAbout()
+        assertEquals(2, seen.size)
+        assertEquals("Bearer secret-token", seen[1].headers[HttpHeaders.Authorization])
+    }
+
+    @Test
     fun aPlaidPostRedirectIsNotFollowedAndIsRetriedAsAnError() = runBlocking<Unit> {
         val seen = mutableListOf<io.ktor.client.request.HttpRequestData>()
         val plaid = PlaidApiWrapper(
