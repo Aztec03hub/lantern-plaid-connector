@@ -41,6 +41,8 @@ class InvestmentSyncStoreTest {
         val s = store()
         s.path.toFile().writeText("{not json")
         assertThat(s.read()).isEmpty()
+        // The bad file is kept aside, not overwritten
+        assertThat(dir.listFiles()!!.map { it.name }.filter { it.startsWith("investment_sync.unreadable-") }).hasSize(1)
         s.record(mapOf("aaaaaaaaaaaa" to d1))
         assertThat(s.read()).isEqualTo(mapOf("aaaaaaaaaaaa" to d1))
     }

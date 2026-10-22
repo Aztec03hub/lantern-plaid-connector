@@ -8,8 +8,6 @@ import kotlinx.coroutines.withContext
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.stereotype.Component
-import java.nio.file.Files
-import java.nio.file.StandardCopyOption
 import java.time.LocalDate
 import kotlin.io.path.Path
 
@@ -33,8 +31,15 @@ class InvestmentSyncStore(
 
     fun itemId(accessToken: PlaidAccessToken): String = itemStatusStore.itemId(accessToken)
 
-    /** Last good sync date per [itemId]; empty when there is no file or it is unreadable (WARN, class name only). */
-    suspend fun read(): Map<String, LocalDate> = withContext(Dispatchers.IO) {
+    /** Last good sync date per [itemId]; empty when there is no file or it is unreadable (see [load]). */
+    suspend fun read(): Map<String, LocalDate> = load() ?: emptyMap()
+
+    /**
+     * The stored dates, empty with no file. An unreadable file is logged at ERROR (class name only) and moved aside
+     * (kept for a person), then read as empty so the fixed window applies. Null only when the move itself failed, so
+     * the bad file is still in place and [record] must not overwrite it.
+     */
+    private suspend fun load(): Map<String, LocalDate>? = withContext(Dispatchers.IO) {
         val file = path.toFile()
         if (!file.exists()) return@withContext emptyMap()
         try {
@@ -42,34 +47,27 @@ class InvestmentSyncStore(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            logger.warn("Ignoring unreadable ${path.fileName}, using the fixed lookback window: ${e::class.simpleName}")
-            emptyMap()
+            try {
+                val aside = moveAside(path)
+                logger.error("${path.fileName} could not be read (${e::class.simpleName}); moved it to ${aside.fileName}. Using the fixed lookback window.")
+                emptyMap()
+            } catch (m: Exception) {
+                logger.error("${path.fileName} could not be read (${e::class.simpleName}) and could not be moved aside (${m::class.simpleName}); leaving it in place.")
+                null
+            }
         }
     }
 
     /**
-     * Merges [synced] over the stored dates and replaces the file atomically (temp file, fsync, rename).
+     * Merges [synced] over the stored dates and replaces the file atomically ([writeAtomically]).
      * Best effort: a failure is logged at ERROR and never fails the poll. A no-op for an empty map.
      */
     suspend fun record(synced: Map<String, LocalDate>) {
         if (synced.isEmpty()) return
         try {
-            val merged = (read() + synced).toSortedMap().mapValues { it.value.toString() }
-            withContext(Dispatchers.IO) {
-                val directory = path.toAbsolutePath().parent
-                Files.createDirectories(directory)
-                val temp = Files.createTempFile(directory, "investment_sync", ".tmp")
-                try {
-                    writeDurably(temp, mapper.writeValueAsString(merged))
-                    try {
-                        Files.move(temp, path, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
-                    } catch (e: java.nio.file.AtomicMoveNotSupportedException) {
-                        Files.move(temp, path, StandardCopyOption.REPLACE_EXISTING)
-                    }
-                } finally {
-                    Files.deleteIfExists(temp)
-                }
-            }
+            val current = load() ?: return
+            val merged = (current + synced).toSortedMap().mapValues { it.value.toString() }
+            withContext(Dispatchers.IO) { writeAtomically(path, mapper.writeValueAsString(merged)) }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {

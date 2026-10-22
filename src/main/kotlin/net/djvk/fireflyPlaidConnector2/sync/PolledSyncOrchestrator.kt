@@ -139,11 +139,15 @@ class PolledSyncOrchestrator(
         }
     }
 
-    /** First day to read: the fixed window, widened back to [lastSuccess] when the Item was silent longer, never past the cap. */
+    /**
+     * First day to read: the fixed window, or when the Item was silent longer, [investmentLookbackDays] before
+     * [lastSuccess] (so a transaction Plaid posted late with an earlier date is still caught, as in a normal poll),
+     * never past the cap.
+     */
     internal fun investmentStart(today: LocalDate, lastSuccess: LocalDate?): LocalDate {
         val fixed = today.minusDays(investmentLookbackDays)
         if (lastSuccess == null || !lastSuccess.isBefore(fixed)) return fixed
-        return maxOf(lastSuccess, today.minusDays(maxOf(investmentLookbackDays, investmentMaxLookbackDays)))
+        return minOf(fixed, maxOf(lastSuccess.minusDays(investmentLookbackDays), today.minusDays(maxOf(investmentLookbackDays, investmentMaxLookbackDays))))
     }
 
     /**
@@ -181,7 +185,7 @@ class PolledSyncOrchestrator(
                         "Investments for ${Utilities.redactAccessToken(accessToken)}: widening the read-back to " +
                                 "${ChronoUnit.DAYS.between(start, today)} days after a gap since $last"
                     )
-                    if (last != null && last.isBefore(start)) {
+                    if (last != null && last.minusDays(investmentLookbackDays).isBefore(start)) {
                         logger.warn(
                             "Investments for ${Utilities.redactAccessToken(accessToken)}: gap since $last exceeds " +
                                     "investmentMaxLookbackDays=$investmentMaxLookbackDays; older transactions are not read"
