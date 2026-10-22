@@ -77,4 +77,16 @@ class ConfigLimitsTest {
         val e = assertThrows<IllegalStateException> { ConfigLimits(env) }
         assertThat(e.message).contains("fireflyPlaidConnector2.firefly.writeConcurrency")
     }
+
+    @Test
+    fun `the shipped application yml passes the limits`() {
+        val res = org.springframework.core.io.ClassPathResource("application.yml")
+        val flat = org.springframework.boot.env.YamlPropertySourceLoader().load("yml", res).first()
+        assertThat(configProblems { flat.getProperty(it)?.toString() }).isEmpty()
+    }
+
+    @Test
+    fun `thresholds above ten are accepted`() {
+        assertThat(problems("pair.autoMin" to "12", "pair.reviewMin" to "8")).isEmpty()
+    }
 }
