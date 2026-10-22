@@ -448,4 +448,15 @@ internal class LoanInterestRunnerTest {
         assertThat(file.readText()).isEqualTo("""{"2":"2026-10-02"}""")
         assertThat(lagDir.list()!!.toList()).containsExactlyInAnyOrder("loan-lag.json", aside) // no .tmp left behind
     }
+
+    @Test
+    fun aLagFileHoldingJsonNullIsMovedAsideLikeAnyOtherUnparseableFile() {  // U03 review
+        val lagDir = File(dir, "lag").also { it.mkdirs() }
+        File(lagDir, "loan-lag.json").writeText("null")
+        fireflyOwed = BigDecimal("23817.37")
+        runner("23427.28", chargedThenNew, hold = true, lagDir = lagDir.path).also { it.today = { d(10, 1) } }.run()
+        val aside = lagDir.list()!!.single { it.startsWith("loan-lag.unreadable-") }
+        assertThat(File(lagDir, aside).readText()).isEqualTo("null")
+        assertThat(File(lagDir, "loan-lag.json").readText()).isEqualTo("""{"2":"2026-10-01"}""")
+    }
 }
