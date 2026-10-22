@@ -416,16 +416,63 @@ internal class PolledSyncOrchestratorTest {
         verify(converter).routingsRefused = 0
     }
 
-    private fun pairingOrchestrator(webhookService: WebhookService, pairPass: net.djvk.fireflyPlaidConnector2.pairing.PairPass) =
+    private fun pairingOrchestrator(webhookService: WebhookService, pairPass: net.djvk.fireflyPlaidConnector2.pairing.PairPass, attention: AttentionStore? = null) =
         PolledSyncOrchestrator(
             30, syncHelper, cursorManager, plaidSyncService, fireflyTransactionService, converter, webhookService,
             pairPass = pairPass, pairSettings = net.djvk.fireflyPlaidConnector2.pairing.PairSettings(dryRun = false, afterRun = true),
+            attentionStore = attention,
         )
+
+    @Test
+    fun theAttentionFileListsPairFailuresLegsAndConflictsAndKeepsPairItemsOnAPollWithNoPass() = runBlocking<Unit> {
+        val dir = java.nio.file.Files.createTempDirectory("attention").toString()
+        val attention = AttentionStore(dir)
+        val pairPass: net.djvk.fireflyPlaidConnector2.pairing.PairPass = mock()
+        val (accountMap, sequence, cursorMap) = stubOneCreateIteration()
+        val report = reportOf(failed = 1, needsHuman = 1)
+        whenever(pairPass.run(any(), any(), any(), any())).thenReturn(report)
+        whenever(fireflyTransactionService.takeUpdateConflicts()).thenReturn(listOf("ff7"))
+        pairingOrchestrator(mock(),pairPass, attention).runIteration(accountMap, sequence, cursorMap)
+
+        val items = attention.read().map { Triple(it.kind, it.ref, it.detail) }
+        assertEquals(
+            listOf(
+                Triple("pair_failed", "o0>i0", "merge failed"),
+                Triple("pair_leg_needs_human", "L0", "reconciled"),
+                Triple("update_conflict", "ff7", "Firefly refused an update: a Plaid id is on another transaction"),
+            ).sortedBy { it.first },
+            items,
+        )
+        assertEquals(false, java.io.File(dir, "needs_attention.json").readText().contains("boom"))
+
+        // a pass that throws replaces the pair items; the conflict (a one-off event) stays
+        whenever(pairPass.run(any(), any(), any(), any())).doSuspendableAnswer { throw IllegalStateException("boom") }
+        whenever(fireflyTransactionService.takeUpdateConflicts()).thenReturn(listOf())
+        pairingOrchestrator(mock(), pairPass, attention).runIteration(accountMap, sequence, cursorMap)
+        assertEquals(
+            listOf(Triple("pair_failed", "pass", "IllegalStateException"), Triple("update_conflict", "ff7", "Firefly refused an update: a Plaid id is on another transaction")),
+            attention.read().map { Triple(it.kind, it.ref, it.detail) },
+        )
+        assertEquals(false, java.io.File(dir, "needs_attention.json").readText().contains("boom"))
+    }
+
+    @Test
+    fun aFailedAttentionWriteDoesNotFailThePoll() = runBlocking<Unit> {
+        val dir = java.nio.file.Files.createTempDirectory("attention").toString()
+        java.io.File(dir, "needs_attention.json").mkdir() // the target is a directory: the write fails
+        val (accountMap, sequence, cursorMap) = stubOneCreateIteration()
+        val orchestrator = PolledSyncOrchestrator(
+            30, syncHelper, cursorManager, plaidSyncService, fireflyTransactionService, converter, attentionStore = AttentionStore(dir),
+        )
+        assertEquals(true, orchestrator.pollOnce(accountMap, sequence, cursorMap))
+        verify(cursorManager).writeCursorMap(eq(cursorMap))
+    }
 
     private fun reportOf(failed: Int, needsHuman: Int): net.djvk.fireflyPlaidConnector2.pairing.PairPassReport {
         val report = mock<net.djvk.fireflyPlaidConnector2.pairing.PairPassReport>()
         whenever(report.failed).thenReturn(List(failed) { net.djvk.fireflyPlaidConnector2.pairing.PairFailure("o$it", "i$it", "d", "boom") })
-        whenever(report.needsHuman).thenReturn(List(needsHuman) { mock<net.djvk.fireflyPlaidConnector2.pairing.Leg>() to "reconciled" })
+        val legs = List(needsHuman) { i -> mock<net.djvk.fireflyPlaidConnector2.pairing.Leg>().also { whenever(it.id).thenReturn("L$i") } to "reconciled" }
+        whenever(report.needsHuman).thenReturn(legs)
         return report
     }
 
