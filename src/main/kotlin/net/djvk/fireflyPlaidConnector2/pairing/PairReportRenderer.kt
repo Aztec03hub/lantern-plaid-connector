@@ -25,6 +25,7 @@ object PairReportRenderer {
         legsRead: Int,
         kinds: Map<Int, AccountKind>,
         accounts: List<PairAccount>,
+        unappliedConfirms: List<Pair<String, String>> = listOf(),
     ): String {
         val names = accounts.associate { it.id to it.name }
         val b = StringBuilder()
@@ -67,6 +68,7 @@ object PairReportRenderer {
         result.unmatched.sortedBy { it.out.date }.forEach { e -> b.appendLine("   score ${e.score}  ${legLine(e.out, names)}  ->  ${legLine(e.inn, names)}   points: ${points(e)}") }
         b.appendLine().appendLine("== Needs a human (never sent to core)")
         needsHuman.forEach { (l, why) -> b.appendLine("   [$why]  ${legLine(l, names)}") }
+        unappliedConfirms.forEach { (o, i) -> b.appendLine("Confirmed pair $o>$i was not merged: not in the review band any more") }
         if (late.isNotEmpty()) {
             b.appendLine().appendLine("== Late competitors: a leg arrived that would have competed for a merged pair (flagged, not undone)")
             late.forEach { (m, r) -> b.appendLine("   merged ${legLine(m.out, names)} -> ${legLine(m.inn, names)}  vs  ${legLine(r.out, names)} -> ${legLine(r.inn, names)}") }

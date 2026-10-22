@@ -66,6 +66,7 @@ internal class PairPassTest {
     private inner class World {
         val journals = linkedMapOf<String, TransactionRead>()
         val merges = mutableListOf<Pair<String, String>>()
+        val requests = mutableListOf<PairMergeRequest>()
         var refuse: Pair<Int, String>? = null
         var unreadable = false
         /** The next N strict reads fail like a concurrent write did (then reads are clean). */
@@ -119,6 +120,7 @@ internal class PairPassTest {
 
         val core = object : PairApi() {
             override suspend fun merge(request: PairMergeRequest): PairMergeOutcome {
+                requests.add(request)
                 refuse?.let { return PairMergeOutcome.Rejected(it.first, it.second) }
                 if (journals[request.keepGroupId]?.attributes?.transactions?.first()?.plaidLinks?.first()?.plaidTransactionId == throwFor) error("core answered HTTP 500")
                 val keep = journals[request.keepGroupId] ?: return PairMergeOutcome.Rejected(404, "not found")
@@ -987,4 +989,97 @@ internal class PairPassTest {
         if (size <= 1) listOf(this) else flatMap { x -> (this - x).permutations().map { listOf(x) + it } }
 
     // endregion
+
+    // U47d: the human decisions from pair-decisions.json
+    private fun decide(vararg d: Pair<String, String>, out: String = "rout1", inn: String = "rin1") =
+        Files.writeString(dir.resolve("pair-decisions.json"), """{"version":1,"decisions":[${d.joinToString(",") { """{"out":"$out","inn":"$inn","action":"${it.first}","at":"${it.second}"}""" }}]}""")
+
+    private fun stateRejected() = com.fasterxml.jackson.module.kotlin.jacksonObjectMapper().readTree(dir.resolve("pair-state.json").toFile()).path("rejected")
+
+    @Test
+    fun aConfirmedReviewPairIsMergedThroughCoreOnce() = runBlocking<Unit> {
+        val w = World().also { it.review() }
+        decide("confirm" to "t")
+        pass(w, dryRun = false).run(d.minusDays(5), today, now = now)
+        assertThat(w.merges).containsExactly("rout1" to "rin1")
+        assertThat(w.requests.single().evidence["human_confirmed"]).isEqualTo(true)
+        assertThat(reviewItems()).isEmpty()
+    }
+
+    @Test
+    fun aConfirmTwiceInTwoPassesMergesOnce() = runBlocking<Unit> {
+        val w = World().also { it.review() }
+        decide("confirm" to "t")
+        pass(w, dryRun = false).run(d.minusDays(5), today, now = now)
+        val again = pass(w, dryRun = false).run(d.minusDays(5), today, now = now)
+        assertThat(w.requests).hasSize(1)
+        assertThat(again.text).contains("Confirmed pair rout1>rin1 was not merged")
+    }
+
+    @Test
+    fun aRejectedPairIsNeverProposedAgain() = runBlocking<Unit> {
+        val w = World().also { it.review() }
+        decide("reject" to "t")
+        pass(w, dryRun = false).run(d.minusDays(5), today, now = now)
+        assertThat(stateRejected().map { it.path("out").asText() + ">" + it.path("inn").asText() }).containsExactly("rout1>rin1")
+        Files.delete(dir.resolve("pair-decisions.json"))
+        val again = pass(w, dryRun = false).run(d.minusDays(5), today, now = now)
+        assertThat(again.result.proposals).isEmpty()
+        assertThat(reviewItems()).isEmpty()
+        assertThat(w.requests).isEmpty()
+    }
+
+    @Test
+    fun aRejectWinsOverAConfirmForTheSamePair() = runBlocking<Unit> {
+        val w = World().also { it.review() }
+        decide("confirm" to "t", "reject" to "t")
+        pass(w, dryRun = false).run(d.minusDays(5), today, now = now)
+        assertThat(w.requests).isEmpty()
+        assertThat(stateRejected()).hasSize(1)
+    }
+
+    @Test
+    fun aConfirmForAnAutoPairOrUnknownPairMergesNothingExtra() = runBlocking<Unit> {
+        val w = World().also { it.payment(1) }
+        decide("confirm" to "t", out = "out1", inn = "in1")
+        val report = pass(w, dryRun = false).run(d.minusDays(5), today, now = now)
+        assertThat(w.merges).containsExactly("out1" to "in1")
+        assertThat(w.requests.single().evidence).doesNotContainKey("human_confirmed")
+        assertThat(report.text).contains("Confirmed pair out1>in1 was not merged")
+        decide("confirm" to "t", out = "ghost", inn = "none")
+        val again = pass(w, dryRun = false).run(d.minusDays(5), today, now = now)
+        assertThat(w.requests).hasSize(1)
+        assertThat(again.text).contains("Confirmed pair ghost>none was not merged")
+    }
+
+    @Test
+    fun aDryRunWithADecisionMergesNothingAndWritesNoState() = runBlocking<Unit> {
+        val w = World().also { it.review() }
+        decide("confirm" to "t")
+        val report = pass(w, dryRun = true).run(d.minusDays(5), today, now = now)
+        assertThat(w.requests).isEmpty()
+        assertThat(Files.exists(dir.resolve("pair-state.json"))).isFalse()
+        assertThat(report.result.proposals.single().heldBy).isEqualTo("human-confirmed")
+    }
+
+    @Test
+    fun anUnreadableDecisionFileIsIgnoredNotFatal() = runBlocking<Unit> {
+        val w = World().also { it.review() }
+        Files.writeString(dir.resolve("pair-decisions.json"), "\u0000garbage{{")
+        val out = captureOut { pass(w, dryRun = false).run(d.minusDays(5), today, now = now) }
+        assertThat(out).contains("Pair decisions file unreadable; ignored this pass")
+        assertThat(w.requests).isEmpty()
+        assertThat(Files.readString(dir.resolve("pair-decisions.json"))).isEqualTo("\u0000garbage{{")
+    }
+
+    @Test
+    fun aConfirmedPairThatAPersonUnmergedIsNotMergedAgain() = runBlocking<Unit> {
+        val w = World().also { it.review() }
+        decide("confirm" to "t")
+        pass(w, dryRun = false).run(d.minusDays(5), today, now = now)
+        w.unmerge("m1")
+        val again = pass(w, dryRun = false).run(d.minusDays(5), today, now = now)
+        assertThat(again.result.proposals).isEmpty()
+        assertThat(w.requests).hasSize(1)
+    }
 }

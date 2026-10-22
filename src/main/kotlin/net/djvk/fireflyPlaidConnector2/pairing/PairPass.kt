@@ -165,7 +165,14 @@ class PairPass(
         val state = PairStateFile.read(settings.directory)
         val singleIds = legs.map { it.id }.toSet()
         val (stillMerged, unmerged) = (state.merges + recoverCommittedMerges(state, journals)).partition { !(it.out.id in singleIds && it.inn.id in singleIds) }
-        val rejectedPairs = (state.rejected + unmerged.map { RejectedPair(it.out.id, it.inn.id, it.pairMergeId, today.toString()) }).distinctBy { it.out to it.inn }
+        // U47d: the people's decisions from the app. A bad file means no decisions, never a merge on a guess.
+        val (decisions, decisionProblem) = PairDecisionFile.read(settings.directory)
+        if (decisionProblem != null) {
+            println("Pair decisions file unreadable; ignored this pass")
+            logger.warn("Pair decisions file is unreadable; ignoring it this pass")
+        }
+        val decisionRejects = decisions.filter { it.action == "reject" }.map { RejectedPair(it.out, it.inn, null, today.toString()) }
+        val rejectedPairs = (state.rejected + unmerged.map { RejectedPair(it.out.id, it.inn.id, it.pairMergeId, today.toString()) } + decisionRejects).distinctBy { it.out to it.inn }
         unmerged.forEach { logger.warn("Pair {} ({} and {}) is no longer merged; it will not be proposed again", it.pairMergeId, it.out.id, it.inn.id) }
         val engine = PairEngine(accounts, config, rejectedPairs.map { it.out to it.inn }.toSet())
 
@@ -173,7 +180,13 @@ class PairPass(
         val settled = Watermark.settle(engine, legs, watermarks, config.fallbackDays)
             // a leg outside the decision window is read to be a competitor, never decided
             .map { if (it.date.isBefore(from) || it.date.isAfter(to)) it.copy(settled = false) else it }
-        val result = engine.decide(settled)
+        val firstResult = engine.decide(settled)
+        // a reject beats a confirm; a confirm only promotes a review-band proposal the engine itself made (vetoed, ambiguous, pending, rejected or merged pairs are not proposals)
+        val confirmed = decisions.filter { it.action == "confirm" }.map { it.out to it.inn }.toSet() - rejectedPairs.map { it.out to it.inn }.toSet()
+        val result = firstResult.copy(proposals = firstResult.proposals.map {
+            if (!it.auto && (it.edge.out.id to it.edge.inn.id) in confirmed) it.copy(auto = true, heldBy = "human-confirmed") else it
+        })
+        val unappliedConfirms = (confirmed - result.proposals.filter { it.heldBy == "human-confirmed" }.map { it.edge.out.id to it.edge.inn.id }.toSet()).sortedBy { it.first + ">" + it.second }
 
         val lateFlags = engine.lateCompetitors(
             lateCheckable(stillMerged).mapNotNull { engine.evaluate(it.out, it.inn) },
@@ -196,7 +209,7 @@ class PairPass(
                             "rule_version" to config.ruleVersion, "layer" to e.layer, "gap_days" to e.gap, "score" to e.score,
                             "points" to e.points.map { mapOf("rule" to it.rule, "points" to it.points, "family" to it.family, "note" to it.note) },
                             "flags" to e.flags, "type" to keepType.name,
-                        ),
+                        ) + if (p.heldBy == "human-confirmed") mapOf("human_confirmed" to true) else mapOf(),
                     )
                     when (val outcome = pairApi.merge(request)) {
                         is PairMergeOutcome.Merged -> {
@@ -229,7 +242,7 @@ class PairPass(
             firstSeen.mapValues { it.value }, state.pendingDurations, today,
         )
 
-        val text = PairReportRenderer.render(result, config, dryRun, merged, rejected, needsHuman, lateFlags, awaiting, legs.size, kinds, accounts)
+        val text = PairReportRenderer.render(result, config, dryRun, merged, rejected, needsHuman, lateFlags, awaiting, legs.size, kinds, accounts, unappliedConfirms)
         println(text)
         if (!dryRun || settings.directory.isNotBlank()) {
             val next = PairState(
