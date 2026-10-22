@@ -481,10 +481,6 @@ class PolledSyncOrchestrator(
         }
         webhookService?.post(iterationStart, Instant.now(), reported, failure)
         if (failure != null) throw failure
-        // Everything was imported, but a routing rule points at a Plaid-synced asset: the one-shot exit code must show it
-        if ((reported?.routingsRefused ?: 0) > 0) {
-            throw IllegalStateException("${reported?.routingsRefused} own-account routing(s) refused, see the WARN lines")
-        }
     }
 
     /**

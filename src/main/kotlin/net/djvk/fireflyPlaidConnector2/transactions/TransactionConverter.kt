@@ -124,8 +124,17 @@ class TransactionConverter(
     @Volatile
     var accountKinds: Map<String, AccountKind> = emptyMap()
 
-    /** Own-account routings skipped because the target has Plaid inflow of its own; the poll resets it and reports it as partial. */
+    private val refusedIds = mutableSetOf<String>()
+
+    /**
+     * Transactions (distinct Plaid ids, not conversions) whose own-account routing was skipped because the target has
+     * Plaid inflow of its own; the poll resets it (to 0, which clears the ids) and reports it as partial.
+     */
     var routingsRefused: Int = 0
+        set(v) {
+            field = v
+            if (v == 0) refusedIds.clear()
+        }
 
     private val timeZone = TimeZone.getTimeZone(timeZoneString)
     private val zoneId = timeZone.toZoneId()
@@ -933,7 +942,7 @@ class TransactionConverter(
             // A payment to one of our own accounts that Plaid has no other side for: ONE link, leg source (never a pairing candidate)
             val routed = fireflyAccountId.toIntOrNull()?.let {
                 ownAccounts.target(it, tx.originalDescription ?: tx.name, Math.round(tx.amount * 100), tx.date)
-                    ?.takeUnless { target -> refusesRouting(it, target, tx, accountMap) }
+                    ?.takeUnless { target -> refusesRouting(it, target, tx, accountMap, update = !link) }
             }
             if (routed != null) {
                 logger.info("Routing ${tx.transactionId} (${tx.amount} on ${tx.date}) from account $fireflyAccountId to own account $routed")
@@ -960,13 +969,15 @@ class TransactionConverter(
      * paired. The transaction is then imported as if no rule matched; counted in [routingsRefused] so the poll is
      * reported partial. Loans are fine (Plaid gives them a balance only); an account of unknown kind is not refused.
      */
-    private fun refusesRouting(from: Int, target: Int, tx: PlaidTransaction, accountMap: Map<PlaidAccountId, FireflyAccountId>): Boolean {
+    private fun refusesRouting(from: Int, target: Int, tx: PlaidTransaction, accountMap: Map<PlaidAccountId, FireflyAccountId>, update: Boolean): Boolean {
         if (accountKinds[target.toString()] != AccountKind.ASSET || target !in accountMap.values) return false
-        routingsRefused++
+        if (refusedIds.add(tx.transactionId)) routingsRefused++
         val rule = ownAccounts.ruleFor(from, tx.originalDescription ?: tx.name)
+        val what = if (update) "update leaves a journal already routed there as it is (fix it with the backfill --reverse)"
+        else "importing it unrouted"
         logger.warn(
             "Not routing ${tx.transactionId} from account $from: own-account rule /${rule?.match}/ targets account $target, " +
-                "which has Plaid transactions of its own (they would pair); importing it unrouted. Remove $target from the routing rules"
+                "which has Plaid transactions of its own (they would pair); $what. Remove $target from the routing rules"
         )
         return true
     }

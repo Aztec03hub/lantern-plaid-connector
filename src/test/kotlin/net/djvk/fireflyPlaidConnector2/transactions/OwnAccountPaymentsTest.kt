@@ -118,6 +118,61 @@ internal class OwnAccountPaymentsTest {
         assertThat(c.routingsRefused).isEqualTo(1)
     }
 
+    private class Probe(path: String) : TransactionConverter(
+        useNameForDestination = true, enablePrimaryCategorization = false, primaryCategoryPrefix = "p-",
+        enableDetailedCategorization = false, detailedCategoryPrefix = "d-", timeZoneString = "America/Chicago",
+        transferMatchWindowDays = 3, txStyle = TransactionStyleConfig(null), pairConfigFile = path,
+    ) {
+        suspend fun single(t: net.djvk.fireflyPlaidConnector2.api.plaid.models.Transaction, m: Map<String, Int>, link: Boolean) =
+            convertSingle(t, m, link = link)
+    }
+
+    private fun warns(block: () -> Unit): List<String> {
+        val root = org.slf4j.LoggerFactory.getLogger(org.slf4j.Logger.ROOT_LOGGER_NAME) as ch.qos.logback.classic.Logger
+        val app = ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent>().also { it.start() }
+        root.addAppender(app)
+        try { block() } finally { root.detachAppender(app) }
+        return app.list.filter { it.level == ch.qos.logback.classic.Level.WARN }.map { it.formattedMessage }
+    }
+
+    @Test
+    fun anUpdateOfARefusedRoutingSaysSoAndIsCountedOnceEvenWhenConvertedTwice() {
+        val p = Probe(File(dir, "p.json").also { it.writeText(fixed) }.path)
+        p.accountKinds = mapOf("1" to AccountKind.ASSET, "2" to AccountKind.ASSET)
+        val m = mapOf("plaid1" to 1, "plaid2" to 2)
+        val msgs = warns { runBlocking { p.single(tx(400.0), m, link = false); p.single(tx(400.0), m, link = false) } }
+        assertThat(p.routingsRefused).isEqualTo(1)
+        assertThat(msgs).hasSize(2)
+        assertThat(msgs.first()).contains("update leaves a journal already routed there").doesNotContain("importing it unrouted")
+    }
+
+    @Test
+    fun aCreateOfARefusedRoutingSaysImportedUnrouted() {
+        val p = Probe(File(dir, "p.json").also { it.writeText(fixed) }.path)
+        p.accountKinds = mapOf("1" to AccountKind.ASSET, "2" to AccountKind.ASSET)
+        val msgs = warns { runBlocking { p.single(tx(400.0), mapOf("plaid1" to 1, "plaid2" to 2), link = true) } }
+        assertThat(msgs.single()).contains("importing it unrouted").contains("XXXX0198")
+    }
+
+    @Test
+    fun resettingTheCounterForgetsTheIds() {
+        val p = Probe(File(dir, "p.json").also { it.writeText(fixed) }.path)
+        p.accountKinds = mapOf("1" to AccountKind.ASSET, "2" to AccountKind.ASSET)
+        val m = mapOf("plaid1" to 1, "plaid2" to 2)
+        runBlocking { p.single(tx(400.0), m, link = true) }
+        p.routingsRefused = 0
+        runBlocking { p.single(tx(400.0), m, link = true) }
+        assertThat(p.routingsRefused).isEqualTo(1)
+    }
+
+    @Test
+    fun anInvestmentTargetIsRefusedLikeAnyMappedAsset() {
+        // an investment account is in accountMap (it has Plaid transactions) and is an ASSET
+        val c = converter(fixed).also { it.accountKinds = mapOf("1" to AccountKind.ASSET, "2" to AccountKind.ASSET) }
+        assertThat(convertMapped(c, mapOf("plaid1" to 1, "plaid-inv" to 2)).destinationId).isNull()
+        assertThat(c.routingsRefused).isEqualTo(1)
+    }
+
     @Test
     fun aPlaidMappedLoanTargetStillRoutes() {
         val c = converter(fixed).also { it.accountKinds = mapOf("1" to AccountKind.ASSET, "2" to AccountKind.LIABILITY) }
