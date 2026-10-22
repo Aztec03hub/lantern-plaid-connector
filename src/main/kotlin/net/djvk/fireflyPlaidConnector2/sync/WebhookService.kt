@@ -115,6 +115,8 @@ class WebhookService(
 
     httpClientEngine: HttpClientEngine? = null,
     buildProperties: BuildProperties? = null,
+    private val connectTimeoutMillis: Long = 5_000,
+    private val requestTimeoutMillis: Long = 15_000,
 ) : DisposableBean {
     private val logger = LoggerFactory.getLogger(this::class.java)
 
@@ -132,8 +134,8 @@ class WebhookService(
         // Never throw on non-2xx; post() reports the status itself
         expectSuccess = false
         install(HttpTimeout) {
-            connectTimeoutMillis = 5_000
-            requestTimeoutMillis = 15_000
+            connectTimeoutMillis = this@WebhookService.connectTimeoutMillis
+            requestTimeoutMillis = this@WebhookService.requestTimeoutMillis
         }
         install(ContentNegotiation) {
             jackson()
