@@ -120,6 +120,19 @@ internal class R2ConverterTest {
         assertThat(result.updates).isEmpty()
     }
 
+    /** A retried create whose Plaid id an existing single already links: the poll creates nothing and updates nothing. */
+    @Test
+    fun aRetriedCreateWhoseIdAnExistingSingleLinksIsNeitherCreatedNorUpdated() = runBlocking<Unit> {
+        val result = converter().convertPollSync(
+            accountMap, listOf(plaid(accountA, "wd", 50.0)), listOf(), listOf(),
+            listOf(existing("ff1", TransactionTypeProperty.withdrawal, single("wd")))
+        )
+
+        assertThat(result.creates).isEmpty()
+        assertThat(result.updates).isEmpty()
+        assertThat(result.deletes).isEmpty()
+    }
+
     /** The old fix only looked at creates; a conversion of a different transaction must be skipped too. */
     @Test
     fun aConversionIsSkippedWhenAnotherTransactionAlreadyRecordsTheLeg() = runBlocking<Unit> {
