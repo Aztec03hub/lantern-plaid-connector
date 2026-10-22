@@ -464,26 +464,72 @@ internal class LoanInterestRunnerTest {
     fun aLineStoredByAnotherWriterBetweenPlanAndStoreIsSkipped() = runBlocking<Unit> {
         owedBefore[d(8, 31)] = "23817.37"
         val r = runner("23491.66", chargedThenNew)
-        val withLine = chargedThenNew + interest("ib", "74.29", "400.00", d(9, 1))
-        var listCalls = 0
+        reReadSees(chargedThenNew) { chargedThenNew + interest("ib", "74.29", "400.00", d(9, 1)) }
+        r.runOnce()
+        assertThat(stored()).isEmpty()
+    }
+
+    /** The plan's listing answers [first]; every later listing (the write's re-read) answers [then]. */
+    private fun reReadSees(first: List<TransactionRead>, then: () -> List<TransactionRead>) = runBlocking<Unit> {
+        var n = 0
         whenever(accountsApi.listTransactionByAccount(any(), anyOrNull(), anyOrNull(), anyOrNull(), anyOrNull(), anyOrNull()))
-            .doSuspendableAnswer { createFireflyResponse(TransactionArray(if (++listCalls == 1) chargedThenNew else withLine, Meta(), PageLink())) }
+            .doSuspendableAnswer { createFireflyResponse(TransactionArray(if (++n == 1) first else then(), Meta(), PageLink())) }
+    }
+
+    @Test
+    fun aLineAnotherWriterStoredUnderTheOldLoanNameIsSkippedByItsExternalId() = runBlocking<Unit> {  // r1: the id path alone
+        owedBefore[d(8, 31)] = "23817.37"
+        val r = runner("23491.66", chargedThenNew)
+        reReadSees(chargedThenNew) { chargedThenNew + interest("ib", "74.29", "400.00", d(9, 1), externalId = "lantern-interest:jb", loanName = "Old Loan Name") }
         r.runOnce()
         assertThat(stored()).isEmpty()
     }
 
     @Test
-    fun aNormalApplyStoresTheLineExactlyOnceAfterTheReRead() = runBlocking<Unit> {
+    fun aSkippedLineAlsoHoldsBackTheResidual() = runBlocking<Unit> {  // r1: the residual was sized for the old gap
         owedBefore[d(8, 31)] = "23817.37"
-        runner("23491.66", chargedThenNew).runOnce()
-        assertThat(stored()).hasSize(1)
+        val r = runner("23717.37", chargedThenNew)
+        reReadSees(chargedThenNew) { chargedThenNew + interest("ib", "74.29", "400.00", d(9, 1)) }
+        assertThat(r.runOnce().single().residual).isEqualByComparingTo("225.71")
+        assertThat(stored()).isEmpty()
     }
 
     @Test
-    fun aDryRunReadsButWritesNothing() = runBlocking<Unit> {
-        owedBefore[d(8, 31)] = "23817.37"
-        runner("23491.66", chargedThenNew, apply = false).runOnce()
+    fun aResidualAnotherWriterStoredBetweenPlanAndStoreIsNotStoredAgain() = runBlocking<Unit> {  // r1: residuals have no identity
+        val rows = chargedThenNew + interest("ib", "74.29", "400.00", d(9, 1))
+        val r = runner("23717.37", rows)
+        // the other writer's 300.00 unexplained row moved Firefly's balance after our plan read it
+        reReadSees(rows) { fireflyOwed = BigDecimal("23717.37"); rows }
+        val plan = r.runOnce().single()
+        assertThat(plan.lines).isEmpty()
+        assertThat(plan.residual).isEqualByComparingTo("300.00")
         assertThat(stored()).isEmpty()
+    }
+
+    @Test
+    fun aFailedReReadStoresNothingAndFailsTheRun() = runBlocking<Unit> {  // r1: fail safe
+        owedBefore[d(8, 31)] = "23817.37"
+        val r = runner("23491.66", chargedThenNew)
+        reReadSees(chargedThenNew) { error("Firefly did not answer") }
+        assertThat(runCatching { r.runOnce() }.exceptionOrNull()).isInstanceOf(IllegalStateException::class.java)
+        assertThat(stored()).isEmpty()
+    }
+
+    @Test
+    fun aHealthySecondNightAfterAnUncheckedFirstNeverStoresTheOldLineAgain() = runBlocking<Unit> {  // A10
+        owedBefore[d(8, 31)] = "23817.37"
+        storeMovesOwed = false  // night 1's re-check finds a gap: written but not checked
+        runner("23491.66", chargedThenNew).runOnce()
+        assertThat(stored().single().transactions.single().externalId).isEqualTo("lantern-interest:jb")
+        org.mockito.kotlin.clearInvocations(txApi)
+        // night 2: Firefly holds night 1's row, a new 400.00 payment came in on 09-15 and Plaid charged its 14 days (68.39)
+        storeMovesOwed = true
+        fireflyOwed = BigDecimal("23091.66")
+        owedBefore[d(9, 14)] = "23491.66"
+        val rows = chargedThenNew + interest("ib", "74.29", "400.00", d(9, 1), externalId = "lantern-interest:jb") + payment("c", "400.00", d(9, 15))
+        val plan = runner("23160.05", rows, hold = true).runOnce().single()
+        assertThat(plan.lines.map { it.payment.date }).containsExactly(d(9, 15))
+        assertThat(stored().map { it.transactions.single().externalId }).containsExactly("lantern-interest:jc")
     }
 
 }

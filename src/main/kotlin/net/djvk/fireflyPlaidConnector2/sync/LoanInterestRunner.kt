@@ -341,6 +341,8 @@ class LoanInterestRunner(
         val now = splitsOf(p.loan.account).filter { it.sourceId == id && it.description.startsWith("Interest on ") }
         val coveredNow = now.map { dateOf(it) to it.description }.toSet()
         val coveredIdsNow = now.mapNotNull { it.externalId }.toSet()
+        // U04 r1: a residual has no identity to re-check, so any write since plan() (another writer's residual) holds it back
+        val moved = p.residual.signum() != 0 && fireflyOwed(p.loan.account, null).compareTo(p.fireflyOwed) != 0
         var skipped = 0
         // the line that carries the cents remainder goes first: a later failure leaves exact lines and the rerun has no remainder
         for (l in p.lines.sortedByDescending { it.expected }) {
@@ -359,7 +361,9 @@ class LoanInterestRunner(
             ))
         }
         // the residual was sized for the old gap; with a line skipped it is stale, so the next run recomputes it
-        if (p.residual.signum() != 0 && skipped == 0) {
+        if (p.residual.signum() != 0 && (skipped > 0 || moved)) {
+            println("   loan ${p.loan.account}: Firefly changed since the plan; unexplained ${money(p.residual)} held back, the next run recomputes it")
+        } else if (p.residual.signum() != 0) {
             val date = LocalDate.now(zone).atStartOfDay(zone).toOffsetDateTime()
             val desc = "$UNEXPLAINED_DESC${p.name}"
             store(
