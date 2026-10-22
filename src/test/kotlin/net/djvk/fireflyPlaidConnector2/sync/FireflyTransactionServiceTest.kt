@@ -86,17 +86,6 @@ class FireflyTransactionServiceTest {
     // region 409 / 422 handling
 
     @Test
-    fun aCreateThatFireflyAnswers409IsSkippedNotDeadLetteredAndNotCountedAsCreated() = runBlocking<Unit> {
-        val (store, service) = serviceWithStore()
-        whenever(syncHelper.optimisticInsertBatchIntoFirefly(any())).doSuspendableAnswer { throw statusError(HttpStatusCode.Conflict) }
-
-        val notCreated = service.processFireflyTransactionUpdates(listOf(linked("tx1")), listOf(), listOf())
-
-        assertEquals(1, notCreated)
-        assertThat(store.read()).isEmpty()
-    }
-
-    @Test
     fun aCreateThatWasCreatedIsNotCountedAsNotCreated() = runBlocking<Unit> {
         val (store, service) = serviceWithStore()
         whenever(syncHelper.optimisticInsertBatchIntoFirefly(any())).thenReturn(1)
@@ -111,17 +100,6 @@ class FireflyTransactionServiceTest {
         whenever(syncHelper.optimisticInsertBatchIntoFirefly(any())).thenReturn(0)
 
         assertEquals(1, service.processFireflyTransactionUpdates(listOf(linked("tx1")), listOf(), listOf()))
-    }
-
-    @Test
-    fun a409AlsoDropsTheExistingLetterOfThatCreate() = runBlocking<Unit> {
-        val (store, service) = serviceWithStore()
-        store.add(DeadLetter("create", "tx1", null, linked("tx1").tx, false, "old"))
-        whenever(syncHelper.optimisticInsertBatchIntoFirefly(any())).doSuspendableAnswer { throw statusError(HttpStatusCode.Conflict) }
-
-        service.retryDeadLetters()
-
-        assertThat(store.read()).describedAs("a retried create that already landed is dropped").isEmpty()
     }
 
     @Test
@@ -162,16 +140,6 @@ class FireflyTransactionServiceTest {
         whenever(syncHelper.updateBatchInFirefly(any())).doSuspendableAnswer { throw statusError(HttpStatusCode.Conflict) }
 
         service.processFireflyTransactionUpdates(listOf(), listOf(FireflyTransactionDto("ff2", linked("tx2").tx)), listOf())
-
-        assertThat(store.read()).isEmpty()
-    }
-
-    @Test
-    fun a409OnADeleteIsDroppedNotDeadLettered() = runBlocking<Unit> {
-        val (store, service) = serviceWithStore()
-        whenever(syncHelper.deleteBatchInFirefly(any())).doSuspendableAnswer { throw statusError(HttpStatusCode.Conflict) }
-
-        service.processFireflyTransactionUpdates(listOf(), listOf(), listOf("ff3"))
 
         assertThat(store.read()).isEmpty()
     }

@@ -25,9 +25,25 @@ import net.djvk.fireflyPlaidConnector2.lib.createFireflyResponse
 import net.djvk.fireflyPlaidConnector2.transactions.TransactionConverter
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.Test
+import net.djvk.fireflyPlaidConnector2.api.firefly.apis.PlaidLinksApi
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.Meta
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.PlaidLink
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.PlaidLinkLeg
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionArray
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionTypeProperty
+import net.djvk.fireflyPlaidConnector2.lib.FireflyFixtures
+import net.djvk.fireflyPlaidConnector2.transactions.FireflyTransactionDto
+import org.junit.jupiter.api.io.TempDir
 import org.mockito.kotlin.any
+import org.mockito.kotlin.argumentCaptor
+import org.mockito.kotlin.atLeast
+import org.mockito.kotlin.doReturn
 import org.mockito.kotlin.doSuspendableAnswer
+import org.mockito.kotlin.mock
+import org.mockito.kotlin.verify
 import org.mockito.kotlin.whenever
+import java.nio.file.Path
+import net.djvk.fireflyPlaidConnector2.api.plaid.models.Transaction as PlaidTransaction
 
 /**
  * LAN-16: syncing the same Plaid batch twice against a Firefly that keeps state records each journal once.
@@ -37,9 +53,10 @@ import org.mockito.kotlin.whenever
  * Each run does what a poll does: look up the batch's ids (the window read is empty, as for old transactions),
  * convert, then write.
  *
- * Limit: `sync()` below is that poll assembled by hand (lookup, convert, write), not a run of `PolledSyncOrchestrator`,
- * so an orchestrator change that skips the lookup is not caught here. The batches are four plain payments: no pending
- * to posted, no transfer pair, no batch over MAX_IDS.
+ * `sync()` below is that poll assembled by hand (lookup, convert, write). `poll()` runs the real
+ * `PolledSyncOrchestrator.processTransactions` over the same fake (only the Plaid side and the account kinds are mocked),
+ * so the orchestrator's choice of ids to look up is covered too, with a pending to posted resync and a batch over
+ * MAX_IDS. Not covered: transfer pairs (the pairing units own those).
  */
 internal class ResyncNoDuplicatesTest {
     /** Touch MockUtil first: its file-level mocks must not be created in the middle of a whenever().thenReturn(). */
@@ -59,6 +76,7 @@ internal class ResyncNoDuplicatesTest {
         timeZoneString = "America/New_York",
         transferMatchWindowDays = 3L,
         txStyle = TransactionStyleConfig(null),
+        pendingTag = "pending",
     )
 
     // region the fake Firefly
@@ -90,6 +108,19 @@ internal class ResyncNoDuplicatesTest {
         }
     }
 
+    /** Firefly's 409 for a write that sends a Plaid id another group holds ([self] is the group being updated, if any). */
+    private fun refuseIfHeld(ids: List<String>, owners: Map<String, String>, self: String?) {
+        val conflicts = ids.filter { id -> owners[id].let { it != null && it != self } }
+        if (!conflictsEnabled || conflicts.isEmpty()) return
+        // core's body: integer journal and group ids plus the leg (docs/core-plaid-links.md)
+        val rows = conflicts.joinToString(",") { id ->
+            val group = owners.getValue(id)
+            val link = journals.getValue(group).transactions.flatMap { s -> s.plaidLinks.orEmpty() }.first { l -> l.plaidTransactionId == id }
+            """{"plaid_transaction_id":"$id","transaction_journal_id":${group.drop(1)},"transaction_group_id":${group.drop(1)},"leg":"${link.leg.value}"}"""
+        }
+        throw statusError(HttpStatusCode.Conflict, """{"message":"already linked","conflicts":[$rows]}""")
+    }
+
     private fun read(group: String, store: TransactionStore) =
         TransactionRead("transactions", group, Transaction(transactions = store.transactions), ObjectLink())
 
@@ -99,16 +130,7 @@ internal class ResyncNoDuplicatesTest {
                 val store = it.getArgument<TransactionStore>(0)
                 if (++stores == failOnStoreNumber) throw IllegalStateException("simulated crash before store #$stores")
                 val owners = linkOwners()
-                val conflicts = store.transactions.flatMap { s -> s.plaidLinks.orEmpty().map { l -> l.plaidTransactionId } }.filter { id -> id in owners }
-                if (conflictsEnabled && conflicts.isNotEmpty()) {
-                    // core's body: integer journal and group ids plus the leg (docs/core-plaid-links.md)
-                    val rows = conflicts.joinToString(",") { id ->
-                        val group = owners.getValue(id)
-                        val link = journals.getValue(group).transactions.flatMap { s -> s.plaidLinks.orEmpty() }.first { l -> l.plaidTransactionId == id }
-                        """{"plaid_transaction_id":"$id","transaction_journal_id":${group.drop(1)},"transaction_group_id":${group.drop(1)},"leg":"${link.leg.value}"}"""
-                    }
-                    throw statusError(HttpStatusCode.Conflict, """{"message":"already linked","conflicts":[$rows]}""")
-                }
+                refuseIfHeld(store.transactions.flatMap { s -> s.plaidLinks.orEmpty().map { l -> l.plaidTransactionId } }, owners, null)
                 val group = "g${journals.size + 1}"
                 journals[group] = store
                 // The write landed but the answer never reached the connector
@@ -116,6 +138,8 @@ internal class ResyncNoDuplicatesTest {
                 createFireflyResponse(TransactionSingle(read(group, store)))
             }
             whenever(firefly.plaidLinksApi.lookupPlaidLinks(any())).doSuspendableAnswer {
+                // the fake mocks the API, so the real client's size rule is enforced here
+                require(it.getArgument<List<String>>(0).size in 1..PlaidLinksApi.MAX_IDS) { "A link lookup takes 1 to ${PlaidLinksApi.MAX_IDS} ids" }
                 val owners = if (lookupEnabled) linkOwners() else mapOf()
                 val rows = it.getArgument<List<String>>(0).filter { id -> id in owners }.map { id ->
                     val group = owners.getValue(id)
@@ -124,6 +148,25 @@ internal class ResyncNoDuplicatesTest {
                 }
                 createFireflyResponse(PlaidLinkLookupResponse(rows))
             }
+            whenever(firefly.transactionsApi.updateTransaction(any(), any())).doSuspendableAnswer {
+                val group = it.getArgument<String>(0)
+                val update = it.getArgument<net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionUpdate>(1)
+                val links = update.transactions!!.first().plaidLinks
+                if (links != null) refuseIfHeld(links.map { l -> l.plaidTransactionId }, linkOwners(), group)
+                val old = journals.getValue(group)
+                journals[group] = old.copy(transactions = old.transactions.map { s -> if (links != null) s.copy(plaidLinks = links) else s })
+                createFireflyResponse(TransactionSingle(read(group, journals.getValue(group))))
+            }
+            whenever(firefly.transactionsApi.deleteTransaction(any())).doSuspendableAnswer {
+                journals.remove(it.getArgument<String>(0))
+                createFireflyResponse(Unit)
+            }
+            val noPagination = mock<Meta> { on { pagination } doReturn null }
+            val emptyWindow = createFireflyResponse(mock<TransactionArray> {
+                on { data } doReturn listOf()
+                on { meta } doReturn noPagination
+            })
+            whenever(firefly.transactionsApi.listTransaction(any(), any(), any(), any())).thenReturn(emptyWindow)
             whenever(firefly.transactionsApi.getTransaction(any())).doSuspendableAnswer {
                 val group = it.getArgument<String>(0)
                 createFireflyResponse(TransactionSingle(read(group, journals.getValue(group))))
@@ -133,11 +176,39 @@ internal class ResyncNoDuplicatesTest {
 
     // endregion
 
-    private val service = FireflyTransactionService(
-        firefly.transactionsApi,
-        SyncHelper(AccountConfigs(emptyList()), "token", firefly.aboutApi, firefly.transactionsApi, firefly.accountsApi, firefly.plaidLinksApi, 1),
-        30, "UTC", firefly.plaidLinksApi,
+    /** The real helper: every layer between the service and the fake is production code. */
+    private val syncHelper = SyncHelper(AccountConfigs(emptyList()), "token", firefly.aboutApi, firefly.transactionsApi, firefly.accountsApi, firefly.plaidLinksApi, 1)
+
+    private val service = FireflyTransactionService(firefly.transactionsApi, syncHelper, 30, "UTC", firefly.plaidLinksApi)
+
+    @TempDir
+    lateinit var dir: Path
+
+    private fun serviceWithStore() = DeadLetterStore(dir.toString()).let {
+        it to FireflyTransactionService(firefly.transactionsApi, syncHelper, 30, "UTC", firefly.plaidLinksApi, it)
+    }
+
+    private fun linked(vararg plaidIds: String) = FireflyTransactionDto(
+        null,
+        FireflyFixtures.getTransaction(
+            type = TransactionTypeProperty.withdrawal, sourceId = "1", amount = "5.0",
+            plaidLinks = plaidIds.map { PlaidLink(it, PlaidLinkLeg.single, "plaidAccountA") },
+        ).transactions.first(),
     )
+
+    /** The orchestrator over the fake. Only Plaid and the account kinds are mocked; lookup, window read, conversion and writes are real. */
+    private val plaidSyncService: PlaidSyncService = mock()
+    private val orchestrator = PolledSyncOrchestrator(
+        30, mock<SyncHelper> { onBlocking { fetchAccountKinds() } doReturn emptyMap() }, mock<CursorManager>(), plaidSyncService, service, converter,
+    )
+
+    private suspend fun poll(created: List<PlaidTransaction> = listOf(), updated: List<PlaidTransaction> = listOf(), deleted: List<String> = listOf()) {
+        whenever(plaidSyncService.processPlaidTransactions(any(), any())).thenReturn(PlaidTransactionResult(created, updated, deleted))
+        orchestrator.processTransactions(accountMap, sequenceOf("tok-12345678" to listOf(accountA)), mutableMapOf())
+    }
+
+    private fun plaid(id: String, amount: Double, pending: Boolean = false, pendingId: String? = null): PlaidTransaction =
+        PlaidFixtures.getPaymentTransaction(accountId = accountA, transactionId = id, amount = amount, pending = pending, pendingTransactionId = pendingId, name = "Plaid $id")
 
     private val batch = (1..4).map {
         PlaidFixtures.getPaymentTransaction(accountId = accountA, transactionId = "tx$it", amount = 10.0 * it, pendingTransactionId = null)
@@ -221,4 +292,106 @@ internal class ResyncNoDuplicatesTest {
         assertThat(sync()).describedAs("a third run").isEqualTo(0)
         assertThat(journals).hasSize(batch.size)
     }
+
+    // region U38: each 409 layer with a response production really returns, and the orchestrator path
+
+    /** Replaces a mock-only test: the real helper (not a mock that throws a create 409) meets the 409 of an already-landed create. */
+    @Test
+    fun aCreateLetterThatAlreadyLandedIsDroppedThroughTheRealHelper() = runBlocking<Unit> {
+        val (store, retrying) = serviceWithStore()
+        service.processFireflyTransactionUpdates(listOf(linked("tx1")), listOf(), listOf())
+        store.add(DeadLetter("create", "tx1", null, linked("tx1").tx, false, "old"))
+        lookupEnabled = false // so the retry's create is really sent and really refused
+        val storesBefore = stores
+
+        retrying.retryDeadLetters()
+
+        assertThat(stores - storesBefore).describedAs("the retry's create was sent and refused").isEqualTo(1)
+        assertThat(store.read()).isEmpty()
+        assertThat(journals).hasSize(1)
+    }
+
+    @Test
+    fun aPollCreateThatFireflyAlreadyHoldsIsAnsweredWith409AndNotCountedAsCreated() = runBlocking<Unit> {
+        val (store, polling) = serviceWithStore()
+        service.processFireflyTransactionUpdates(listOf(linked("tx1")), listOf(), listOf())
+        lookupEnabled = false
+
+        val notCreated = polling.processFireflyTransactionUpdates(listOf(linked("tx1")), listOf(), listOf())
+
+        assertThat(notCreated).isEqualTo(1)
+        assertThat(store.read()).isEmpty()
+        assertThat(journals).hasSize(1)
+    }
+
+    /** `guarded` as the only layer: the helper has no 409 handling for an update, and Firefly answers 409 to one that sends another group's id. */
+    @Test
+    fun anUpdateThatFireflyAnswers409IsDroppedByGuardedWhenTheRealHelperDoesNotAbsorbIt() = runBlocking<Unit> {
+        val (store, polling) = serviceWithStore()
+        service.processFireflyTransactionUpdates(listOf(linked("a"), linked("b")), listOf(), listOf())
+        val g1Before = journals.getValue("g1")
+
+        polling.processFireflyTransactionUpdates(listOf(), listOf(FireflyTransactionDto("g1", linked("a", "b").tx)), listOf())
+
+        assertThat(store.read()).isEmpty()
+        assertThat(journals.getValue("g1")).isEqualTo(g1Before)
+        assertThat(linkOwners()).containsEntry("b", "g2")
+    }
+
+    private fun plainBatchResyncLeavesOneJournalEach() = runBlocking<Unit> {
+        poll(created = batch.map { plaid(it.transactionId, 10.0) })
+        poll(created = batch.map { plaid(it.transactionId, 10.0) })
+        assertThat(journals).hasSize(4)
+        assertThat(linkOwners().keys).containsExactlyInAnyOrder("tx1", "tx2", "tx3", "tx4")
+    }
+
+    @Test
+    fun thePolledResyncOfAPlainBatchLeavesOneJournalEach() = plainBatchResyncLeavesOneJournalEach()
+
+    /** A plain create is not looked up by the orchestrator (only the 409 stops it), so this variant pins the 409 alone. */
+    @Test
+    fun thePolledResyncOfAPlainBatchIsStoppedBy409Alone() { lookupEnabled = false; plainBatchResyncLeavesOneJournalEach() }
+
+    private fun pendingToPostedThenRepeat() = runBlocking<Unit> {
+        poll(created = listOf(plaid("p1", 25.0, pending = true)))
+        assertThat(journals).hasSize(1)
+        val posted = plaid("t1", 25.0, pendingId = "p1")
+        poll(created = listOf(posted), deleted = listOf("p1"))
+        poll(created = listOf(posted), deleted = listOf("p1"))
+        assertThat(journals).describedAs("journals after the resync").hasSize(1)
+        assertThat(linkOwners().keys).describedAs("link owners").containsExactly("t1")
+    }
+
+    @Test
+    fun aPendingToPostedResyncThroughTheOrchestratorLeavesOneJournal() = pendingToPostedThenRepeat()
+
+    @Test
+    fun aPendingToPostedResyncWithTheLookupAloneLeavesOneJournal() { conflictsEnabled = false; pendingToPostedThenRepeat() }
+
+    /**
+     * FINDING (U38): with the lookup missing the pending journal, the 409 can't help (the posted id differs from the pending one's):
+     * the posted create lands as a second journal beside the still-held pending one. Enable once the connector re-checks.
+     */
+    @org.junit.jupiter.api.Disabled("Finding: pending to posted has no 409 defence; a lookup that misses leaves pending p1 and posted t1 as 2 journals")
+    @Test
+    fun aPendingToPostedResyncWithThe409AloneLeavesOneJournal() { lookupEnabled = false; pendingToPostedThenRepeat() }
+
+    @Test
+    fun aBatchOverTheLookupLimitIsChunkedAndNotDuplicatedOnResync() = runBlocking<Unit> {
+        val ids = (1..30)
+        poll(created = ids.map { plaid("p$it", 10.0 * it, pending = true) })
+        val posted = ids.map { plaid("t$it", 10.0 * it, pendingId = "p$it") }
+        val removed = ids.map { "p$it" }
+        poll(created = posted, deleted = removed)
+        poll(created = posted, deleted = removed)
+
+        val lists = argumentCaptor<List<String>>()
+        verify(firefly.plaidLinksApi, atLeast(2)).lookupPlaidLinks(lists.capture())
+        assertThat(lists.allValues).allSatisfy { assertThat(it.size).isBetween(1, PlaidLinksApi.MAX_IDS) }
+        assertThat(lists.allValues.maxOf { it.size }).describedAs("a full chunk was sent").isEqualTo(PlaidLinksApi.MAX_IDS)
+        assertThat(journals).hasSize(30)
+        assertThat(linkOwners().keys).containsExactlyInAnyOrderElementsOf(ids.map { "t$it" })
+    }
+
+    // endregion
 }

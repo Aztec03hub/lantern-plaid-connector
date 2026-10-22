@@ -149,7 +149,7 @@ internal class SyncHelperLinkTest {
     }
 
     @Test
-    fun theProbeIsNotAnswerableByAStockFireflyThatIgnoresLinksOnWrite() = runBlocking<Unit> {
+    fun aWriteThatComesBackWithoutItsLinksFailsTheBatchAsNotTheFork() = runBlocking<Unit> {
         // a Firefly that answers 200 but drops plaid_links stores nothing the link table could dedupe
         whenever(firefly.transactionsApi.storeTransaction(any())).doSuspendableAnswer {
             val sent = it.getArgument<TransactionStore>(0)
