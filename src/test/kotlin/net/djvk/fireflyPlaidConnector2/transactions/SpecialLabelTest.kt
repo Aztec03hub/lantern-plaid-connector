@@ -24,7 +24,7 @@ internal class SpecialLabelTest {
             convertSingle(t, mapOf(t.accountId to 1)).tx
 
         suspend fun update(t: net.djvk.fireflyPlaidConnector2.api.plaid.models.Transaction) =
-            convert(t, sourceId = "1", fireflyTx =FireflyTransactionDto("9", FireflyFixtures.getTransaction(categoryName = "Hand set").transactions.first())).tx
+            convert(t, sourceId = "1", fireflyTx = FireflyTransactionDto("9", FireflyFixtures.getTransaction(categoryName = "Hand set").transactions.first())).tx
     }
 
     private fun tx(text: String) = PlaidFixtures.getTransaction(

@@ -985,7 +985,7 @@ class TransactionConverter(
     }
 
     /**
-     * @param fireflyTx Only included in cases where we're converting a Plaid/Firefly tx pair into a transfer.
+     * @param fireflyTx The existing Firefly transaction this is an update of (its id, description and currency are kept); null for a create.
      * @param plaidLinks the Plaid transaction ids this transaction is created or converted with; null leaves the links alone
      */
     protected suspend fun convert(
@@ -1028,7 +1028,7 @@ class TransactionConverter(
             sourceName = sourceName,
             destinationId = destinationId,
             destinationName = destinationName,
-            // create only (a create carries its links; a plain update and a pair-into-transfer of an existing journal don't):
+            // create only (a create carries its links; a plain update of an existing journal doesn't):
             //  an update must not overwrite a category set by hand
             categoryName = if (fireflyTx == null && plaidLinks != null) namer.special(tx.counterparties?.firstOrNull()?.name ?: tx.merchantName, tx.name) else null,
             tags = getFireflyCategoryTags(tx) + listOfNotNull(importTag),
