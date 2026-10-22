@@ -1126,8 +1126,9 @@ class TransactionConverter(
             sourceName = sourceName,
             destinationId = destinationId,
             destinationName = destinationName,
-            // create only: an update must not overwrite a category set by hand
-            categoryName = if (fireflyTx == null) namer.special(tx.counterparties?.firstOrNull()?.name ?: tx.merchantName, tx.name) else null,
+            // create only (a create carries its links; a plain update and a pair-into-transfer of an existing journal don't):
+            //  an update must not overwrite a category set by hand
+            categoryName = if (fireflyTx == null && plaidLinks != null) namer.special(tx.counterparties?.firstOrNull()?.name ?: tx.merchantName, tx.name) else null,
             tags = getFireflyCategoryTags(tx) + listOfNotNull(importTag),
             latitude = tx.location.lat,
             longitude = tx.location.lon,
