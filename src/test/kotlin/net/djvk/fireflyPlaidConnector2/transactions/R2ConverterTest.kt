@@ -469,4 +469,62 @@ internal class R2ConverterTest {
     }
 
     // endregion
+
+    // region U10 A7
+
+    private val markWd = net.djvk.fireflyPlaidConnector2.sync.FlipMark("1", setOf("wd"))
+    private fun sync(vararg updated: net.djvk.fireflyPlaidConnector2.api.plaid.models.Transaction, marks: Map<String, net.djvk.fireflyPlaidConnector2.sync.FlipMark> = mapOf(), transfer: TransactionRead = existing("ff1", TransactionTypeProperty.transfer, transferLinks)) =
+        runBlocking { converter().convertPollSync(accountMap, listOf(), updated.toList(), listOf(), listOf(transfer), marks) }
+
+    @Test
+    fun aLegFlippedInAnEarlierSyncAndItsPartnerFlippingNowSwapsTheTransferOnce() {
+        val first = sync(plaid(accountA, "wd", -50.0))
+        assertThat(first.flipMarks).isEqualTo(mapOf("ff1" to markWd))
+        assertThat(first.updates.single().tx.sourceId).isEqualTo("1")
+
+        val second = sync(plaid(accountB, "dep", 50.0), marks = first.flipMarks.mapValues { it.value!! })
+        val update = second.updates.single()
+        assertThat(update.tx.sourceId).isEqualTo("2")
+        assertThat(update.tx.destinationId).isEqualTo("1")
+        assertThat(update.tx.plaidLinks).containsExactlyInAnyOrder(
+            PlaidLink("wd", PlaidLinkLeg.destination, accountA), PlaidLink("dep", PlaidLinkLeg.source, accountB),
+        )
+        assertThat(second.transfersNeedingReview).isEmpty()
+        assertThat(second.flipMarks).isEqualTo(mapOf("ff1" to null))
+    }
+
+    @Test
+    fun aMarkFromBeforeASwapIsIgnored() {
+        val swappedLinks = listOf(PlaidLink("wd", PlaidLinkLeg.destination, accountA), PlaidLink("dep", PlaidLinkLeg.source, accountB))
+        val swapped = existing("ff1", TransactionTypeProperty.transfer, swappedLinks, sourceId = "2", destinationId = "1")
+        val result = sync(plaid(accountB, "dep", -50.0), marks = mapOf("ff1" to markWd), transfer = swapped)
+        assertThat(result.updates.single().tx.sourceId).isEqualTo("2")
+        assertThat(result.transfersNeedingReview).containsExactly("ff1")
+        assertThat(result.flipMarks["ff1"]).isEqualTo(net.djvk.fireflyPlaidConnector2.sync.FlipMark("2", setOf("dep")))
+    }
+
+    @Test
+    fun aLegThatFlippedBackClearsItsMark() {
+        val result = sync(plaid(accountA, "wd", 50.0), marks = mapOf("ff1" to markWd))
+        assertThat(result.flipMarks).isEqualTo(mapOf("ff1" to null))
+        assertThat(result.updates.single().tx.sourceId).isEqualTo("1")
+    }
+
+    @Test
+    fun aSecondLegWithNoEarlierFlipStillDisagrees() {
+        val result = sync(plaid(accountB, "dep", 50.0))
+        assertThat(result.transfersNeedingReview).containsExactly("ff1")
+        assertThat(result.updates.single().tx.sourceId).isEqualTo("1")
+        assertThat(result.flipMarks).isEqualTo(mapOf("ff1" to net.djvk.fireflyPlaidConnector2.sync.FlipMark("1", setOf("dep"))))
+    }
+
+    @Test
+    fun aMarkNamingTheOtherTransferIsNotUsed() {
+        val result = sync(plaid(accountB, "dep", 50.0), marks = mapOf("ff2" to markWd))
+        assertThat(result.transfersNeedingReview).containsExactly("ff1")
+        assertThat(result.updates.single().tx.sourceId).isEqualTo("1")
+        assertThat(result.flipMarks).containsOnlyKeys("ff1")
+    }
+
+    // endregion
 }

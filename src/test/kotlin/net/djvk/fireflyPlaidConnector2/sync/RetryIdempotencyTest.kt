@@ -171,7 +171,7 @@ internal class RetryIdempotencyTest {
         whenever(fireflyTransactionService.windowStart()).thenReturn(LocalDate.now().minusDays(5))
         whenever(fireflyTransactionService.fetchMissingByPlaidId(any(), any())).thenReturn(emptyList())
         whenever(fireflyTransactionService.fetchFireflyTransactionsBetween(any(), any(), any())).thenReturn(emptyList())
-        whenever(mockConverter.convertPollSync(any(), any(), any(), any(), any()))
+        whenever(mockConverter.convertPollSync(any(), any(), any(), any(), any(), any()))
             .thenReturn(TransactionConverter.ConvertPollSyncResult(listOf(), listOf(), listOf()))
     }
 

@@ -280,7 +280,8 @@ internal class PolledSyncOrchestratorTest {
             eq(plaidTransactionResult.created),
             eq(plaidTransactionResult.updated),
             eq(plaidTransactionResult.deleted),
-            eq(existingFireflyTxs)
+            eq(existingFireflyTxs),
+            any()
         )).thenReturn(convertResult)
 
         // Create an orchestrator instance
@@ -303,7 +304,7 @@ internal class PolledSyncOrchestratorTest {
         if (!plaidHadChanges) {
             // A poll with nothing new must not touch Firefly at all, but must still commit the cursors
             verify(fireflyTransactionService, never()).fetchExistingFireflyTransactions()
-            verify(converter, never()).convertPollSync(any(), any(), any(), any(), any())
+            verify(converter, never()).convertPollSync(any(), any(), any(), any(), any(), any())
             verify(fireflyTransactionService, never()).processFireflyTransactionUpdates(any(), any(), any())
             verify(cursorManager).writeCursorMap(eq(cursorMap))
             return@runBlocking
@@ -314,7 +315,8 @@ internal class PolledSyncOrchestratorTest {
             eq(plaidTransactionResult.created),
             eq(plaidTransactionResult.updated),
             eq(plaidTransactionResult.deleted),
-            eq(existingFireflyTxs)
+            eq(existingFireflyTxs),
+            any()
         )
         verify(fireflyTransactionService).processFireflyTransactionUpdates(
             eq(convertResult.creates),
@@ -324,7 +326,7 @@ internal class PolledSyncOrchestratorTest {
         verify(cursorManager).writeCursorMap(eq(cursorMap))
     }
 
-    private fun stubOneCreateIteration(): Triple<Map<String, Int>, Sequence<Pair<String, List<String>>>, MutableMap<String, String>> {
+    private fun stubOneCreateIteration(flipMarks: Map<String, net.djvk.fireflyPlaidConnector2.sync.FlipMark?> = mapOf()): Triple<Map<String, Int>, Sequence<Pair<String, List<String>>>, MutableMap<String, String>> {
         val accountMap = mapOf("account1" to 1)
         val sequence = sequenceOf(Pair("token1", listOf("account1")))
         val cursorMap = mutableMapOf<String, String>()
@@ -342,6 +344,7 @@ internal class PolledSyncOrchestratorTest {
             ),
             updates = emptyList(),
             deletes = listOf("77"),
+            flipMarks = flipMarks,
         )
         runBlocking {
             whenever(fireflyTransactionService.fetchExistingFireflyTransactions()).thenReturn(emptyList())
@@ -349,7 +352,7 @@ internal class PolledSyncOrchestratorTest {
             whenever(fireflyTransactionService.windowStart()).thenReturn(java.time.LocalDate.now().minusDays(5))
             whenever(fireflyTransactionService.fetchFireflyTransactionsBetween(any(), any(), any())).thenReturn(emptyList())
             whenever(plaidSyncService.processPlaidTransactions(eq(sequence), eq(cursorMap))).thenReturn(plaidResult)
-            whenever(converter.convertPollSync(any(), any(), any(), any(), any())).thenReturn(convertResult)
+            whenever(converter.convertPollSync(any(), any(), any(), any(), any(), any())).thenReturn(convertResult)
         }
         return Triple(accountMap, sequence, cursorMap)
     }
@@ -425,5 +428,38 @@ internal class PolledSyncOrchestratorTest {
         orchestrator.runIteration(accountMap, sequence, cursorMap)
 
         verify(fireflyTransactionService).processFireflyTransactionUpdates(any(), any(), any())
+    }
+
+    /** U10 A7: the marks are read for the conversion and saved only after Firefly accepted the writes. */
+    @Test
+    fun marksAreSavedAfterTheWritesAndPassedToTheConversion() = runBlocking<Unit> {
+        val marks = mapOf("ff1" to net.djvk.fireflyPlaidConnector2.sync.FlipMark("1", setOf("wd")))
+        val store: net.djvk.fireflyPlaidConnector2.sync.FlippedLegStore = mock()
+        whenever(store.read()).thenReturn(mapOf("ff0" to net.djvk.fireflyPlaidConnector2.sync.FlipMark("2", setOf("x"))))
+        val (accountMap, sequence, cursorMap) = stubOneCreateIteration(marks)
+        val orchestrator = PolledSyncOrchestrator(
+            30, syncHelper, cursorManager, plaidSyncService, fireflyTransactionService, converter, flippedLegStore = store,
+        )
+
+        orchestrator.runIteration(accountMap, sequence, cursorMap)
+
+        val inOrder = org.mockito.Mockito.inOrder(fireflyTransactionService, store)
+        inOrder.verify(fireflyTransactionService).processFireflyTransactionUpdates(any(), any(), any())
+        inOrder.verify(store).apply(eq(marks))
+        verify(converter).convertPollSync(any(), any(), any(), any(), any(), eq(mapOf("ff0" to net.djvk.fireflyPlaidConnector2.sync.FlipMark("2", setOf("x")))))
+    }
+
+    @Test
+    fun aFailedWriteLeavesTheMarkStoreUntouched() = runBlocking<Unit> {
+        val store: net.djvk.fireflyPlaidConnector2.sync.FlippedLegStore = mock()
+        val (accountMap, sequence, cursorMap) = stubOneCreateIteration(mapOf("ff1" to null))
+        whenever(fireflyTransactionService.processFireflyTransactionUpdates(any(), any(), any())).thenThrow(IllegalStateException("boom"))
+        val orchestrator = PolledSyncOrchestrator(
+            30, syncHelper, cursorManager, plaidSyncService, fireflyTransactionService, converter, flippedLegStore = store,
+        )
+
+        assertThrows<IllegalStateException> { orchestrator.runIteration(accountMap, sequence, cursorMap) }
+
+        verify(store, never()).apply(any())
     }
 }

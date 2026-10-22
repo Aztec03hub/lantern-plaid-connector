@@ -160,7 +160,7 @@ internal class NetworkResilienceTest {
             // One deletion, so there is work for Firefly (an empty poll skips Firefly entirely)
             PlaidTransactionResult(emptyList(), emptyList(), listOf("gone"))
         }
-        whenever(converter.convertPollSync(any(), any(), any(), any(), any()))
+        whenever(converter.convertPollSync(any(), any(), any(), any(), any(), any()))
             .thenReturn(TransactionConverter.ConvertPollSyncResult(emptyList(), emptyList(), emptyList()))
         whenever(fireflyTransactionService.fetchMissingByPlaidId(any(), any())).thenReturn(emptyList())
         whenever(fireflyTransactionService.windowStart()).thenReturn(java.time.LocalDate.now().minusDays(5))
@@ -187,7 +187,7 @@ internal class NetworkResilienceTest {
             (it.arguments[1] as MutableMap<String, String>)["token1"] = "cursor-new"
             PlaidTransactionResult(emptyList(), emptyList(), emptyList())
         }
-        whenever(converter.convertPollSync(any(), any(), any(), any(), any()))
+        whenever(converter.convertPollSync(any(), any(), any(), any(), any(), any()))
             .thenReturn(TransactionConverter.ConvertPollSyncResult(emptyList(), emptyList(), emptyList()))
 
         orchestrator().processTransactions(accountMap, sequence, committed)

@@ -94,6 +94,8 @@ class PolledSyncOrchestrator(
     /** Longest read-back after an outage; the read-back never goes past this many days even if the Item was silent longer. */
     @Value("\${fireflyPlaidConnector2.polled.investmentMaxLookbackDays:90}")
     private val investmentMaxLookbackDays: Long = 90,
+    /** Remembers a transfer leg that flipped before its partner did; null (tests) means nothing is remembered. */
+    private val flippedLegStore: FlippedLegStore? = null,
 ) : Runner, DisposableBean {
     private val logger = LoggerFactory.getLogger(this::class.java)
 
@@ -375,6 +377,7 @@ class PolledSyncOrchestrator(
             plaidTransactions.updated,
             plaidTransactions.deleted,
             existingFireflyTxs,
+            flippedLegs = flippedLegStore?.read().orEmpty(),
         )
         logger.debug(
             "Conversion result: ${convertResult.creates.size} creates; " +
@@ -388,6 +391,8 @@ class PolledSyncOrchestrator(
             convertResult.updates,
             convertResult.deletes
         )
+        // Saved only after Firefly accepted the writes; a crash before this replays the poll (the cursor commits later)
+        flippedLegStore?.apply(convertResult.flipMarks)
 
         // What this poll could not pair in memory (a leg imported by another run) is paired from Firefly's state. A
         //  failure is logged and retried by the next poll: it must not hold back the cursors of imported data.
