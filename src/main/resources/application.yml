@@ -131,6 +131,13 @@ fireflyPlaidConnector2:
     #  maxRangeTransactions (from Firefly's total, whatever its page size) is the real ceiling.
     maxReadPages: 1000
     maxRangeTransactions: 200000
+  http:
+    # Timeouts (ms, 1..600000) for the Plaid and Firefly HTTP clients. Before these keys connect was the CIO engine's
+    #  5000 and socket was unlimited; request was already 60000 (Plaid's /accounts/balance/get can take that long).
+    #  Defaults are no tighter than that in effect: socket idle is capped by the request limit anyway.
+    connectTimeoutMillis: 10000
+    socketTimeoutMillis: 60000
+    requestTimeoutMillis: 60000
   plaid:
 #    url: https://production.plaid.com
 #    clientId: HI I'M A CLIENT ID

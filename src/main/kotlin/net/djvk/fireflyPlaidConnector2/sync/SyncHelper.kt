@@ -196,7 +196,7 @@ class SyncHelper(
         //  [writeConcurrency] at a time; the link table's 409 is what makes any overlap safe.
         val created = AtomicInteger(0)
         val timedOut = AtomicInteger(0)
-        val firstTimeout = java.util.concurrent.atomic.AtomicReference<ConnectTimeoutException?>(null)
+        val firstTimeout = java.util.concurrent.atomic.AtomicReference<java.io.IOException?>(null)
         fireflyTxs.forEachBounded(writeConcurrency) { fireflyTx ->
             val plaidIds = fireflyTx.tx.plaidLinks.orEmpty().map { it.plaidTransactionId }
             try {
@@ -222,9 +222,12 @@ class SyncHelper(
                     }
                     else -> throw cre
                 }
-            } catch (e: ConnectTimeoutException) {
+            } catch (e: java.io.IOException) {
+                // Only the three timeouts are handled here; any other IOException goes on as before.
+                if (e !is ConnectTimeoutException && e !is SocketTimeoutException && e !is HttpRequestTimeoutException) throw e
                 // Keep going so one timeout doesn't block the rest, but remember it: silently skipping would lose
-                //  the transaction for good once the caller commits its Plaid cursor.
+                //  the transaction for good once the caller commits its Plaid cursor. A timed-out create may still have landed;
+                //  the retry gets a 409 from the link table, which insertUnconflictedLegs treats as already imported.
                 logger.error("Timeout inserting firefly tx $plaidIds; will fail this batch", e)
                 firstTimeout.compareAndSet(null, e)
                 timedOut.incrementAndGet()
