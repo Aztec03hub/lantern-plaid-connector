@@ -844,6 +844,17 @@ internal class PairPassTest {
         assertThat(Files.readString(awaiting)).isNotEqualTo("SENTINEL")
     }
 
+    @Test
+    fun awaitingRecordsCarryAmountDirectionAndTextAndAnOldRecordStillBuilds() {  // LAN-109
+        assertThat(Awaiting.amountText(-1234)).isEqualTo("12.34")
+        assertThat(Awaiting.amountText(5)).isEqualTo("0.05")
+        val old = AwaitingRecord("a", 1, d, "pending", null, null, emptyMap(), null, null, null, emptyList())
+        assertThat(old.amount).isNull()
+        val json = com.fasterxml.jackson.module.kotlin.jacksonObjectMapper().findAndRegisterModules()
+            .writeValueAsString(old.copy(amount = "12.34", direction = "out", text = "ACH"))
+        assertThat(json).contains("\"amount\":\"12.34\"", "\"direction\":\"out\"", "\"text\":\"ACH\"")
+    }
+
     // endregion
 
     // region order independence
