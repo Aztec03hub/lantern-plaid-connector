@@ -441,4 +441,32 @@ internal class R2ConverterTest {
     }
 
     // endregion
+
+    // region U10 A6
+
+    private fun replacedPendingSync() = runBlocking {
+        val q1 = PlaidFixtures.getPaymentTransaction(
+            accountId = accountA, transactionId = "q1", pendingTransactionId = "p1", amount = 50.0, pending = false, name = "Plaid q1",
+        )
+        converter().convertPollSync(
+            accountMap, listOf(q1, plaid(accountB, "c1", -50.0)), listOf(), listOf("p1"),
+            listOf(existing("ff1", TransactionTypeProperty.withdrawal, single("p1"))),
+        )
+    }
+
+    /**
+     * A6 characterization (U10 Step 0): the replaced pending leg is dropped from the candidates, but the two new Plaid legs
+     * pair with each other, so the transfer exists. Only the old untagged Firefly leg is deleted (its own user fields go).
+     */
+    @Test
+    fun aPendingLegReplacedInTheSameSyncStillEndsAsOneTransfer() {
+        val result = replacedPendingSync()
+        val transfer = result.creates.single()
+        assertThat(transfer.tx.type).isEqualTo(TransactionTypeProperty.transfer)
+        assertThat(transfer.tx.plaidLinks!!.map { it.plaidTransactionId }).containsExactlyInAnyOrder("q1", "c1")
+        assertThat(result.updates).isEmpty()
+        assertThat(result.deletes).containsExactly("ff1")
+    }
+
+    // endregion
 }
