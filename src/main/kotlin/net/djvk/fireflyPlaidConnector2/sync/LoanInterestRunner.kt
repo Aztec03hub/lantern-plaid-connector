@@ -53,6 +53,8 @@ data class InterestLine(val payment: LoanPayment, val days: Long, val owedBefore
 data class LoanPlan(
     val loan: LoanConfig, val name: String, val plaidOwed: BigDecimal, val fireflyOwed: BigDecimal, val gap: BigDecimal,
     val lines: List<InterestLine>, val residual: BigDecimal, val action: String,
+    /** Journal ids of the payments plan() saw; [LoanInterestRunner.isStored] needs them to tell a live row from an orphan. */
+    val paymentIds: Set<String> = setOf(),
 ) {
     val writes: Boolean get() = lines.isNotEmpty() || residual.signum() != 0
 }
@@ -287,6 +289,21 @@ class LoanInterestRunner(
     private fun money(x: BigDecimal) = x.setScale(2, RoundingMode.HALF_UP).toPlainString()
     private fun interestDescription(name: String, p: LoanPayment) = "Interest on $name payment of $${money(p.amount)}"
 
+    /**
+     * L3 (U04b): is [p]'s interest already among [rows]? An externalId naming this payment's journal always says yes. A date plus
+     * description match says yes only for a row with no externalId, or one naming a journal no longer among [liveIds] (the payment was
+     * re-imported under a new id). A row owned by another live payment never covers this one, so two same-day, same-amount
+     * payments each get their own row. plan() and write() both call this, so they can't disagree.
+     */
+    internal fun isStored(p: LoanPayment, desc: String, rows: List<TransactionSplit>, liveIds: Set<String>): Boolean = rows.any { r ->
+        val ext = r.externalId?.takeIf { it.isNotBlank() }
+        when {
+            p.journalId != null && ext == EXTERNAL_PREFIX + p.journalId -> true
+            dateOf(r) != p.date || r.description != desc -> false
+            else -> ext == null || ext.removePrefix(EXTERNAL_PREFIX) !in liveIds
+        }
+    }
+
     /** Reads Plaid and Firefly for [loan] and decides; writes nothing. */
     internal suspend fun plan(loan: LoanConfig, plaid: Map<Int, BigDecimal>? = null): LoanPlan {
         val id = loan.account.toString()
@@ -297,8 +314,9 @@ class LoanInterestRunner(
         val name = fireflyAccountsApi.getAccount(id, null).body().data.attributes.name
         val fireflyOwed = fireflyOwed(loan.account, null)
         val gap = plaidOwed - fireflyOwed
+        var paymentIds = setOf<String>()
         fun done(action: String, lines: List<InterestLine> = listOf(), residual: BigDecimal = BigDecimal.ZERO) =
-            LoanPlan(loan, name, plaidOwed, fireflyOwed, gap, lines, residual, action)
+            LoanPlan(loan, name, plaidOwed, fireflyOwed, gap, lines, residual, action, paymentIds)
         if (gap.abs() <= tolerance) return done("OK: within $tolerance")
         // Plaid owes LESS than Firefly: Plaid has seen a payment that Firefly has not (not imported or not routed yet)
         if (gap.signum() < 0) return done("Firefly lags: Plaid owes less than Firefly, so a payment Plaid has seen may be missing in Firefly, or Firefly holds interest or withdrawals Plaid does not; nothing written")
@@ -310,12 +328,11 @@ class LoanInterestRunner(
         val payments = splits.filter { it.destinationId == id && !own(it) }
             .map { LoanPayment(dateOf(it), BigDecimal(it.amount), it.transactionJournalId) }.sortedBy { it.date }
         val interestRows = splits.filter { it.sourceId == id && it.description.startsWith("Interest on ") }
-        val covered = interestRows.map { dateOf(it) to it.description }.toSet()
-        val coveredIds = interestRows.mapNotNull { it.externalId }.toSet()
+        val liveIds = payments.mapNotNull { it.journalId }.toSet()
+        paymentIds = liveIds
         val lines = mutableListOf<InterestLine>()
         payments.forEachIndexed { i, p ->
-            if (p.journalId != null && EXTERNAL_PREFIX + p.journalId in coveredIds) return@forEachIndexed
-            if ((p.date to interestDescription(name, p)) in covered) return@forEachIndexed
+            if (isStored(p, interestDescription(name, p), interestRows, liveIds)) return@forEachIndexed
             val days = if (i == 0) 0 else ChronoUnit.DAYS.between(payments[i - 1].date, p.date)
             // Firefly's balance lacks the interest of the earlier uncovered payments of this plan
             val owedBefore = fireflyOwed(loan.account, p.date.minusDays(1)) + lines.fold(BigDecimal.ZERO) { a, l -> a + l.expected }
@@ -339,16 +356,13 @@ class LoanInterestRunner(
         val id = p.loan.account.toString()
         // U04: re-list just before storing, with the identity rule plan() used, so a second writer's line is not stored again
         val now = splitsOf(p.loan.account).filter { it.sourceId == id && it.description.startsWith("Interest on ") }
-        val coveredNow = now.map { dateOf(it) to it.description }.toSet()
-        val coveredIdsNow = now.mapNotNull { it.externalId }.toSet()
         // U04 r1: a residual has no identity to re-check, so any write since plan() (another writer's residual) holds it back
         val moved = p.residual.signum() != 0 && fireflyOwed(p.loan.account, null).compareTo(p.fireflyOwed) != 0
         var skipped = 0
         // the line that carries the cents remainder goes first: a later failure leaves exact lines and the rerun has no remainder
         for (l in p.lines.sortedByDescending { it.expected }) {
             if (l.expected.signum() <= 0) continue
-            if ((l.payment.journalId != null && EXTERNAL_PREFIX + l.payment.journalId in coveredIdsNow) ||
-                (l.payment.date to interestDescription(p.name, l.payment)) in coveredNow) {
+            if (isStored(l.payment, interestDescription(p.name, l.payment), now, p.paymentIds)) {
                 skipped++
                 println("   loan ${p.loan.account}: interest for payment ${l.payment.date} already stored by another writer; skipped")
                 continue

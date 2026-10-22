@@ -327,7 +327,34 @@ internal class LoanInterestRunnerTest {
     }
 
     @Test
-    fun aRenamedLoanDoesNotUncoverOldPaymentsBecauseCoverageFollowsTheJournalId() = runBlocking<Unit> {  // B1
+    fun aSameDaySameAmountSecondPaymentIsNotCoveredByTheFirstOnesRow() = runBlocking<Unit> {  // U04b L3
+        owedBefore[d(8, 31)] = "23817.37"
+        val rows = chargedThenNew.dropLast(1) + listOf(
+            payment("b1", "400.00", d(9, 1)), interest("ib1", "74.29", "400.00", d(9, 1), externalId = "lantern-interest:jb1"),
+            payment("b2", "400.00", d(9, 1)),
+        )
+        val plan = runner("23491.66", rows, apply = false).runOnce().single()
+        assertThat(plan.lines.map { it.payment.journalId }).containsExactly("jb2")
+    }
+
+    @Test
+    fun aReimportedPaymentWhoseOldRowNamesAGoneJournalStaysCovered() = runBlocking<Unit> {  // U04b L3
+        val rows = chargedThenNew + interest("ib", "74.29", "400.00", d(9, 1), externalId = "lantern-interest:jGONE")
+        assertThat(runner("23491.66", rows, apply = false).runOnce().single().lines).isEmpty()
+    }
+
+    @Test
+    fun aSinglePaymentNightStoresExactlyOnceAndALaterNightStoresNothing() = runBlocking<Unit> {  // U04b L3
+        owedBefore[d(8, 31)] = "23817.37"
+        runner("23491.66", chargedThenNew).runOnce()
+        assertThat(stored()).hasSize(1)
+        val again = runner("23491.66", chargedThenNew + interest("ib", "74.29", "400.00", d(9, 1), externalId = "lantern-interest:jb"))
+        again.runOnce()
+        assertThat(stored()).hasSize(1)
+    }
+
+    @Test
+    fun aRenamedLoanDoesNotUncoverOldPaymentsBecauseCoverageFollowsTheJournalId()= runBlocking<Unit> {  // B1
         owedBefore[d(8, 31)] = "23817.37"
         val rows = listOf(
             payment("a", "400.00", d(8, 17)),
