@@ -135,6 +135,18 @@ class FireflyTransactionServiceTest {
     }
 
     @Test
+    fun anUpdate409IsReportedOnceAndACreate409IsNot() = runBlocking<Unit> {
+        val (_, service) = serviceWithStore()
+        whenever(syncHelper.updateBatchInFirefly(any())).doSuspendableAnswer { throw statusError(HttpStatusCode.Conflict) }
+        whenever(syncHelper.optimisticInsertBatchIntoFirefly(any())).doSuspendableAnswer { throw statusError(HttpStatusCode.Conflict) }
+
+        service.processFireflyTransactionUpdates(listOf(linked("tx9")), listOf(FireflyTransactionDto("ff7", linked("tx1").tx)), listOf())
+
+        assertThat(service.takeUpdateConflicts()).containsExactly("ff7")
+        assertThat(service.takeUpdateConflicts()).isEmpty()
+    }
+
+    @Test
     fun a409OnAFreshUpdateIsNotKept() = runBlocking<Unit> {
         val (store, service) = serviceWithStore()
         whenever(syncHelper.updateBatchInFirefly(any())).doSuspendableAnswer { throw statusError(HttpStatusCode.Conflict) }

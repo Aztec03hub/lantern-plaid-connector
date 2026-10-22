@@ -418,15 +418,20 @@ class PolledSyncOrchestrator(
 
         // What this poll could not pair in memory (a leg imported by another run) is paired from Firefly's state. A
         //  failure is logged and retried by the next poll: it must not hold back the cursors of imported data.
+        var pairFailures = 0
+        var pairLegsNeedingHuman = 0
         try {
             if (pairPass != null && pairSettings?.afterRun == true) {
                 val today = java.time.LocalDate.now()
-                pairPass.run(today.minusDays(pairSettings.lookbackDays), today, pairSettings.dryRun)
+                val report = pairPass.run(today.minusDays(pairSettings.lookbackDays), today, pairSettings.dryRun)
+                pairFailures = report.failed.size
+                pairLegsNeedingHuman = report.needsHuman.size
             }
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (e: Exception) {
             logger.error("Transfer pairing failed; it is retried by the next poll", e)
+            pairFailures = 1
         }
 
         // A create waiting in the dead letter file is invisible to the conversion above (it only looks in Firefly), so
@@ -448,14 +453,17 @@ class PolledSyncOrchestrator(
             failedItems = recordItemOutcomes(accessTokens, plaidTransactions.failedItems),
             transfersNeedingReview = convertResult.transfersNeedingReview.size,
             routingsRefused = converter.routingsRefused,
+            pairFailures = pairFailures,
+            pairLegsNeedingHuman = pairLegsNeedingHuman,
         ).withDeadLetters()
     }
 
-    /** Fills in what the dead letter file holds right now (retried, abandoned, unreadable). */
+    /** Fills in what the dead letter file holds right now (retried, abandoned, unreadable) and the update 409s since the last poll. */
     private suspend fun PollResult.withDeadLetters(): PollResult {
-        val store = deadLetterStore ?: return this
+        val withConflicts = copy(updateConflicts = fireflyTransactionService.takeUpdateConflicts().size)
+        val store = deadLetterStore ?: return withConflicts
         val letters = store.read()
-        return copy(
+        return withConflicts.copy(
             deadLetters = letters.size,
             deadLettersAbandoned = letters.count { it.abandoned },
             deadLetterFilesUnreadable = store.takeUnreadableCount(),

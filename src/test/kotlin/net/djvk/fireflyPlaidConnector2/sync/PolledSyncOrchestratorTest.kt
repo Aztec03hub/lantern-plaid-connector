@@ -16,6 +16,7 @@ import org.junit.jupiter.params.provider.Arguments
 import org.junit.jupiter.params.provider.MethodSource
 import org.junit.jupiter.api.assertThrows
 import org.mockito.kotlin.any
+import org.mockito.kotlin.doSuspendableAnswer
 import org.mockito.kotlin.argumentCaptor
 import org.mockito.kotlin.eq
 import org.mockito.kotlin.isNull
@@ -413,6 +414,77 @@ internal class PolledSyncOrchestratorTest {
         assertEquals(true, result.firstValue.partial)
         verify(fireflyTransactionService).processFireflyTransactionUpdates(any(), any(), any())
         verify(converter).routingsRefused = 0
+    }
+
+    private fun pairingOrchestrator(webhookService: WebhookService, pairPass: net.djvk.fireflyPlaidConnector2.pairing.PairPass) =
+        PolledSyncOrchestrator(
+            30, syncHelper, cursorManager, plaidSyncService, fireflyTransactionService, converter, webhookService,
+            pairPass = pairPass, pairSettings = net.djvk.fireflyPlaidConnector2.pairing.PairSettings(dryRun = false, afterRun = true),
+        )
+
+    private fun reportOf(failed: Int, needsHuman: Int): net.djvk.fireflyPlaidConnector2.pairing.PairPassReport {
+        val report = mock<net.djvk.fireflyPlaidConnector2.pairing.PairPassReport>()
+        whenever(report.failed).thenReturn(List(failed) { net.djvk.fireflyPlaidConnector2.pairing.PairFailure("o$it", "i$it", "d", "boom") })
+        whenever(report.needsHuman).thenReturn(List(needsHuman) { mock<net.djvk.fireflyPlaidConnector2.pairing.Leg>() to "reconciled" })
+        return report
+    }
+
+    @Test
+    fun aThrowingPairPassMakesThePollPartialButKeepsExitZero() = runBlocking<Unit> {
+        val webhookService: WebhookService = mock()
+        val pairPass: net.djvk.fireflyPlaidConnector2.pairing.PairPass = mock()
+        val (accountMap, sequence, cursorMap) = stubOneCreateIteration()
+        whenever(pairPass.run(any(), any(), any(), any())).doSuspendableAnswer { throw IllegalStateException("boom") }
+
+        assertEquals(true, pairingOrchestrator(webhookService, pairPass).pollOnce(accountMap, sequence, cursorMap))
+
+        val result = argumentCaptor<PollResult>()
+        verify(webhookService).post(any(), any(), result.capture(), isNull())
+        assertEquals(1, result.firstValue.pairFailures)
+        assertEquals(true, result.firstValue.partial)
+        verify(cursorManager).writeCursorMap(eq(cursorMap))
+    }
+
+    @Test
+    fun failedMergesArePartialAndRefusedLegsAreCountedButNotPartial() = runBlocking<Unit> {
+        val pairPass: net.djvk.fireflyPlaidConnector2.pairing.PairPass = mock()
+        val (accountMap, sequence, cursorMap) = stubOneCreateIteration()
+
+        val failedHook: WebhookService = mock()
+        val failedReport = reportOf(failed = 1, needsHuman = 0)
+        whenever(pairPass.run(any(), any(), any(), any())).thenReturn(failedReport)
+        pairingOrchestrator(failedHook, pairPass).runIteration(accountMap, sequence, cursorMap)
+        val failedResult = argumentCaptor<PollResult>()
+        verify(failedHook).post(any(), any(), failedResult.capture(), isNull())
+        assertEquals(1, failedResult.firstValue.pairFailures)
+        assertEquals(true, failedResult.firstValue.partial)
+
+        val legsHook: WebhookService = mock()
+        val legsReport = reportOf(failed = 0, needsHuman = 2)
+        whenever(pairPass.run(any(), any(), any(), any())).thenReturn(legsReport)
+        pairingOrchestrator(legsHook, pairPass).runIteration(accountMap, sequence, cursorMap)
+        val legsResult = argumentCaptor<PollResult>()
+        verify(legsHook).post(any(), any(), legsResult.capture(), isNull())
+        assertEquals(2, legsResult.firstValue.pairLegsNeedingHuman)
+        assertEquals(0, legsResult.firstValue.pairFailures)
+        assertEquals(false, legsResult.firstValue.partial)
+    }
+
+    @Test
+    fun anUpdateConflictMakesThePollPartialAndKeepsExitZero() = runBlocking<Unit> {
+        val webhookService: WebhookService = mock()
+        val (accountMap, sequence, cursorMap) = stubOneCreateIteration()
+        whenever(fireflyTransactionService.takeUpdateConflicts()).thenReturn(listOf("ff7"))
+        val orchestrator = PolledSyncOrchestrator(
+            30, syncHelper, cursorManager, plaidSyncService, fireflyTransactionService, converter, webhookService
+        )
+
+        assertEquals(true, orchestrator.pollOnce(accountMap, sequence, cursorMap))
+
+        val result = argumentCaptor<PollResult>()
+        verify(webhookService).post(any(), any(), result.capture(), isNull())
+        assertEquals(1, result.firstValue.updateConflicts)
+        assertEquals(true, result.firstValue.partial)
     }
 
     /**
