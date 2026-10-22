@@ -69,6 +69,8 @@ internal fun permissionWarnings(paths: List<Path>): List<String> = paths.mapNotN
         return@mapNotNull null
     } catch (e: java.io.IOException) {
         return@mapNotNull null
+    } catch (e: SecurityException) {
+        return@mapNotNull null
     }
     val open = perms.any { it.name.startsWith("GROUP") || it.name.startsWith("OTHERS") }
     if (open) "${p.fileName} is readable by group or others (mode ${PosixFilePermissions.toString(perms)}); it holds credentials, chmod 600" else null
