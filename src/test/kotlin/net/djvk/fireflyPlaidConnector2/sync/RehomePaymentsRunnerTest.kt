@@ -9,6 +9,7 @@ import net.djvk.fireflyPlaidConnector2.api.firefly.models.AccountSingle
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.AccountTypeProperty
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.ShortAccountTypeProperty
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.Meta
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.MetaPagination
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.ObjectLink
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.PageLink
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.PlaidLink
@@ -16,6 +17,7 @@ import net.djvk.fireflyPlaidConnector2.api.firefly.models.PlaidLinkLeg
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionArray
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionRead
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionSingle
+import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionTypeProperty
 import net.djvk.fireflyPlaidConnector2.api.firefly.models.TransactionUpdate
 import net.djvk.fireflyPlaidConnector2.config.properties.TransactionStyleConfig
 import net.djvk.fireflyPlaidConnector2.lib.FireflyFixtures
@@ -68,13 +70,13 @@ internal class RehomePaymentsRunnerTest {
         ), ObjectLink(),
     )
 
-    private fun runner(apply: Boolean, rows: List<TransactionRead>, match: String = "XXXX0198", reverse: Boolean = false): RehomePaymentsRunner {
+    private fun runner(apply: Boolean, rows: List<TransactionRead>, match: String = "XXXX0198", reverse: Boolean = false, since: String = "2000-01-01"): RehomePaymentsRunner {
         runBlocking {
             whenever(syncHelper.getAllPlaidAccessTokenAccountIdSets()).thenReturn(Pair(emptyMap(), emptySequence()))
             whenever(accountsApi.listTransactionByAccount(any(), anyOrNull(), anyOrNull(), anyOrNull(), anyOrNull(), anyOrNull()))
                 .doSuspendableAnswer { createFireflyResponse(TransactionArray(rows, Meta(), PageLink())) }
         }
-        return RehomePaymentsRunner(syncHelper, accountsApi, txApi, converter(match), apply, "2000-01-01", dir.path, "America/Chicago", reverse)
+        return RehomePaymentsRunner(syncHelper, accountsApi, txApi, converter(match), apply, since, dir.path, "America/Chicago", reverse)
     }
 
     // 400 matches the Lexus schedule only on the 7th; journals are dated on the 7th of a recent month
@@ -351,5 +353,70 @@ internal class RehomePaymentsRunnerTest {
         val m = r.readPlan().single()
         assertThat(m.date.dayOfMonth).isEqualTo(7)
         assertThat(m.to).isEqualTo(2)
+    }
+
+    // U55 (B30): guards of planSplit and applyPlan that no test pinned
+    private val onTheSeventh = OffsetDateTime.parse("2026-09-07T17:00:00Z")
+
+    private fun row(id: String, type: TransactionTypeProperty = TransactionTypeProperty.withdrawal, source: String = "1", leg: PlaidLinkLeg = PlaidLinkLeg.single, at: OffsetDateTime = onTheSeventh) = TransactionRead(
+        "transactions", id,
+        FireflyFixtures.getTransaction(
+            type = type, sourceId = source, destinationId = "50", destinationType = AccountTypeProperty.expenseAccount, amount = "400.00",
+            description = text, date = at, transactionJournalId = "j$id", plaidLinks = listOf(PlaidLink("p$id", leg, "plaid1")),
+        ), ObjectLink(),
+    )
+
+    @Test
+    fun aLinkAlreadyOnANonSingleLegStaysUnplanned() = runBlocking<Unit> {
+        val r = runner(false, listOf(row("a", leg = PlaidLinkLeg.source), row("b")))
+        assertThat(r.readPlan().map { it.journalId }).containsExactly("b")
+    }
+
+    @Test
+    fun onlyWithdrawalsAreEverPlanned() = runBlocking<Unit> {
+        val r = runner(false, listOf(row("a", type = TransactionTypeProperty.deposit), row("b", type = TransactionTypeProperty.transfer), row("c")))
+        assertThat(r.readPlan().map { it.journalId }).containsExactly("c")
+    }
+
+    @Test
+    fun aWithdrawalFromAnotherSourceAccountIsNeverPlanned() = runBlocking<Unit> {
+        val r = runner(false, listOf(row("a", source = "9"), row("b")))
+        assertThat(r.readPlan().map { it.journalId }).containsExactly("b")
+    }
+
+    @Test
+    fun aRowOnTheSinceDateIsPlannedAndTheDayBeforeIsNot() = runBlocking<Unit> {  // KDoc names no bound; the code keeps `date >= since`
+        val r = runner(false, listOf(row("on", at = onTheSeventh), row("before", at = onTheSeventh.minusDays(1))), since = "2026-09-07")
+        assertThat(r.readPlan().map { it.journalId }).containsExactly("on")
+    }
+
+    @Test
+    fun aSearchWithTwoPagesIsReadToTheEnd() = runBlocking<Unit> {
+        val r = runner(false, emptyList())
+        whenever(accountsApi.listTransactionByAccount(any(), anyOrNull(), anyOrNull(), anyOrNull(), anyOrNull(), anyOrNull())).doSuspendableAnswer {
+            val page = it.getArgument<Int?>(1) ?: 1
+            createFireflyResponse(TransactionArray(listOf(row(if (page == 1) "p1" else "p2")), Meta(pagination = MetaPagination(currentPage = page, totalPages = 2)), PageLink()))
+        }
+        assertThat(r.readPlan().map { it.journalId }).containsExactly("p1", "p2")
+    }
+
+    @Test
+    fun theUpdateCarriesNoRulesAndNoWebhooks() = runBlocking<Unit> {
+        val r = runner(true, listOf(row("a")))
+        r.applyPlan(r.readPlan())
+        val upd = argumentCaptor<TransactionUpdate>()
+        verify(txApi).updateTransaction(any(), upd.capture())
+        assertThat(upd.firstValue.applyRules).isEqualTo(false)
+        assertThat(upd.firstValue.fireWebhooks).isEqualTo(false)
+    }
+
+    @Test
+    fun aLaterDoneLineOfAnotherJournalDoesNotCloseAnOpenIntent() = runBlocking<Unit> {
+        File(dir, "rehome_log.jsonl").writeText(intent("50", "2", "2026-10-01T01:00:00Z") + "\n" + done("51", "2", "2026-10-01T02:00:00Z", "b") + "\n")
+        stubJournal("a", "2")
+        stubJournal("b", "2")
+        runner(true, emptyList(), reverse = true).reverseLog()
+        verify(txApi).updateTransaction(org.mockito.kotlin.eq("a"), any())
+        verify(txApi).updateTransaction(org.mockito.kotlin.eq("b"), any())
     }
 }
