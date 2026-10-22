@@ -316,7 +316,7 @@ internal class FirstSyncCursorTest {
         assertThat(requestCursors(plaid)).containsExactly(null, "c1", "c2")
         assertThat(cursorMap).isEqualTo(mapOf(tok to "c3"))
         verify(fireflyTransactionService, never()).processFireflyTransactionUpdates(any(), any(), any())
-        verify(converter, never()).convertPollSync(any(), any(), any(), any(), any())
+        verify(converter, never()).convertPollSync(any(), any(), any(), any(), any(), any())
     }
 
     // endregion
