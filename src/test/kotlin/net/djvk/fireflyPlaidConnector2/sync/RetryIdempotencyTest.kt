@@ -227,8 +227,10 @@ internal class RetryIdempotencyTest {
         orchestrator().processTransactions(mapOf(accountA to 1), sequence, cursorMap)
 
         val ids = argumentCaptor<Collection<String>>()
-        verify(fireflyTransactionService).fetchMissingByPlaidId(ids.capture(), any())
+        // LAN-110: the stub finds nothing, so the posted create's pending id "pend" is looked up a second time
+        verify(fireflyTransactionService, times(2)).fetchMissingByPlaidId(ids.capture(), any())
         assertThat(ids.firstValue).containsExactlyInAnyOrder("mod", "gone", "pend", "posted", "leg")
+        assertThat(ids.secondValue).containsExactly("pend")
     }
 
     /** R4 survivor: only the authorized date is before the window, and that is the date Firefly will carry. */
