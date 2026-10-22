@@ -366,8 +366,14 @@ class PolledSyncOrchestrator(
                 plaidTransactions.created.filter { it.pendingTransactionId != null }.map { it.transactionId } +
                 plaidTransactions.created.filter { converter.mightPairAsTransfer(it) }.map { it.transactionId }
         val knownFireflyTxs = windowFireflyTxs + oldFireflyTxs
-        val existingFireflyTxs = knownFireflyTxs +
+        val firstLookupTxs = knownFireflyTxs +
                 fireflyTransactionService.fetchMissingByPlaidId(referencedPlaidIds, knownFireflyTxs)
+        // A posted create whose pending journal the lookup missed would land beside it (a different Plaid id, so no 409
+        //  stops it, and the pending removal finds nothing). Firefly may merely lag: look those pending ids up once more
+        //  before the write. One that is still missing is truly gone, and the posted create goes ahead (LAN-110).
+        val postedPendingIds = plaidTransactions.created.mapNotNull { it.pendingTransactionId } // the service skips the ones it already holds
+        val existingFireflyTxs = firstLookupTxs +
+                fireflyTransactionService.fetchMissingByPlaidId(postedPendingIds, firstLookupTxs)
 
         // Convert Plaid transactions to Firefly format
         logger.trace("Converting Plaid transactions to Firefly transactions")
