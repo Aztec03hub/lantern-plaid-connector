@@ -89,20 +89,24 @@ class PlaidApiWrapper(
         try {
             return request(plaidApi)
         } catch (cre: ClientRequestException) {
-            if (cre.response.status == HttpStatusCode.TooManyRequests) {
-                if (!boundRateLimit) {
+            val (errorType, errorCode) = plaidErrorTypeAndCode(cre)
+            // U08: Plaid's per-minute budget also answers 400 RATE_LIMIT; waiting seconds can't clear it, so it waits like a 429
+            // and is always bounded by the retry budget (it never was an unbounded wait).
+            val is400RateLimit = cre.response.status != HttpStatusCode.TooManyRequests && errorType == "RATE_LIMIT"
+            if (cre.response.status == HttpStatusCode.TooManyRequests || is400RateLimit) {
+                if (!boundRateLimit && !is400RateLimit) {
                     logger.error("429 rate limiting error encountered while calling $logString. Waiting for ${rateLimitWaitMillis / 1000} seconds.", cre)
                     delay(rateLimitWaitMillis)
                     return executeRequest(request, logString, remainingRetries, false)
                 }
                 // LAN-54: the budget shrinks on every 429, so a persistent one ends after maxRetries attempts and the caller sees the exception
-                logger.error("429 rate limiting error encountered while calling $logString; ${remainingRetries - 1} retries remaining.", cre)
+                logger.error("rate limit (${cre.response.status.value}${errorType?.let { " $it" } ?: ""}) while calling $logString; ${remainingRetries - 1} retries remaining.", cre)
                 if (remainingRetries <= 1) throw cre
                 val retryAfter = cre.response.headers[HttpHeaders.RetryAfter]?.trim()?.toLongOrNull()?.let { it.coerceIn(0, 3600) * 1000 }
                 delay(minOf(retryAfter ?: rateLimitWaitMillis, rateLimitWaitMillis))
                 return executeRequest(request, logString, remainingRetries - 1, true)
             }
-            val transientCode = transientPlaidError(cre)
+            val transientCode = errorCode?.takeIf { it in TRANSIENT_INSTITUTION_CODES }
             if (transientCode != null) {
                 // LAN-50: an institution that does not answer (a 400, not a 5xx) is retried like a network failure
                 logger.error("Transient Plaid error $transientCode while calling $logString; ${remainingRetries - 1} retries remaining.")
@@ -128,6 +132,7 @@ class PlaidApiWrapper(
     /**
      * Plaid's `error_code` when [cre] is a transient institution or rate-limit error (error_type RATE_LIMIT or a code in
      * [TRANSIENT_INSTITUTION_CODES]), else null. Never returns the message, which can hold user data.
+     * Kept for the planned U34 balance check; executeRequest itself now reads the body once.
      */
     suspend fun transientPlaidError(cre: ClientRequestException): String? {
         val (type, code) = plaidErrorTypeAndCode(cre)
