@@ -80,7 +80,7 @@ internal class LinkTableLiveFireflyTest {
             if (n == crashOn) {
                 // The creates run concurrently (writeConcurrency), so "the 2nd store" can fire before the 1st is committed
                 //  and cancel it. Wait for the earlier one to land so this is the crash BETWEEN two creates.
-                if (afterEarlierOnesLand) earlierLanded.await()
+                if (afterEarlierOnesLand && crashOn > 1) kotlinx.coroutines.withTimeout(30_000) { earlierLanded.await() } // bounded: a failed earlier store must not hang the poll
                 throw java.io.IOException("connection reset (simulated)")
             }
             return super.storeTransaction(transactionStore).also { if (n == crashOn - 1) earlierLanded.complete(Unit) }
@@ -204,6 +204,7 @@ internal class LinkTableLiveFireflyTest {
         println("LINKLIVE crash: after the retry ${summary(found)} created=${retry.fireflyCreated}")
         assertThat(found).hasSize(2)
         assertThat(held("c1$run", "c2$run")).containsExactlyInAnyOrder("c1$run", "c2$run")
+        assertThat(linksApi.lookupPlaidLinks(listOf("c1$run", "c2$run")).body().data).hasSize(2)
         assertThat(retry.fireflyCreated).isEqualTo(1)
         assertThat(store.read()).isEmpty()
         cleanup(found)
@@ -233,7 +234,10 @@ internal class LinkTableLiveFireflyTest {
         println("LINKLIVE racing crash: after the retry ${summary(found)} created=${retry.fireflyCreated}")
         assertThat(found).hasSize(2)
         assertThat(held("r1$run", "r2$run")).containsExactlyInAnyOrder("r1$run", "r2$run")
-        assertThat(retry.fireflyCreated).isEqualTo(2 - before.size)
+        // Raw link rows, not the set: a duplicate create would show as a third row.
+        assertThat(linksApi.lookupPlaidLinks(listOf("r1$run", "r2$run")).body().data).hasSize(2)
+        // A cancelled in-flight create can still commit after `before` was read, so the retry makes at most the missing ones.
+        assertThat(retry.fireflyCreated).isBetween(0, 2 - before.size)
         assertThat(store.read()).isEmpty()
         cleanup(found)
     }
