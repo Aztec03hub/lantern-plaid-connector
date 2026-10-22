@@ -457,6 +457,43 @@ internal class PolledSyncOrchestratorTest {
     }
 
     @Test
+    fun aPollWithNoPlaidChangesKeepsThePairItems() = runBlocking<Unit> {
+        val dir = java.nio.file.Files.createTempDirectory("attention").toString()
+        val attention = AttentionStore(dir)
+        val pairPass: net.djvk.fireflyPlaidConnector2.pairing.PairPass = mock()
+        val (accountMap, sequence, cursorMap) = stubOneCreateIteration()
+        val report = reportOf(failed = 0, needsHuman = 1)
+        whenever(pairPass.run(any(), any(), any(), any())).thenReturn(report)
+        pairingOrchestrator(mock(), pairPass, attention).runIteration(accountMap, sequence, cursorMap)
+        assertEquals(listOf("L0"), attention.read().map { it.ref })
+
+        // poll 2: Plaid has no changes, so no pass runs
+        whenever(plaidSyncService.processPlaidTransactions(any(), any())).thenReturn(PlaidTransactionResult(emptyList(), emptyList(), emptyList()))
+        pairingOrchestrator(mock(), pairPass, attention).runIteration(accountMap, sequence, cursorMap)
+        assertEquals(listOf("L0"), attention.read().map { it.ref })
+    }
+
+    @Test
+    fun anAbandonedLetterAndAnUnreadableFileAreListed() = runBlocking<Unit> {
+        val dir = java.nio.file.Files.createTempDirectory("attention").toString()
+        val letters = DeadLetterStore(dir)
+        letters.add(DeadLetter("update", "plaid-tx-aaa", message = "HTTP 422: secret words", attempts = 10, abandoned = true))
+        java.io.File(dir, "plaid_dead_letters.unreadable-123.json").writeText("x")
+        val (accountMap, sequence, cursorMap) = stubOneCreateIteration()
+        val orchestrator = PolledSyncOrchestrator(
+            30, syncHelper, cursorManager, plaidSyncService, fireflyTransactionService, converter,
+            deadLetterStore = letters, attentionStore = AttentionStore(dir),
+        )
+        orchestrator.pollOnce(accountMap, sequence, cursorMap)
+        val items = AttentionStore(dir).read().map { it.kind to it.detail }
+        assertEquals(
+            listOf("dead_letter_abandoned" to "update HTTP 422, 10 attempts", "dead_letter_file_unreadable" to "moved aside; its writes are not retried"),
+            items,
+        )
+        assertEquals(false, java.io.File(dir, "needs_attention.json").readText().contains("secret words"))
+    }
+
+    @Test
     fun aFailedAttentionWriteDoesNotFailThePoll() = runBlocking<Unit> {
         val dir = java.nio.file.Files.createTempDirectory("attention").toString()
         java.io.File(dir, "needs_attention.json").mkdir() // the target is a directory: the write fails
