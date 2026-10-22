@@ -170,6 +170,13 @@ internal class CounterpartyNamerTest {
     }
 
     @Test
+    fun theLongestChainStemWinsWhenOneStemStartsAnother() {
+        // "acme 5" must be tried before "acme": otherwise "ACME 5 12" would lose its "5" to the store-number rule
+        val n = CounterpartyNamer(chains = listOf("acme", "acme 5"))
+        assertThat(n.canonical(null, "ACME 5 12 CHICAGO")).isEqualTo("Acme 5")
+    }
+
+    @Test
     fun aFileWithoutChainsKeepsTheDefaultChains() {
         val n = CounterpartyNamer.fromFile(aliasFile("""{"EVOLV CONSULTING":"Evolv Consulting"}"""))
         assertThat(n.canonical(null, "TARGET 12 CHICAGO IL")).isEqualTo("Target")
