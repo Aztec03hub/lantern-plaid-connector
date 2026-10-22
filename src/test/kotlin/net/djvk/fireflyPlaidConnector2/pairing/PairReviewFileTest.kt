@@ -62,4 +62,12 @@ internal class PairReviewFileTest {
         assertThat(out.codePointCount(0, out.length)).isEqualTo(80)
         assertThat(out).startsWith("AB😀").doesNotContain("\u0000", "\n")
     }
+
+    @Test
+    fun aRuleNameOverFortyCharactersIsCutSoTheReaderKeepsThePair() {
+        val p = proposal(1, 3)
+        val e = p.edge.copy(points = listOf(RulePoints("r".repeat(60), 3)))
+        val rule = tree(listOf(p.copy(edge = e))).path("items").single().path("points").single().path("rule").asText()
+        assertThat(rule).hasSize(40)
+    }
 }
