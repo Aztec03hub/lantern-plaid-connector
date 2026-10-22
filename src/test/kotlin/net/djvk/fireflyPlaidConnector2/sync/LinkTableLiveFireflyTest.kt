@@ -43,7 +43,7 @@ import net.djvk.fireflyPlaidConnector2.api.plaid.models.Transaction as PlaidTran
  * Never point this at a Firefly that holds real data. The orchestrator, service, store, converter and sync helper are
  * the real ones; only Plaid is scripted.
  */
-@EnabledIfEnvironmentVariable(named = "LANTERN_LIVE_FIREFLY_URL", matches = ".+")
+@EnabledIfEnvironmentVariable(named = "LANTERN_LIVE_FIREFLY_URL", matches = ".+", disabledReason = "assumption: LANTERN_LIVE_FIREFLY_URL not set (needs a throwaway Lantern Firefly)")
 internal class LinkTableLiveFireflyTest {
     @TempDir
     lateinit var dir: Path
@@ -504,9 +504,66 @@ internal class LinkTableLiveFireflyTest {
         assertThat(linksApi.lookupPlaidLinks(ids.take(PlaidLinksApi.MAX_IDS)).body().data).isEmpty()
     }
 
+    private fun apiStatus(method: String, path: String, body: String): Int {
+        val request = HttpRequest.newBuilder(URI("$url/api/v1/$path"))
+            .header("Authorization", "Bearer $token").header("Accept", "application/json").header("Content-Type", "application/json")
+            .method(method, HttpRequest.BodyPublishers.ofString(body)).build()
+        return http.send(request, java.net.http.HttpResponse.BodyHandlers.ofString()).statusCode()
+    }
+
+    /** A18: a PUT that converts a withdrawal to a transfer and then hits a link conflict must leave type, accounts and amount as they were. */
+    @Test
+    fun aFailedTransferConversionLeavesTheJournalUnchanged() = runBlocking<Unit> {
+        creds()
+        val orchestrator = orchestrator(DeadLetterStore(dir.toString()))
+        poll(orchestrator, created = listOf(plaid(plaidA, "atom$run", 12.0), plaid(plaidA, "atom2$run", 7.0)))
+        val before = mine("atom$run").single()
+        val b = before.attributes.transactions.single()
+        val beforeLine = "${b.type}:${b.amount}:${b.sourceId}->${b.destinationId}:${linksOf(before).map { it.plaidTransactionId }}"
+
+        val status = apiStatus(
+            "PUT", "transactions/${before.id}",
+            """{"apply_rules":false,"transactions":[{"transaction_journal_id":"${b.transactionJournalId}","type":"transfer","destination_id":"$accountB","amount":"12.0","plaid_links":[{"plaid_transaction_id":"atom2$run","leg":"single"}]}]}""",
+        )
+
+        val after = mine("atom$run").single()
+        val a = after.attributes.transactions.single()
+        val afterLine = "${a.type}:${a.amount}:${a.sourceId}->${a.destinationId}:${linksOf(after).map { it.plaidTransactionId }}"
+        println("LINKLIVE atomicity: status=$status before=$beforeLine after=$afterLine")
+        assertThat(status).isEqualTo(409)
+        assertThat(a.type).isEqualTo(TransactionTypeProperty.withdrawal)
+        assertThat(afterLine).isEqualTo(beforeLine)
+        cleanup(listOf(after), mine("atom2$run"))
+    }
+
+    /** disableAccountAssignment: a Plaid withdrawal arrives with no destination name, and Firefly stores it anyway. */
+    @Test
+    fun aWithdrawalWithNoDestinationIsAccepted() = runBlocking<Unit> {
+        creds()
+        val bare = TransactionConverter(
+            useNameForDestination = true, enablePrimaryCategorization = false, primaryCategoryPrefix = "p-",
+            enableDetailedCategorization = false, detailedCategoryPrefix = "d-", timeZoneString = "UTC",
+            transferMatchWindowDays = 3L, txStyle = TransactionStyleConfig(null), pendingTag = "pending",
+            disableAccountAssignment = true,
+        )
+        val store = DeadLetterStore(dir.toString())
+        val service = FireflyTransactionService(txApi, syncHelper, 30, "UTC", linksApi, store)
+        val orchestrator = PolledSyncOrchestrator(30, syncHelper, cursorManager, plaidSyncService, service, bare, deadLetterStore = store)
+
+        val result = poll(orchestrator, created = listOf(plaid(plaidA, "nodest$run", 9.0)))
+
+        val found = mine("nodest$run")
+        println("LINKLIVE no destination: ${summary(found)} destName=${found.firstOrNull()?.attributes?.transactions?.single()?.destinationName}")
+        assertThat(found).hasSize(1)
+        assertThat(found.single().attributes.transactions.single().type).isEqualTo(TransactionTypeProperty.withdrawal)
+        assertThat(result.deadLetters).isEqualTo(0)
+        assertThat(store.read()).isEmpty()
+        cleanup(found)
+    }
+
     /** The stock Firefly (no link table) must stop the connector at startup. Needs LANTERN_LIVE_STOCK_FIREFLY_URL and _TOKEN. */
     @Test
-    @EnabledIfEnvironmentVariable(named = "LANTERN_LIVE_STOCK_FIREFLY_URL", matches = ".+")
+    @EnabledIfEnvironmentVariable(named = "LANTERN_LIVE_STOCK_FIREFLY_URL", matches = ".+", disabledReason = "assumption: LANTERN_LIVE_STOCK_FIREFLY_URL not set (needs a stock Firefly III on its own port)")
     fun aStockFireflyStopsTheConnectorAtStartup() = runBlocking<Unit> {
         val stockUrl = System.getenv("LANTERN_LIVE_STOCK_FIREFLY_URL")
         val stockToken = System.getenv("LANTERN_LIVE_STOCK_FIREFLY_TOKEN")
