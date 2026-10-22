@@ -102,6 +102,12 @@ class DeadLetterStore(
      */
     fun takeUnreadableCount(): Int = unreadable.getAndSet(0)
 
+    /** Names of the moved-aside unreadable files, oldest first. They stay until a person removes them, so every poll can list them. */
+    suspend fun unreadableFiles(): List<String> = withContext(Dispatchers.IO) {
+        path.toAbsolutePath().parent.toFile().listFiles { f -> f.name.startsWith("plaid_dead_letters.unreadable-") && f.name.endsWith(".json") }
+            ?.map { it.name }?.sorted().orEmpty()
+    }
+
     /**
      * The letters in the file. A file that can't be parsed (for example after an upgrade changed the generated
      * `TransactionSplit`) is moved aside to `plaid_dead_letters.unreadable-<epoch>.json` (owner-only, kept for a

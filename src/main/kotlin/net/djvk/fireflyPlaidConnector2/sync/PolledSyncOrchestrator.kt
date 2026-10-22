@@ -98,6 +98,8 @@ class PolledSyncOrchestrator(
     private val flippedLegStore: FlippedLegStore? = null,
     /** Keeps each Item's last refresh time across runs; null (tests) means in memory only. */
     private val refreshTimeStore: RefreshTimeStore? = null,
+    /** The file the dashboard reads for things a person should look at; null (tests) writes none. */
+    private val attentionStore: AttentionStore? = null,
 ) : Runner, DisposableBean {
     private val logger = LoggerFactory.getLogger(this::class.java)
 
@@ -420,18 +422,22 @@ class PolledSyncOrchestrator(
         //  failure is logged and retried by the next poll: it must not hold back the cursors of imported data.
         var pairFailures = 0
         var pairLegsNeedingHuman = 0
+        var pairItems: List<Attention>? = null // null: no pass ran this poll, so the last pass's items stay in the file
         try {
             if (pairPass != null && pairSettings?.afterRun == true) {
                 val today = java.time.LocalDate.now()
                 val report = pairPass.run(today.minusDays(pairSettings.lookbackDays), today, pairSettings.dryRun)
                 pairFailures = report.failed.size
                 pairLegsNeedingHuman = report.needsHuman.size
+                pairItems = report.failed.map { Attention("pair_failed", "${it.out}>${it.inn}", "merge failed") } +
+                        report.needsHuman.map { (leg, why) -> Attention("pair_leg_needs_human", leg.id, why) }
             }
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (e: Exception) {
             logger.error("Transfer pairing failed; it is retried by the next poll", e)
             pairFailures = 1
+            pairItems = listOf(Attention("pair_failed", "pass", e::class.simpleName ?: "error"))
         }
 
         // A create waiting in the dead letter file is invisible to the conversion above (it only looks in Firefly), so
@@ -455,19 +461,36 @@ class PolledSyncOrchestrator(
             routingsRefused = converter.routingsRefused,
             pairFailures = pairFailures,
             pairLegsNeedingHuman = pairLegsNeedingHuman,
-        ).withDeadLetters()
+        ).withDeadLetters(pairItems)
     }
 
-    /** Fills in what the dead letter file holds right now (retried, abandoned, unreadable) and the update 409s since the last poll. */
-    private suspend fun PollResult.withDeadLetters(): PollResult {
-        val withConflicts = copy(updateConflicts = fireflyTransactionService.takeUpdateConflicts().size)
-        val store = deadLetterStore ?: return withConflicts
-        val letters = store.read()
-        return withConflicts.copy(
+    /**
+     * Fills in what the dead letter file holds right now (retried, abandoned, unreadable) and the update 409s since the
+     * last poll, then writes needs_attention.json. [pairItems] is null when no pairing pass ran this poll.
+     */
+    private suspend fun PollResult.withDeadLetters(pairItems: List<Attention>? = null): PollResult {
+        val conflicts = fireflyTransactionService.takeUpdateConflicts() // drained once per poll; the ids go to the file below
+        val withConflicts = copy(updateConflicts = conflicts.size)
+        val store = deadLetterStore
+        val letters = store?.read().orEmpty()
+        val result = if (store == null) withConflicts else withConflicts.copy(
             deadLetters = letters.size,
             deadLettersAbandoned = letters.count { it.abandoned },
             deadLetterFilesUnreadable = store.takeUnreadableCount(),
         )
+        attentionStore?.let { attention ->
+            val fresh = letters.filter { it.abandoned }.map {
+                Attention("dead_letter_abandoned", it.key, "${it.operation} ${it.message.substringBefore(':')}, ${it.attempts} attempts")
+            } + store?.unreadableFiles().orEmpty().map {
+                Attention("dead_letter_file_unreadable", it, "moved aside; its writes are not retried")
+            } + conflicts.map {
+                Attention(AttentionStore.CONFLICT, it, "Firefly refused an update: a Plaid id is on another transaction")
+            } + pairItems.orEmpty()
+            val replaces = setOf("dead_letter_abandoned", "dead_letter_file_unreadable") +
+                    (if (pairItems != null) setOf("pair_failed", "pair_leg_needs_human") else setOf())
+            attention.record(Instant.now(), fresh, replaces)
+        }
+        return result
     }
 
     /**
