@@ -29,4 +29,48 @@ class RunningBalanceSwitchTest {
         assertThat(seen[0].third.replace(Regex("\\s"), "")).isEqualTo("""{"value":false}""")
         assertThat(seen[1].third.replace(Regex("\\s"), "")).isEqualTo("""{"value":true}""")
     }
+
+    private fun flagBody(value: Boolean) =
+        """{"data":{"title":"configuration.running_balance_dirty","value":$value,"editable":false}}"""
+
+    @Test
+    fun runningBalanceNeedsRefreshReadsTheFlag() = runBlocking<Unit> {
+        val seen = mutableListOf<Pair<HttpMethod, String>>()
+        val answers = ArrayDeque(listOf(true, false))
+        val api = ConfigurationApi("http://firefly.test", MockEngine { request ->
+            seen.add(request.method to request.url.encodedPath)
+            respond(flagBody(answers.removeFirst()), HttpStatusCode.OK, headersOf(HttpHeaders.ContentType, "application/json"))
+        })
+
+        assertThat(api.runningBalanceNeedsRefresh()).isTrue()
+        assertThat(api.runningBalanceNeedsRefresh()).isFalse()
+        assertThat(seen).containsOnly(HttpMethod.Get to "/api/v1/configuration/configuration.running_balance_dirty")
+    }
+
+    @Test
+    fun aCoreThatDoesNotKnowTheKeyAnswersFalse() = runBlocking<Unit> {
+        val api = ConfigurationApi("http://firefly.test", MockEngine {
+            respond("{}", HttpStatusCode.NotFound, headersOf(HttpHeaders.ContentType, "application/json"))
+        })
+
+        assertThat(api.runningBalanceNeedsRefresh()).isFalse()
+    }
+
+    @Test
+    fun aServerErrorIsThrown() = runBlocking<Unit> {
+        val api = ConfigurationApi("http://firefly.test", MockEngine {
+            respond("{}", HttpStatusCode.InternalServerError, headersOf(HttpHeaders.ContentType, "application/json"))
+        })
+
+        assertThat(runCatching { api.runningBalanceNeedsRefresh() }.exceptionOrNull()).isNotNull()
+    }
+
+    @Test
+    fun aNotFoundFromAClientThatThrowsOnErrorsIsStillFalse() = runBlocking<Unit> {
+        val api = ConfigurationApi("http://firefly.test", MockEngine {
+            respond("{}", HttpStatusCode.NotFound, headersOf(HttpHeaders.ContentType, "application/json"))
+        }, { it.expectSuccess = true })
+
+        assertThat(api.runningBalanceNeedsRefresh()).isFalse()
+    }
 }

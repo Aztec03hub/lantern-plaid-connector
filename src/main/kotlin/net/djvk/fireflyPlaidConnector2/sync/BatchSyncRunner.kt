@@ -2,6 +2,7 @@ package net.djvk.fireflyPlaidConnector2.sync
 
 import net.djvk.fireflyPlaidConnector2.pairing.PairPass
 import net.djvk.fireflyPlaidConnector2.pairing.PairSettings
+import io.ktor.client.network.sockets.SocketTimeoutException
 import io.ktor.client.plugins.*
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -62,7 +63,8 @@ class BatchSyncRunner(
     /**
      * Turn Firefly's running balance off while this run writes, and on again after (also when it fails). Firefly
      * recomputes every later balance on each insert, which was the limit of a bulk import (about 2 to 50 writes per
-     * second). Run `php artisan firefly-iii:refresh-running-balance --force` afterwards to fill the balances in.
+     * second). Turning it on again makes core refresh every balance inside that PUT, and a run that crashed in between
+     * is repaired the same way at the start of the next run.
      */
     @Value("\${fireflyPlaidConnector2.batch.disableRunningBalance:false}")
     private val disableRunningBalance: Boolean = false,
@@ -95,6 +97,12 @@ class BatchSyncRunner(
             val switchRunningBalance = disableRunningBalance && configurationApi != null
             if (switchRunningBalance) {
                 configurationApi!!.setAccessToken(fireflyAccessToken)
+                // A run that crashed between the off and the on PUT left stale balances behind; turning the setting
+                //  on makes core refresh them inside that PUT, so do it before this run writes more
+                if (configurationApi.runningBalanceNeedsRefresh()) {
+                    logger.warn("Firefly holds balances from an earlier run that did not finish; refreshing them before this run")
+                    setRunningBalanceOn(configurationApi)
+                }
                 configurationApi.setUseRunningBalance(false)
                 logger.info("Firefly's running balance is off for this run")
             }
@@ -112,11 +120,8 @@ class BatchSyncRunner(
                 }
             } finally {
                 if (switchRunningBalance) {
-                    configurationApi!!.setUseRunningBalance(true)
-                    logger.info(
-                        "Firefly's running balance is on again; fill it in with: " +
-                                "php artisan firefly-iii:refresh-running-balance --force"
-                    )
+                    setRunningBalanceOn(configurationApi!!)
+                    logger.info("Firefly's running balance is on again (core refreshed the balances inside that call)")
                 }
             }
 
@@ -124,6 +129,22 @@ class BatchSyncRunner(
             if (setInitialBalance) {
                 setInitialBalances(allPlaidTxs, syncHelper)
             }
+        }
+    }
+
+    /**
+     * PUT the running balance on. Core runs a full recalculation inside this request, so the client's request timeout
+     * can fire while core is still working. That is logged, not thrown: the setting is on or will be, the flag stays
+     * up if the refresh did not finish, and the next run repairs it (throwing from here would also hide the run's own
+     * failure, since this is called from a finally).
+     */
+    private suspend fun setRunningBalanceOn(api: ConfigurationApi) {
+        try {
+            api.setUseRunningBalance(true)
+        } catch (e: HttpRequestTimeoutException) {
+            logger.error("!! Firefly did not answer the running balance PUT in time (its refresh may still be running); the next run checks the flag and repairs it", e)
+        } catch (e: SocketTimeoutException) {
+            logger.error("!! Firefly did not answer the running balance PUT in time (its refresh may still be running); the next run checks the flag and repairs it", e)
         }
     }
 
