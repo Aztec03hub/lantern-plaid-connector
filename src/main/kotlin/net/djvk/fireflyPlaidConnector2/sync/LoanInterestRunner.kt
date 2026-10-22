@@ -247,6 +247,7 @@ class LoanInterestRunner(
                 plaidApiWrapper.executeRequest(
                     { it.accountsBalanceGet(AccountsBalanceGetRequest(token, null, null, AccountsBalanceGetRequestOptions(ours, null))) },
                     "balance get request",
+                    boundRateLimit = true,
                 ).body().accounts
             } catch (e: CancellationException) {
                 throw e

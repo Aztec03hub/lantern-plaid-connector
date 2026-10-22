@@ -44,7 +44,7 @@ fun <T : Any> createPlaidResponse(
 class PlaidMock {
     val api = mock<PlaidApi>()
     val wrapper = mock<PlaidApiWrapper> {
-        onBlocking { executeRequest(any<suspend (PlaidApi) -> Any>(), any(), any()) } doSuspendableAnswer {
+        onBlocking { executeRequest(any<suspend (PlaidApi) -> Any>(), any(), any(), any()) } doSuspendableAnswer {
             val requestExecutor = it.getArgument(0) as suspend (PlaidApi) -> Any
             requestExecutor.invoke(api)
         }

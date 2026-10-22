@@ -74,11 +74,14 @@ class PlaidApiWrapper(
      * Executes a request to the Plaid API
      *
      * @param logString String to include in log messages
+     * @param boundRateLimit LAN-54, loan interest only: a 429 uses up the retry budget and then throws. false (poll, batch, repair-dates)
+     *   keeps the original behaviour: wait [rateLimitWaitMillis] and retry with the same budget, however long it takes.
      */
     suspend fun <T> executeRequest(
         request: suspend (PlaidApi) -> T,
         logString: String,
         remainingRetries: Int = maxRetries,
+        boundRateLimit: Boolean = false,
     ): T {
         if (remainingRetries <= 0) {
             throw RuntimeException("Plaid API call $logString was not attempted: maxRetries is $maxRetries, it must be at least 1")
@@ -87,12 +90,17 @@ class PlaidApiWrapper(
             return request(plaidApi)
         } catch (cre: ClientRequestException) {
             if (cre.response.status == HttpStatusCode.TooManyRequests) {
+                if (!boundRateLimit) {
+                    logger.error("429 rate limiting error encountered while calling $logString. Waiting for ${rateLimitWaitMillis / 1000} seconds.", cre)
+                    delay(rateLimitWaitMillis)
+                    return executeRequest(request, logString, remainingRetries, false)
+                }
                 // LAN-54: the budget shrinks on every 429, so a persistent one ends after maxRetries attempts and the caller sees the exception
                 logger.error("429 rate limiting error encountered while calling $logString; ${remainingRetries - 1} retries remaining.", cre)
                 if (remainingRetries <= 1) throw cre
                 val retryAfter = cre.response.headers[HttpHeaders.RetryAfter]?.trim()?.toLongOrNull()?.let { it.coerceIn(0, 3600) * 1000 }
                 delay(minOf(retryAfter ?: rateLimitWaitMillis, rateLimitWaitMillis))
-                return executeRequest(request, logString, remainingRetries - 1)
+                return executeRequest(request, logString, remainingRetries - 1, true)
             }
             val transientCode = transientPlaidError(cre)
             if (transientCode != null) {
@@ -100,7 +108,7 @@ class PlaidApiWrapper(
                 logger.error("Transient Plaid error $transientCode while calling $logString; ${remainingRetries - 1} retries remaining.")
                 if (remainingRetries - 1 <= 0) throw cre
                 delay(retryBackoffMillis * (maxRetries - remainingRetries + 1))
-                return executeRequest(request, logString, remainingRetries - 1)
+                return executeRequest(request, logString, remainingRetries - 1, boundRateLimit)
             }
             throw cre
         } catch (e: CancellationException) {
@@ -113,7 +121,7 @@ class PlaidApiWrapper(
             }
             // Back off so a brief network outage isn't burned through by instant retries
             delay(retryBackoffMillis * (maxRetries - remainingRetries + 1))
-            return executeRequest(request, logString, remainingRetries - 1)
+            return executeRequest(request, logString, remainingRetries - 1, boundRateLimit)
         }
     }
 

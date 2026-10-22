@@ -24,7 +24,7 @@ internal class PlaidApiWrapperRateLimitTest {
         return PlaidApiWrapper("https://plaid.test", maxRetries, "id", "secret", engine, ApiConfiguration().getClientConfig(), 0, cap)
     }
 
-    private fun call(w: PlaidApiWrapper) = runBlocking { w.executeRequest({ it.accountsBalanceGet(AccountsBalanceGetRequest("tok", null, null, null)) }, "balance get request") }
+    private fun call(w: PlaidApiWrapper, bound: Boolean = true) = runBlocking { w.executeRequest({ it.accountsBalanceGet(AccountsBalanceGetRequest("tok", null, null, null)) }, "balance get request", boundRateLimit = bound) }
 
     private val ok = HttpStatusCode.OK to """{"accounts":[],"item":{"available_products":[],"billed_products":[],"consent_expiration_time":null,"error":null,"institution_id":"i","item_id":"z","products":[],"update_type":"background","webhook":""},"request_id":"r"}"""
     private val limited = HttpStatusCode.TooManyRequests to "{}"
@@ -54,6 +54,26 @@ internal class PlaidApiWrapperRateLimitTest {
         val t0 = System.nanoTime()
         assertThrows<ClientRequestException> { call(wrapper(cap = 300, retryAfter = "9223372036854776") { limited }) }
         assertThat((System.nanoTime() - t0) / 1_000_000).isGreaterThanOrEqualTo(550)  // 2 waits of the 300 ms cap
+    }
+
+    @Test
+    fun theDefaultPathKeepsWaitingOutA429TrainLongerThanMaxRetries() {
+        call(wrapper(cap = 0) { if (it <= 7) limited else ok }, bound = false)  // maxRetries is 3
+        assertThat(calls).isEqualTo(8)
+    }
+
+    @Test
+    fun aShortRetryAfterIsHonouredBelowTheCap() {
+        val t0 = System.nanoTime()
+        call(wrapper(cap = 5000, retryAfter = "1") { if (it == 1) limited else ok })
+        assertThat((System.nanoTime() - t0) / 1_000_000).isBetween(900, 3000)
+    }
+
+    @Test
+    fun withNoRetryAfterTheCapIsWaited() {
+        val t0 = System.nanoTime()
+        call(wrapper(cap = 300, retryAfter = "x") { if (it == 1) limited else ok })
+        assertThat((System.nanoTime() - t0) / 1_000_000).isGreaterThanOrEqualTo(280)
     }
 
     @Test
