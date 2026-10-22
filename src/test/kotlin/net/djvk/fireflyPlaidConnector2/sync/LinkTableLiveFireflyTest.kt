@@ -596,6 +596,8 @@ internal class LinkTableLiveFireflyTest {
         println("LINKLIVE no destination: ${summary(found)} destName=${found.firstOrNull()?.attributes?.transactions?.single()?.destinationName}")
         assertThat(found).hasSize(1)
         assertThat(found.single().attributes.transactions.single().type).isEqualTo(TransactionTypeProperty.withdrawal)
+        // Firefly's own default; with account assignment on, the converter would send the Plaid counterparty name instead.
+        assertThat(found.single().attributes.transactions.single().destinationName).isEqualTo("Cash account")
         assertThat(result.deadLetters).isEqualTo(0)
         assertThat(store.read()).isEmpty()
         cleanup(found)
