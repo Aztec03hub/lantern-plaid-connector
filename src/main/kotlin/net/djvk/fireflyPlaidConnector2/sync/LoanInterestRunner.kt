@@ -112,6 +112,9 @@ class LoanInterestRunner(
     /** F2: loans written whose post-write re-read got no answer from Plaid. Their writes stand (a rerun is idempotent); the run fails so a human looks. */
     private var unchecked: List<Pair<LoanConfig, String>> = listOf()
 
+    /** L2 (U04c): loans whose write threw. They are held for tonight (a rerun is idempotent) and fail the run. */
+    private var failedWrites: List<Pair<LoanConfig, String>> = listOf()
+
     /** A loan left HELD exits non-zero, so the nightly prints its "!!" line instead of looking fine (A1). */
     override fun run() = runBlocking<Unit> {
         val plans = runOnce(apply)
@@ -124,6 +127,7 @@ class LoanInterestRunner(
         val parts = listOfNotNull(
             transient.takeIf { it.isNotEmpty() }?.let { "${it.size} loan(s) SKIPPED, Plaid did not answer or needs a login: ${it.map { (l, c) -> "${l.account} ($c)" }}" },
             unchecked.takeIf { it.isNotEmpty() }?.let { "${it.size} loan(s) WRITTEN but not re-checked, Plaid did not answer or a gap is left: ${it.map { (l, c) -> "${l.account} ($c)" }}" },
+            failedWrites.takeIf { it.isNotEmpty() }?.let { "${it.size} loan(s) HELD, write failed: ${it.map { (l, c) -> "${l.account} ($c)" }}" },
             held.takeIf { it.isNotEmpty() }?.let { "${it.size} loan(s) HELD, nothing written: ${it.map { h -> h.loan.account }}" },
             stuck.takeIf { it.isNotEmpty() }?.let { "loan(s) $it have been \"Firefly lags\" for $lagNights or more nights; a payment Plaid has seen is probably missing in Firefly" },
         )
@@ -179,14 +183,25 @@ class LoanInterestRunner(
         }
         skipped = skip
         unchecked = listOf()
+        failedWrites = listOf()
         plans.forEach { print(it) }
         if (!apply) {
             println("DRY RUN: nothing was changed. Add --fireflyPlaidConnector2.repair.apply=true to apply.")
             return plans
         }
-        plans.filter { it.writes }.forEach { write(it) }
+        // L2 (U04c): one loan's failed re-read or store must not stop the loans after it or skip the checks of those before it
+        val writeFailed = mutableListOf<Pair<LoanConfig, String>>()
+        for (p in plans.filter { it.writes }) {
+            try { write(p) } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                println("WARN: loan ${p.loan.account} HELD, write failed (ERROR_${e.javaClass.simpleName}); the other loans carry on")
+                writeFailed.add(p.loan to "ERROR_${e.javaClass.simpleName}")
+            }
+        }
+        failedWrites = writeFailed
         println("APPLIED. Re-reading to check:")
-        val written = plans.filter { it.writes }
+        val written = plans.filter { it.writes && writeFailed.none { f -> f.first.account == it.loan.account } }
         val (plaidAfter, failedAfter) = try { readPlaidOwed(written.map { it.loan }) } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -356,9 +371,8 @@ class LoanInterestRunner(
         val id = p.loan.account.toString()
         // U04: re-list just before storing, with the identity rule plan() used, so a second writer's line is not stored again
         val now = splitsOf(p.loan.account).filter { it.sourceId == id && it.description.startsWith("Interest on ") }
-        // U04 r1: a residual has no identity to re-check, so any write since plan() (another writer's residual) holds it back
-        val moved = p.residual.signum() != 0 && fireflyOwed(p.loan.account, null).compareTo(p.fireflyOwed) != 0
         var skipped = 0
+        var storedSum = BigDecimal.ZERO
         // the line that carries the cents remainder goes first: a later failure leaves exact lines and the rerun has no remainder
         for (l in p.lines.sortedByDescending { it.expected }) {
             if (l.expected.signum() <= 0) continue
@@ -373,8 +387,11 @@ class LoanInterestRunner(
                 sourceId = id, destinationId = null, destinationName = p.loan.interestAccount,
                 externalId = l.payment.journalId?.let { EXTERNAL_PREFIX + it },
             ))
+            storedSum += BigDecimal(money(l.expected))
         }
         // the residual was sized for the old gap; with a line skipped it is stale, so the next run recomputes it
+        // L5 (U04c): read the balance only now, after our lines, and compare it with the plan's balance plus what this call stored
+        val moved = p.residual.signum() != 0 && fireflyOwed(p.loan.account, null).compareTo(p.fireflyOwed + storedSum) != 0
         if (p.residual.signum() != 0 && (skipped > 0 || moved)) {
             println("   loan ${p.loan.account}: Firefly changed since the plan; unexplained ${money(p.residual)} held back, the next run recomputes it")
         } else if (p.residual.signum() != 0) {

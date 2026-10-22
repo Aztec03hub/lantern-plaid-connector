@@ -59,6 +59,8 @@ internal class LoanInterestRunnerTest {
     /** False makes the store mock leave Firefly's balance alone, so the apply re-read check can fail. */
     private var storeMovesOwed = true
     private var failSecondStore = false
+    /** Runs after each store mock call; a test sets it to simulate another writer. */
+    private var onStore: (() -> Unit)? = null
     private val owedBefore = mutableMapOf<LocalDate, String>()
 
     private fun d(m: Int, day: Int) = LocalDate.of(2026, m, day)
@@ -109,6 +111,7 @@ internal class LoanInterestRunnerTest {
                 val s = it.getArgument<TransactionStore>(0).transactions.single()
                 val amount = BigDecimal(s.amount)
                 if (storeMovesOwed) fireflyOwed += if (s.type == TransactionTypeProperty.deposit) amount.negate() else amount
+                onStore?.invoke()
                 createFireflyResponse(TransactionSingle(rows.first()))
             }
         }
@@ -392,7 +395,7 @@ internal class LoanInterestRunnerTest {
         failSecondStore = true
         val rows = listOf(payment("a", "400.00", d(8, 17)), payment("b", "400.00", d(9, 1)))
         // two uncovered payments and the oldest has days 0 (no earlier payment), so only b earns interest: lines [0.00, X]
-        org.junit.jupiter.api.assertThrows<IllegalStateException> { runner("23428.34", rows).runOnce() }
+        org.junit.jupiter.api.assertThrows<IllegalStateException> { runner("23428.34", rows).run() }
         val first = stored().first().transactions.single()
         assertThat(first.description).contains("payment of \$400.00")
         assertThat(first.date.toLocalDate()).isEqualTo(d(9, 1))
@@ -423,7 +426,7 @@ internal class LoanInterestRunnerTest {
             payment("a", "400.00", d(8, 17)), payment("b", "400.00", d(9, 20)),
         )
         // a: 7 days (about 34.93), b: 34 days (about 167.10); a gap 0.20 above the sum goes to b, the biggest, which must be written first
-        org.junit.jupiter.api.assertThrows<IllegalStateException> { runner("23402.23", rows).runOnce() }
+        org.junit.jupiter.api.assertThrows<IllegalStateException> { runner("23402.23", rows).run() }
         val first = stored().first().transactions.single()
         assertThat(first.date.toLocalDate()).isEqualTo(d(9, 20))
         assertThat(first.amount).isEqualTo("167.30")
@@ -556,8 +559,37 @@ internal class LoanInterestRunnerTest {
         owedBefore[d(8, 31)] = "23817.37"
         val r = runner("23491.66", chargedThenNew)
         reReadSees(chargedThenNew) { error("Firefly did not answer") }
-        assertThat(runCatching { r.runOnce() }.exceptionOrNull()).isInstanceOf(IllegalStateException::class.java)
+        assertThat(runCatching { r.run() }.exceptionOrNull()).isInstanceOf(IllegalStateException::class.java)
         assertThat(stored()).isEmpty()
+    }
+
+    @Test
+    fun aFailedStoreHoldsThatLoanAndFailsTheRunWithoutThrowingFromRunOnce() = runBlocking<Unit> {  // U04c L2
+        owedBefore[d(8, 31)] = "23817.37"
+        failSecondStore = true  // the line goes in, the residual store fails
+        val r = runner("23717.37", chargedThenNew)
+        val e = org.junit.jupiter.api.assertThrows<IllegalStateException> { r.run() }
+        assertThat(e.message).contains("HELD, write failed").contains("2 (ERROR_IllegalStateException)")
+        assertThat(stored()).hasSize(2)
+    }
+
+    @Test
+    fun aResidualStoredByAnotherWriterWhileOurLinesGoInIsNotStoredAgain() = runBlocking<Unit> {  // U04c L5
+        owedBefore[d(8, 31)] = "23817.37"
+        val r = runner("23717.37", chargedThenNew)
+        onStore = { fireflyOwed += BigDecimal("225.71"); onStore = null }  // B's residual lands during A's line store
+        r.runOnce()
+        assertThat(stored().map { it.transactions.single().description }).containsExactly("Interest on $name payment of \$400.00")
+    }
+
+    @Test
+    fun aBalanceThatDiffersOnlyByATrailingZeroDoesNotHoldTheResidual() = runBlocking<Unit> {  // U04c L6: compareTo, not equals
+        owedBefore[d(8, 31)] = "23817.37"
+        storeMovesOwed = false
+        val r = runner("23717.37", chargedThenNew)
+        onStore = { fireflyOwed = BigDecimal("23491.660"); onStore = null }  // 23417.37 + 74.29, scale 3
+        r.runOnce()
+        assertThat(stored()).hasSize(2)
     }
 
     @Test
