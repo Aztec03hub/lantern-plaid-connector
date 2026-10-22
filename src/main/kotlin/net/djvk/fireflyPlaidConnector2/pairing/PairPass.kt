@@ -315,7 +315,8 @@ class PairPass(
         //  merged nothing, so it must not claim its pairs as paired there (B3): it writes a file of its own.
         val awaitingFile = if (dryRun) "pair-awaiting-dryrun.json" else "pair-awaiting.json"
         Files.writeString(dir.resolve(awaitingFile), mapper.writerWithDefaultPrettyPrinter().writeValueAsString(awaiting))
-        pruneDryRunReports(dir, now)
+        // housekeeping must never fail a pass whose files are already written
+        runCatching { pruneDryRunReports(dir, now) }.onFailure { logger.warn("Could not prune old pair reports ({})", it::class.java.simpleName) }
     }
 
     private fun pruneDryRunReports(dir: Path, now: Instant) {
