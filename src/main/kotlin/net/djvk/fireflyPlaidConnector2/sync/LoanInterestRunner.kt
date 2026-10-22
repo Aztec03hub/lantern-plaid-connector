@@ -337,9 +337,20 @@ class LoanInterestRunner(
 
     private suspend fun write(p: LoanPlan) {
         val id = p.loan.account.toString()
+        // U04: re-list just before storing, with the identity rule plan() used, so a second writer's line is not stored again
+        val now = splitsOf(p.loan.account).filter { it.sourceId == id && it.description.startsWith("Interest on ") }
+        val coveredNow = now.map { dateOf(it) to it.description }.toSet()
+        val coveredIdsNow = now.mapNotNull { it.externalId }.toSet()
+        var skipped = 0
         // the line that carries the cents remainder goes first: a later failure leaves exact lines and the rerun has no remainder
         for (l in p.lines.sortedByDescending { it.expected }) {
             if (l.expected.signum() <= 0) continue
+            if ((l.payment.journalId != null && EXTERNAL_PREFIX + l.payment.journalId in coveredIdsNow) ||
+                (l.payment.date to interestDescription(p.name, l.payment)) in coveredNow) {
+                skipped++
+                println("   loan ${p.loan.account}: interest for payment ${l.payment.date} already stored by another writer; skipped")
+                continue
+            }
             store(TransactionSplit(
                 type = TransactionTypeProperty.withdrawal, date = l.payment.date.atStartOfDay(zone).toOffsetDateTime(),
                 amount = money(l.expected), description = interestDescription(p.name, l.payment),
@@ -347,7 +358,8 @@ class LoanInterestRunner(
                 externalId = l.payment.journalId?.let { EXTERNAL_PREFIX + it },
             ))
         }
-        if (p.residual.signum() != 0) {
+        // the residual was sized for the old gap; with a line skipped it is stale, so the next run recomputes it
+        if (p.residual.signum() != 0 && skipped == 0) {
             val date = LocalDate.now(zone).atStartOfDay(zone).toOffsetDateTime()
             val desc = "$UNEXPLAINED_DESC${p.name}"
             store(

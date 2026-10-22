@@ -459,4 +459,31 @@ internal class LoanInterestRunnerTest {
         assertThat(File(lagDir, aside).readText()).isEqualTo("null")
         assertThat(File(lagDir, "loan-lag.json").readText()).isEqualTo("""{"2":"2026-10-01"}""")
     }
+
+    @Test
+    fun aLineStoredByAnotherWriterBetweenPlanAndStoreIsSkipped() = runBlocking<Unit> {
+        owedBefore[d(8, 31)] = "23817.37"
+        val r = runner("23491.66", chargedThenNew)
+        val withLine = chargedThenNew + interest("ib", "74.29", "400.00", d(9, 1))
+        var listCalls = 0
+        whenever(accountsApi.listTransactionByAccount(any(), anyOrNull(), anyOrNull(), anyOrNull(), anyOrNull(), anyOrNull()))
+            .doSuspendableAnswer { createFireflyResponse(TransactionArray(if (++listCalls == 1) chargedThenNew else withLine, Meta(), PageLink())) }
+        r.runOnce()
+        assertThat(stored()).isEmpty()
+    }
+
+    @Test
+    fun aNormalApplyStoresTheLineExactlyOnceAfterTheReRead() = runBlocking<Unit> {
+        owedBefore[d(8, 31)] = "23817.37"
+        runner("23491.66", chargedThenNew).runOnce()
+        assertThat(stored()).hasSize(1)
+    }
+
+    @Test
+    fun aDryRunReadsButWritesNothing() = runBlocking<Unit> {
+        owedBefore[d(8, 31)] = "23817.37"
+        runner("23491.66", chargedThenNew, apply = false).runOnce()
+        assertThat(stored()).isEmpty()
+    }
+
 }
