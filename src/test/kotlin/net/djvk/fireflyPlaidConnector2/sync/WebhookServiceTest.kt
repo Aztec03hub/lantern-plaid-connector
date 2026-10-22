@@ -154,6 +154,51 @@ internal class WebhookServiceTest {
         assertEquals("https://monitor.example.com:8443/hook", target)
     }
 
+    private fun warnsFrom(block: () -> Unit): List<String> {
+        val log = ch.qos.logback.classic.Logger::class.java.cast(org.slf4j.LoggerFactory.getLogger(WebhookService::class.java))
+        val app = ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent>().also { it.start(); log.addAppender(it) }
+        try { block() } finally { log.detachAppender(app) }
+        return app.list.filter { it.level == ch.qos.logback.classic.Level.WARN }.map { it.formattedMessage }
+    }
+
+    @Test
+    fun theCallbackRequestPinsContentTypeBearerAndTheDroppedAcceptCharset() = runBlocking<Unit> {
+        val captured = Captured()
+        WebhookService("https://monitor.example.com/hook", "tok-1", engine(captured)).post(start, end, sampleResult)
+        val request = captured.requests.single()
+        assertEquals("application/json", request.body.contentType.toString())
+        assertEquals("Bearer tok-1", request.headers[HttpHeaders.Authorization])
+        // ktor 3 doesn't send it; ktor 2 did; deliberate, see U37 D1
+        assertTrue(!request.headers.contains(HttpHeaders.AcceptCharset))
+    }
+
+    @Test
+    fun aCallbackThatOutlastsTheRequestTimeoutEndsThePostAndLogsTheClassOnly() = runBlocking<Unit> {
+        var engineFinished = false
+        val service = WebhookService(
+            "https://user:pw@monitor.example.com/hook?token=abc", null,
+            MockEngine { kotlinx.coroutines.delay(1500); engineFinished = true; respond("OK") },
+            requestTimeoutMillis = 100,
+        )
+        val warns = warnsFrom { runBlocking { service.post(start, end, sampleResult) } }
+        assertTrue(!engineFinished, "the timeout cancelled the handler")
+        assertThat(warns).hasSize(1)
+        assertThat(warns.single()).endsWith("HttpRequestTimeoutException")
+            .doesNotContain("user", "pw", "token=abc", "abc")
+    }
+
+    @Test
+    fun aConnectTimeoutIsLoggedByClassOnly() = runBlocking<Unit> {
+        // MockEngine has no connect phase: the 5 s connect limit itself is pinned only through its request-timeout twin
+        val service = WebhookService(
+            "https://monitor.example.com/hook", null,
+            MockEngine { throw io.ktor.client.network.sockets.ConnectTimeoutException("detail-token-xyz", null) },
+        )
+        val warns = warnsFrom { runBlocking { service.post(start, end, sampleResult) } }
+        assertThat(warns).hasSize(1)
+        assertThat(warns.single()).endsWith("ConnectTimeoutException").doesNotContain("detail-token-xyz")
+    }
+
     @Test
     fun rejectsMalformedUrls() {
         assertThrows<IllegalArgumentException> { WebhookService("not a url", null, engine(Captured())) }

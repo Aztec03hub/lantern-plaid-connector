@@ -21,6 +21,7 @@ import net.djvk.fireflyPlaidConnector2.config.properties.AccountConfigs
 import net.djvk.fireflyPlaidConnector2.lib.FireflyFixtures
 import net.djvk.fireflyPlaidConnector2.lib.FireflyMock
 import net.djvk.fireflyPlaidConnector2.sync.SyncHelper
+import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
@@ -97,21 +98,77 @@ internal class WireAndTimeoutTest {
         assertEquals(listOf("Bearer secret-token"), r.headers.getAll(HttpHeaders.Authorization))
     }
 
+    private fun fullText(t: Throwable) = t.toString() + "\n" + t.stackTraceToString()
+
+    private fun echoingPlaid(body: (io.ktor.client.request.HttpRequestData) -> String) = PlaidApiWrapper(
+        baseUrl = "https://plaid.test", maxRetries = 1, plaidClientId = "cid-abc123", plaidSecret = "sec-xyz789",
+        httpClientEngine = MockEngine { request ->
+            respond(ByteReadChannel(body(request)), HttpStatusCode.BadRequest, jsonHeaders)
+        },
+        httpClientConfig = { it.expectSuccess = true },
+    )
+
+    private fun failingCall(plaid: PlaidApiWrapper) = assertThrows<io.ktor.client.plugins.ClientRequestException> {
+        runBlocking { plaid.executeRequest({ it.accountsBalanceGet(AccountsBalanceGetRequest(accessToken = "tok-SECRET")) }, "x") }
+    }
+
     @Test
-    fun redactedErrorMessageHasNoCredentials() = runBlocking<Unit> {
+    fun redactedErrorTextHasNoCredentialsInMessageOrCauseChain() = runBlocking<Unit> {
         // L2: a logged 429 must not carry the Authorization value or the access token
+        val e = failingCall(echoingPlaid { """{"error_code":"RATE_LIMIT"}""" })
+        assertThat(fullText(e)).doesNotContain("tok-SECRET", "cid-abc123", "sec-xyz789", "Authorization")
+    }
+
+    @Test
+    fun theRedactionCheckFailsWhenTheServerEchoesACredential() = runBlocking<Unit> {
+        // negative control: if this stops holding, the test above is vacuous
+        val e = failingCall(echoingPlaid { """{"echo":"${it.headers["PLAID-SECRET"]}"}""" })
+        assertThat(fullText(e)).contains("sec-xyz789")
+    }
+
+    @Test
+    fun aRetriedConnectTimeoutCarriesNoCredential() {
+        val (_, e) = plaidTimeoutRun("connect")
+        assertThat(fullText(e)).doesNotContain("cid-abc123", "sec-xyz789", "Authorization")
+    }
+
+    // endregion
+
+    // region B25: redirects (characterization, measured on ktor 3.6.0)
+
+    @Test
+    fun aFireflyGetRedirectIsFollowedButTheBearerTokenIsNotSentToTheOtherHost() = runBlocking<Unit> {
+        val seen = mutableListOf<io.ktor.client.request.HttpRequestData>()
+        val api = AboutApi("https://firefly.test", MockEngine { request ->
+            seen.add(request)
+            if (request.url.host == "firefly.test") respond("", HttpStatusCode.Found, headersOf(HttpHeaders.Location, "https://other.test/landing"))
+            else respond(ByteReadChannel(ok), HttpStatusCode.OK, jsonHeaders)
+        })
+        api.setAccessToken("secret-token")
+        api.getAbout()
+        // measured on ktor 3.6.0: followed, and the Authorization header is dropped on the cross-host hop
+        assertEquals(listOf("firefly.test", "other.test"), seen.map { it.url.host })
+        assertEquals("Bearer secret-token", seen[0].headers[HttpHeaders.Authorization])
+        assertNull(seen[1].headers[HttpHeaders.Authorization])
+    }
+
+    @Test
+    fun aPlaidPostRedirectIsNotFollowedAndIsRetriedAsAnError() = runBlocking<Unit> {
+        val seen = mutableListOf<io.ktor.client.request.HttpRequestData>()
         val plaid = PlaidApiWrapper(
-            baseUrl = "https://plaid.test", maxRetries = 1, plaidClientId = "cid", plaidSecret = "sec",
-            httpClientEngine = MockEngine {
-                respond(ByteReadChannel("""{"error_code":"RATE_LIMIT"}"""), HttpStatusCode.BadRequest, jsonHeaders)
+            baseUrl = "https://plaid.test", maxRetries = 2, plaidClientId = "cid-abc123", plaidSecret = "sec-xyz789",
+            httpClientEngine = MockEngine { request ->
+                seen.add(request)
+                respond("", HttpStatusCode.Found, headersOf(HttpHeaders.Location, "https://other.test/landing"))
             },
-            httpClientConfig = { it.expectSuccess = true },
+            httpClientConfig = { it.expectSuccess = true }, retryBackoffMillis = 1,
         )
-        val e = assertThrows<io.ktor.client.plugins.ClientRequestException> {
-            runBlocking { plaid.executeRequest({ it.accountsBalanceGet(AccountsBalanceGetRequest(accessToken = "tok-SECRET")) }, "x") }
+        val e = assertThrows<Throwable> {
+            runBlocking { plaid.executeRequest({ it.accountsBalanceGet(AccountsBalanceGetRequest(accessToken = "t")) }, "t") }
         }
-        assertFalse(e.message.contains("tok-SECRET"))
-        assertFalse(e.message.contains("Authorization", ignoreCase = true))
+        assertEquals(2, seen.size, "retried, never followed")
+        assertTrue(seen.none { it.url.host == "other.test" }, "no request reaches the other host")
+        assertTrue(e is RuntimeException && e !is java.util.concurrent.CancellationException, "wrapped, got $e")
     }
 
     // endregion
@@ -119,9 +176,10 @@ internal class WireAndTimeoutTest {
     // region M1: timeouts
 
     /** Same shape as ApiConfiguration.getClientConfig (expectSuccess + HttpTimeout) with a short timeout. */
-    private val shortTimeoutConfig: (io.ktor.client.HttpClientConfig<*>) -> Unit = {
+    private fun timeoutConfig(kind: String): (io.ktor.client.HttpClientConfig<*>) -> Unit = {
         it.expectSuccess = true
-        it.install(HttpTimeout) { requestTimeoutMillis = 50 }
+        // only the "request" kind needs the short timer; connect/socket throw at once and must not race it
+        it.install(HttpTimeout) { requestTimeoutMillis = if (kind == "request") 50 else 60_000 }
     }
 
     private suspend fun MockRequestHandleScope.fail(kind: String, request: io.ktor.client.request.HttpRequestData): io.ktor.client.request.HttpResponseData =
@@ -136,8 +194,8 @@ internal class WireAndTimeoutTest {
         val engine = MockEngine { request -> calls++
             fail(kind, request) }
         val plaid = PlaidApiWrapper(
-            baseUrl = "https://plaid.test", maxRetries = 2, plaidClientId = "c", plaidSecret = "s",
-            httpClientEngine = engine, httpClientConfig = shortTimeoutConfig, retryBackoffMillis = 1,
+            baseUrl = "https://plaid.test", maxRetries = 2, plaidClientId = "cid-abc123", plaidSecret = "sec-xyz789",
+            httpClientEngine = engine, httpClientConfig = timeoutConfig(kind), retryBackoffMillis = 1,
         )
         val e = assertThrows<Throwable> {
             runBlocking { plaid.executeRequest({ it.accountsBalanceGet(AccountsBalanceGetRequest(accessToken = "t")) }, "t") }
@@ -159,9 +217,9 @@ internal class WireAndTimeoutTest {
         }
     }
 
-    private fun helperWith(engine: MockEngine): SyncHelper {
+    private fun helperWith(engine: MockEngine, kind: String): SyncHelper {
         val firefly = FireflyMock()
-        val tx = TransactionsApi("https://firefly.test", engine, shortTimeoutConfig)
+        val tx = TransactionsApi("https://firefly.test", engine, timeoutConfig(kind))
         tx.setAccessToken("t")
         return SyncHelper(AccountConfigs(emptyList()), "token", firefly.aboutApi, tx, firefly.accountsApi, firefly.plaidLinksApi)
     }
@@ -174,7 +232,7 @@ internal class WireAndTimeoutTest {
             net.djvk.fireflyPlaidConnector2.transactions.FireflyTransactionDto(null, FireflyFixtures.getTransaction().transactions.first()),
             net.djvk.fireflyPlaidConnector2.transactions.FireflyTransactionDto(null, FireflyFixtures.getTransaction(description = "second").transactions.first()),
         )
-        val e = assertThrows<Throwable> { runBlocking { helperWith(engine).optimisticInsertBatchIntoFirefly(dtos) } }
+        val e = assertThrows<Throwable> { runBlocking { helperWith(engine, kind).optimisticInsertBatchIntoFirefly(dtos) } }
         return calls to e
     }
 
