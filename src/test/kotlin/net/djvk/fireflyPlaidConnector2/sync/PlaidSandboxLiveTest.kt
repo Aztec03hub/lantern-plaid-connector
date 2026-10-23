@@ -53,7 +53,7 @@ internal class PlaidSandboxLiveTest {
     )
     private val clientId = System.getenv("LANTERN_PLAID_SANDBOX_CLIENT_ID")
     private val secret = System.getenv("LANTERN_PLAID_SANDBOX_SECRET")
-        private val service = PlaidSyncService(wrapper, 500, false)
+    private val service = PlaidSyncService(wrapper, 500, false)
     private val accessTokens = mutableListOf<String>()
 
     private fun newItem(product: Products, options: SandboxPublicTokenCreateRequestOptions? = null): String = runBlocking {
