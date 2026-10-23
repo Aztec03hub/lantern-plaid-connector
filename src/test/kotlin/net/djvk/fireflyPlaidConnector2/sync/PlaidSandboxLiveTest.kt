@@ -49,11 +49,11 @@ internal class PlaidSandboxLiveTest {
     private val wrapper = PlaidApiWrapper(
         "https://sandbox.plaid.com", 3,
         System.getenv("LANTERN_PLAID_SANDBOX_CLIENT_ID"), System.getenv("LANTERN_PLAID_SANDBOX_SECRET"),
-        null, ApiConfiguration().getClientConfig(), 0,
+        null, ApiConfiguration().getClientConfig(), 0, 3_000, // a stray sandbox 429 costs seconds, not the 60 s default
     )
     private val clientId = System.getenv("LANTERN_PLAID_SANDBOX_CLIENT_ID")
     private val secret = System.getenv("LANTERN_PLAID_SANDBOX_SECRET")
-    private val service = PlaidSyncService(wrapper, 2, false) // batch size 2 forces several pages
+        private val service = PlaidSyncService(wrapper, 500, false)
     private val accessTokens = mutableListOf<String>()
 
     private fun newItem(product: Products, options: SandboxPublicTokenCreateRequestOptions? = null): String = runBlocking {
@@ -75,7 +75,8 @@ internal class PlaidSandboxLiveTest {
     @AfterAll
     fun removeItems() = runBlocking {
         accessTokens.forEach { t ->
-            wrapper.executeRequest({ api -> api.itemRemove(ItemRemoveRequest(t)) }, "sandbox item remove")
+            // one failed remove must not leave the other Items behind
+            runCatching { wrapper.executeRequest({ api -> api.itemRemove(ItemRemoveRequest(t)) }, "sandbox item remove") }
         }
     }
 
@@ -111,9 +112,10 @@ internal class PlaidSandboxLiveTest {
                 "sandbox investment transactions total"
             ).body().totalInvestmentTransactions
         }
-        assertTrue(total > 2, "need more than one page at batch size 2, the sandbox returned $total")
+        val batch = maxOf(1, (total + 2) / 3) // about three pages, few calls: the sandbox rate limits this endpoint
+        assertTrue(total > batch, "need more than one page at batch size $batch, the sandbox returned $total")
 
-        val txs = service.fetchInvestmentTransactions(token, ids, start, end)
+        val txs = PlaidSyncService(wrapper, batch, false).fetchInvestmentTransactions(token, ids, start, end)
 
         assertEquals(total, txs.size)
         assertEquals(txs.size, txs.map { it.investmentTransactionId }.toSet().size, "duplicate investment_transaction_id across pages")
@@ -138,16 +140,21 @@ internal class PlaidSandboxLiveTest {
         val ids = wrapper.executeRequest({ api -> api.accountsGet(AccountsGetRequest(token)) }, "sandbox accounts get")
             .body().accounts.map { it.accountId }
         // wait (60 s at most) until the first sync has transactions; this cursor is not given to the connector
-        untilReady {
-            val deadline = System.currentTimeMillis() + 60_000
-            while (wrapper.executeRequest(
-                    { api -> api.transactionsSync(TransactionsSyncRequest(token, null, null, null, 1)) }, "sandbox first sync"
-                ).body().added.isEmpty()
-            ) {
+        var available = 0
+        val deadline = System.currentTimeMillis() + 60_000
+        while (available == 0) {
+            available = untilReady {
+                wrapper.executeRequest(
+                    { api -> api.transactionsSync(TransactionsSyncRequest(token, null, null, null, 500)) }, "sandbox first sync"
+                ).body().added.size
+            }
+            if (available == 0) {
                 check(System.currentTimeMillis() < deadline) { "the sandbox Item never got transactions" }
-                delay(3_000)
+                delay(1_000)
             }
         }
+        assertTrue(available > 1, "need more than one transaction to page, the sandbox returned $available")
+        val batch = maxOf(1, (available + 1) / 2) // two pages before the mutation, not a walk over every transaction
 
         val description = "U58 mutation ${System.currentTimeMillis()}"
         val raw = HttpClient(CIO)
@@ -175,16 +182,16 @@ internal class PlaidSandboxLiveTest {
                             """{"client_id":"$clientId","secret":"$secret","access_token":"$token","transactions":[{"date_transacted":"$today","date_posted":"$today","amount":1.23,"description":"$description","iso_currency_code":"USD"}]}"""
                         )
                     }
-                    delay(5_000) // let the mutation land before page 2
+                    delay(2_000) // let the mutation land before page 2
                 }
             }
         }
         val connectorWrapper = PlaidApiWrapper(
             "https://sandbox.plaid.com", 3, clientId, secret, null,
-            { c -> ApiConfiguration().getClientConfig().invoke(c); c.install(plugin) }, 0,
+            { c -> ApiConfiguration().getClientConfig().invoke(c); c.install(plugin) }, 0, 3_000,
         )
 
-        val result = PlaidSyncService(connectorWrapper, 5, false).processPlaidTransactions(sequenceOf(token to ids), mutableMapOf())
+        val result = PlaidSyncService(connectorWrapper, batch, false).processPlaidTransactions(sequenceOf(token to ids), mutableMapOf())
         raw.close()
 
         assertTrue(mutated.get(), "the mutation was never sent")
